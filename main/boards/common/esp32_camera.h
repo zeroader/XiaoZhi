@@ -33,6 +33,14 @@ public:
     virtual bool SetHMirror(bool enabled) override;
     virtual bool SetVFlip(bool enabled) override;
     virtual std::string Explain(const std::string& question);
+
+    camera_fb_t* GetLastCapturedFrame() const { return fb_; }
+    void ReleaseLastCapturedFrame() {
+        if (fb_ != nullptr) {
+            esp_camera_fb_return(fb_);
+            fb_ = nullptr;
+        }
+    }
 };
 
 #endif // ESP32_CAMERA_H
