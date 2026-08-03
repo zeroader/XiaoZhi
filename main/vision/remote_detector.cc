@@ -81,7 +81,8 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
     }
 
     std::thread encoder_thread([&frame, jpeg_queue]() {
-        image_to_jpeg_cb(frame.data, frame.len, frame.width, frame.height, frame.pixel_format, 80,
+        image_to_jpeg_cb(const_cast<uint8_t*>(frame.data), frame.len, frame.width, frame.height,
+            static_cast<pixformat_t>(frame.pixel_format), 80,
             [](void* arg, size_t index, const void* data, size_t len) -> size_t {
                 auto queue = (QueueHandle_t)arg;
                 JpegChunk chunk = {
@@ -95,7 +96,7 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
                 return len;
             }, jpeg_queue);
         JpegChunk sentinel = { .data = nullptr, .len = 0 };
-        xQueueSend(queue, &sentinel, portMAX_DELAY);
+        xQueueSend(jpeg_queue, &sentinel, portMAX_DELAY);
     });
 
     auto network = Board::GetInstance().GetNetwork();
@@ -169,12 +170,12 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
     auto parse_end = esp_timer_get_time();
 
     auto total_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "Remote detect: jpeg=%zuB, detections=%d, total=%lldms (http+enc=%lldms, parse=%lldms)",
-             total_jpeg,
+    ESP_LOGI(TAG, "Remote detect: jpeg=%uB, detections=%d, total=%dms (http+enc=%dms, parse=%dms)",
+             (unsigned)total_jpeg,
              (int)result.detections.size(),
-             (long long)((total_end - total_start) / 1000LL),
-             (long long)(((parse_start - total_start)) / 1000LL),
-             (long long)((parse_end - parse_start) / 1000LL));
+             (int)((total_end - total_start) / 1000LL),
+             (int)((parse_start - total_start) / 1000LL),
+             (int)((parse_end - parse_start) / 1000LL));
 
     return result;
 }

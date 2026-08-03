@@ -146,11 +146,11 @@ private:
         config.pin_reset = CAMERA_PIN_RESET;
         config.xclk_freq_hz = XCLK_FREQ_HZ;
         config.pixel_format = PIXFORMAT_RGB565;
-        config.frame_size = FRAMESIZE_QVGA;
+        config.frame_size = FRAMESIZE_CIF;    // 352×288, more detail for face detection
         config.jpeg_quality = 12;
-        config.fb_count = 1;
+        config.fb_count = 2;  // double buffer prevents frame tearing during detection
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+        config.grab_mode = CAMERA_GRAB_LATEST;  // always get latest complete frame
         camera_ = new Esp32Camera(config);
         camera_->SetHMirror(false);
     }

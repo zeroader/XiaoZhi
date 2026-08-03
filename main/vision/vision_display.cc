@@ -220,7 +220,7 @@ std::unique_ptr<LvglImage> VisionDisplay::ComposePreview(const uint8_t* frame_rg
     size_t total = dst_stride * (size_t)height;
     uint8_t* dst = (uint8_t*)heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
     if (dst == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate %zu bytes for preview", total);
+        ESP_LOGE(TAG, "Failed to allocate %u bytes for preview", (unsigned)total);
         return nullptr;
     }
 

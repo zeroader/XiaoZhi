@@ -11,7 +11,7 @@
 #include <atomic>
 #include <memory>
 
-#define PREVIEW_IMAGE_DURATION_MS 5000
+#define PREVIEW_IMAGE_DURATION_MS 30000
 
 
 class LcdDisplay : public LvglDisplay {

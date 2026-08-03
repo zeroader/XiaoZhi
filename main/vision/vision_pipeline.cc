@@ -2,6 +2,7 @@
 
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_pthread.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -58,8 +59,15 @@ Esp32Camera* VisionPipeline::ResolveEsp32Camera() {
 
 LvglDisplay* VisionPipeline::ResolveLvglDisplay() {
     auto* display = Board::GetInstance().GetDisplay();
-    if (display == nullptr) return nullptr;
-    return dynamic_cast<LvglDisplay*>(display);
+    if (display == nullptr) {
+        ESP_LOGW(TAG, "ResolveLvglDisplay: Board::GetDisplay() returns NULL");
+        return nullptr;
+    }
+    auto* lcd = dynamic_cast<LvglDisplay*>(display);
+    if (lcd == nullptr) {
+        ESP_LOGW(TAG, "ResolveLvglDisplay: dynamic_cast<LvglDisplay*> failed, display is not an LvglDisplay subclass");
+    }
+    return lcd;
 }
 
 bool VisionPipeline::Initialize() {
@@ -144,12 +152,14 @@ VisionDisplay* VisionPipeline::GetDisplayComposer() { return display_composer_.g
 bool VisionPipeline::CaptureFrame(ImageFrame& out_frame) {
     auto* cam = ResolveEsp32Camera();
     if (cam == nullptr) {
-        ESP_LOGE(TAG, "No Esp32Camera available for capture");
+        ESP_LOGE(TAG, "CaptureFrame: No Esp32Camera available for capture. "
+                 "Check that Board::GetCamera() returns non-NULL (camera may not be plugged in, "
+                 "or XL9555 PWDN/RESET pins are not set correctly)");
         return false;
     }
     auto t0 = esp_timer_get_time();
     if (!cam->Capture()) {
-        ESP_LOGE(TAG, "Camera Capture() failed");
+        ESP_LOGE(TAG, "CaptureFrame: Camera Capture() returned false. Check camera cable / PWDN pin.");
         return false;
     }
     auto t1 = esp_timer_get_time();
@@ -158,7 +168,12 @@ bool VisionPipeline::CaptureFrame(ImageFrame& out_frame) {
 
     camera_fb_t* fb = cam->GetLastCapturedFrame();
     if (fb == nullptr) {
-        ESP_LOGE(TAG, "Captured frame buffer is null");
+        ESP_LOGE(TAG, "CaptureFrame: GetLastCapturedFrame() returned NULL frame buffer");
+        return false;
+    }
+    if (fb->buf == nullptr || fb->width == 0 || fb->height == 0) {
+        ESP_LOGE(TAG, "CaptureFrame: invalid frame buf=%p %dx%d len=%u",
+                 fb->buf, fb->width, fb->height, (unsigned)fb->len);
         return false;
     }
     out_frame.data = fb->buf;
@@ -212,20 +227,28 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     bool displayed = false;
     if (show_on_lcd && display_composer_) {
         auto* lcd = ResolveLvglDisplay();
-        if (lcd != nullptr) {
+        if (lcd == nullptr) {
+            ESP_LOGW(TAG, "OneShotDetect: ResolveLvglDisplay returned NULL, skip showing on LCD");
+        } else {
             auto t_comp0 = esp_timer_get_time();
+            ESP_LOGI(TAG, "OneShotDetect: ComposePreview frame=%dx%d format=%d len=%u",
+                     frame.width, frame.height, frame.pixel_format, (unsigned)frame.len);
             auto image = display_composer_->ComposePreview(frame.data, frame.width, frame.height,
                                                           (size_t)frame.width * 2, result);
             auto t_comp1 = esp_timer_get_time();
             stats_.total_compose_ms += (uint64_t)((t_comp1 - t_comp0) / 1000LL);
 
-            if (image) {
+            if (!image) {
+                ESP_LOGW(TAG, "OneShotDetect: ComposePreview returned NULL (bad alloc or invalid dims?)");
+            } else {
                 auto t_disp0 = esp_timer_get_time();
                 lcd->SetPreviewImage(std::move(image));
                 auto t_disp1 = esp_timer_get_time();
                 stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
                 stats_.display_count++;
                 displayed = true;
+                ESP_LOGI(TAG, "OneShotDetect: SetPreviewImage done (took %dms)",
+                         (int)((t_disp1 - t_disp0) / 1000LL));
             }
         }
     }
@@ -235,12 +258,12 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     auto t_all1 = esp_timer_get_time();
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "detector=%s, detections=%d, dimensions=%dx%d, total=%lldms, detect=%lldms, shown=%s",
+             "detector=%s, detections=%d, dimensions=%dx%d, total=%dms, detect=%dms, shown=%s",
              active_detector_->GetName(),
              (int)result.detections.size(),
              frame.width, frame.height,
-             (long long)((t_all1 - t_all) / 1000LL),
-             (long long)((t_detect1 - t_detect0) / 1000LL),
+             (int)((t_all1 - t_all) / 1000LL),
+             (int)((t_detect1 - t_detect0) / 1000LL),
              displayed ? "true" : "false");
     ESP_LOGI(TAG, "OneShotDetect: %s", buf);
     if (out_debug_info) *out_debug_info = buf;
@@ -278,13 +301,21 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms) {
     }
     continuous_period_ms_ = period_ms;
     continuous_running_.store(true);
+    // The loop thread runs snprintf/ESP_LOGI and LVGL calls; the default pthread
+    // stack (3072B) is too small and caused a printf crash. Use a larger stack.
+    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    cfg.stack_size = 8192;
+    cfg.prio = 5;
+    esp_pthread_set_cfg(&cfg);
     try {
         continuous_thread_ = std::thread([this]() { this->ContinuousLoop(); });
     } catch (...) {
+        esp_pthread_set_cfg(nullptr);
         continuous_running_.store(false);
         ESP_LOGE(TAG, "Failed to spawn continuous detection thread");
         return false;
     }
+    esp_pthread_set_cfg(nullptr);
     return true;
 }
 
@@ -379,7 +410,9 @@ void RegisterVisionMcpTools() {
 
     mcp.AddTool("self.vision.init",
         "Initialize the vision pipeline (camera + detectors + display composer). "
-        "Must be called before other self.vision.* tools. Safe to call multiple times.",
+        "Must be called before other self.vision.* tools. Safe to call multiple times.\n"
+        "NOTE: all self.vision.* tools process images LOCALLY on the device - no image is ever uploaded "
+        "(unless you explicitly configure and select the `remote` detector).",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             return VisionPipeline::GetInstance().Initialize();
@@ -396,7 +429,8 @@ void RegisterVisionMcpTools() {
     mcp.AddTool("self.vision.set_active_detector",
         "Choose which detector is used for detection.\n"
         "Args:\n"
-        "  `detector`: One of `face` (local, low-latency, ESP-SR based), `remote` (HTTP server based).",
+        "  `detector`: One of `face` (local, low-latency, ESP-SR based, NO upload), "
+        "`remote` (HTTP server based, UPLOADS the frame to the configured server).",
         PropertyList({
             Property("detector", kPropertyTypeString)
         }),
@@ -422,8 +456,10 @@ void RegisterVisionMcpTools() {
         });
 
     mcp.AddTool("self.vision.detect_once",
-        "Capture one frame from the camera, run the active detector, and draw detection boxes "
-        "on the LCD preview image. Returns full detection result JSON.\n"
+        "Capture ONE frame from the camera, run the active detector LOCALLY, and draw detection boxes "
+        "on the LCD preview image. The frame never leaves the device (no upload).\n"
+        "Use for a single snapshot check. For continuous REAL-TIME detection, call `self.vision.start_continuous` instead "
+        "(do not call this tool repeatedly in a loop).\n"
         "Args:\n"
         "  `show_on_lcd` (optional, default true): if false, do not update the LCD.\n",
         PropertyList({
@@ -454,7 +490,11 @@ void RegisterVisionMcpTools() {
         });
 
     mcp.AddTool("self.vision.start_continuous",
-        "Start continuous detection loop: capture -> detect -> show on LCD, repeated.\n"
+        "Start REAL-TIME detection loop: capture -> detect LOCALLY -> draw boxes on LCD, repeated continuously.\n"
+        "Use this when the user asks for real-time / continuous / live face detection, or wants the device to "
+        "keep watching the camera (e.g. \"实时人脸检测\", \"持续盯着我\", \"检测到人脸就告诉我\").\n"
+        "LOCAL-ONLY: every frame is processed on the device, nothing is uploaded to any server.\n"
+        "While this loop is running, `self.camera.take_photo` (which uploads to the cloud) is blocked.\n"
         "Args:\n"
         "  `period_ms` (optional, default 500): target time between iterations in ms. "
         "Actual rate may be lower if detector is slow.",
@@ -467,7 +507,8 @@ void RegisterVisionMcpTools() {
         });
 
     mcp.AddTool("self.vision.stop_continuous",
-        "Stop the continuous detection loop.",
+        "Stop the REAL-TIME detection loop started by `self.vision.start_continuous`. "
+        "Call this when the user no longer wants continuous face detection, or before switching to a single snapshot.",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             VisionPipeline::GetInstance().StopContinuous();

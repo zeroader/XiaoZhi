@@ -3,7 +3,9 @@
 #include "display.h"
 #include "application.h"
 #include "lvgl_theme.h"
+#if __has_include("gfx.h")
 #include "emote_display.h"
+#endif
 
 #include <esp_log.h>
 #include <spi_flash_mmap.h>
