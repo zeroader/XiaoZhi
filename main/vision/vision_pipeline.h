@@ -64,6 +64,11 @@ public:
     void StopContinuous();
     bool IsContinuousRunning() const;
 
+    // Preview-only: capture + display, NO detection (for debugging camera pipeline)
+    bool StartPreview(uint32_t period_ms = 200);
+    void StopPreview();
+    bool IsPreviewRunning() const;
+
     const PipelineStats& GetStats() const;
     void ResetStats();
 
@@ -89,9 +94,14 @@ private:
     std::thread continuous_thread_;
     uint32_t continuous_period_ms_;
 
+    std::atomic<bool> preview_running_;
+    std::thread preview_thread_;
+    uint32_t preview_period_ms_;
+
     Esp32Camera* ResolveEsp32Camera();
     LvglDisplay* ResolveLvglDisplay();
     void ContinuousLoop();
+    void PreviewLoop();   // capture + display only, no detection
 
     bool CaptureFrame(ImageFrame& out_frame);
     bool ReleaseCurrentFrame();

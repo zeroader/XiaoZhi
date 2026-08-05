@@ -234,6 +234,15 @@ std::unique_ptr<LvglImage> VisionDisplay::ComposePreview(const uint8_t* frame_rg
         }
     }
 
+    // Swap RGB565 byte pairs for LVGL compatibility (LVGL expects BGR565 byte order)
+    {
+        uint16_t* pixels = (uint16_t*)dst;
+        size_t pixel_count = total / 2;
+        for (size_t i = 0; i < pixel_count; i++) {
+            pixels[i] = __builtin_bswap16(pixels[i]);
+        }
+    }
+
     DrawDetections(dst, width, height, dst_stride, detections);
 
     return std::make_unique<LvglAllocatedImage>(dst, total, width, height, (int)dst_stride, LV_COLOR_FORMAT_RGB565);

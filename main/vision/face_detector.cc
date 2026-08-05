@@ -113,7 +113,7 @@ DetectionResult FaceDetector::Detect(const ImageFrame& frame) {
         .data = frame_copy,
         .width = (uint16_t)frame.width,
         .height = (uint16_t)frame.height,
-        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE
+        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE
     };
 
     auto t_infer_start = esp_timer_get_time();
@@ -125,15 +125,6 @@ DetectionResult FaceDetector::Detect(const ImageFrame& frame) {
         ESP_LOGI(TAG, "Raw result: score=%.3f box=[%d,%d,%d,%d] keypoints=%d",
                  res.score, res.box[0], res.box[1], res.box[2], res.box[3],
                  (int)res.keypoint.size());
-        if (res.score < confidence_threshold_) {
-            continue;
-        }
-        // Filter edge-touching false positives (camera sensor artifacts)
-        if (res.box[0] < 8 || res.box[1] < 8
-            || res.box[2] > frame.width - 8
-            || res.box[3] > frame.height - 8) {
-            continue;
-        }
         Detection d;
         d.class_id = 0;
         d.class_name = "face";
@@ -146,6 +137,8 @@ DetectionResult FaceDetector::Detect(const ImageFrame& frame) {
         if (y1 < 0) y1 = 0;
         if (x2 > frame.width) x2 = frame.width;
         if (y2 > frame.height) y2 = frame.height;
+        ESP_LOGI(TAG, "Final detection: score=%.3f box=[%d,%d,%d,%d] w=%d h=%d",
+                 res.score, x1, y1, x2, y2, x2-x1, y2-y1);
         d.box = BoundingBox(x1, y1, x2 - x1, y2 - y1);
         result.detections.push_back(d);
     }

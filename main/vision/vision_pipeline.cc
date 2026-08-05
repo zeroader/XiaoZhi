@@ -331,6 +331,75 @@ bool VisionPipeline::IsContinuousRunning() const {
     return continuous_running_.load();
 }
 
+// --- Preview-only (no detection) ---
+
+void VisionPipeline::PreviewLoop() {
+    ESP_LOGI(TAG, "Preview loop started (period=%ums)", preview_period_ms_);
+    while (preview_running_.load()) {
+        auto t0 = esp_timer_get_time();
+
+        ImageFrame frame;
+        if (!CaptureFrame(frame)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        DetectionResult empty_result;  // no detections
+        empty_result.source_width = frame.width;
+        empty_result.source_height = frame.height;
+
+        auto* lcd = ResolveLvglDisplay();
+        if (lcd != nullptr && display_composer_) {
+            auto image = display_composer_->ComposePreview(
+                frame.data, frame.width, frame.height,
+                (size_t)frame.width * 2, empty_result);
+            if (image) {
+                lcd->SetPreviewImage(std::move(image));
+            }
+        }
+
+        ReleaseCurrentFrame();
+
+        auto t1 = esp_timer_get_time();
+        int64_t elapsed_ms = (t1 - t0) / 1000LL;
+        int64_t wait_ms = (int64_t)preview_period_ms_ - elapsed_ms;
+        if (wait_ms > 0 && preview_running_.load()) {
+            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
+        }
+    }
+    ESP_LOGI(TAG, "Preview loop stopped");
+}
+
+bool VisionPipeline::StartPreview(uint32_t period_ms) {
+    if (!initialized_) return false;
+    if (preview_running_.load()) {
+        ESP_LOGW(TAG, "Preview already running");
+        return true;
+    }
+    preview_period_ms_ = period_ms;
+    preview_running_.store(true);
+    try {
+        preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
+    } catch (...) {
+        preview_running_.store(false);
+        ESP_LOGE(TAG, "Failed to spawn preview thread");
+        return false;
+    }
+    return true;
+}
+
+void VisionPipeline::StopPreview() {
+    if (!preview_running_.load()) return;
+    preview_running_.store(false);
+    if (preview_thread_.joinable()) {
+        preview_thread_.join();
+    }
+}
+
+bool VisionPipeline::IsPreviewRunning() const {
+    return preview_running_.load();
+}
+
 const PipelineStats& VisionPipeline::GetStats() const { return stats_; }
 
 void VisionPipeline::ResetStats() { stats_.Reset(); }
@@ -520,6 +589,36 @@ void RegisterVisionMcpTools() {
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             return (bool)VisionPipeline::GetInstance().IsContinuousRunning();
+        });
+
+    mcp.AddTool("self.vision.start_preview",
+        "Start live camera preview on LCD (capture + display, NO face detection). "
+        "Use this to verify the camera → LCD pipeline without any AI overhead. "
+        "Much lighter than start_continuous — does not run any model.\n"
+        "Args:\n"
+        "  `period_ms` (optional, default 200): target interval between frames.",
+        PropertyList({
+             Property("period_ms", kPropertyTypeInteger, 200, 50, 5000)
+         }),
+        [](const PropertyList& properties) -> ReturnValue {
+             uint32_t period = 200;
+             try {
+                 period = (uint32_t)properties["period_ms"].value<int>();
+             } catch (...) {
+                 // use default
+             }
+             if (!VisionPipeline::GetInstance().StartPreview(period)) {
+                throw std::runtime_error("Failed to start preview (pipeline not initialized?)");
+            }
+            return std::string("Preview started successfully. Call self.vision.stop_preview to stop.");
+        });
+
+    mcp.AddTool("self.vision.stop_preview",
+        "Stop the live camera preview started by `self.vision.start_preview`.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            VisionPipeline::GetInstance().StopPreview();
+            return true;
         });
 
     mcp.AddTool("self.vision.get_stats",
