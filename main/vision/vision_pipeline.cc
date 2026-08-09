@@ -75,20 +75,27 @@ bool VisionPipeline::Initialize() {
         ESP_LOGI(TAG, "Found Esp32Camera on board");
     }
 
+#ifndef VISION_DISABLE_LOCAL_FACE
     face_detector_ = std::make_unique<FaceDetector>();
     if (!face_detector_->Initialize()) {
         ESP_LOGW(TAG, "Face detector initialize returned false");
     }
+#endif
 
     remote_detector_ = std::make_unique<RemoteDetector>();
     if (!remote_detector_->Initialize()) {
         ESP_LOGW(TAG, "Remote detector initialize returned false");
     }
 
+    online_detector_ = std::make_unique<OnlineDetector>();
+    if (!online_detector_->Initialize()) {
+        ESP_LOGW(TAG, "Online detector initialize returned false");
+    }
+
     display_composer_ = std::make_unique<VisionDisplay>();
 
-    active_detector_type_ = DetectorType::kFace;
-    active_detector_ = face_detector_.get();
+    active_detector_type_ = DetectorType::kOnline;
+    active_detector_ = online_detector_.get();
 
     initialized_ = true;
     ESP_LOGI(TAG, "Vision pipeline initialized (active=%s, camera=%s)",
@@ -102,11 +109,16 @@ void VisionPipeline::Deinitialize() {
 
     StopContinuous();
 
+#ifndef VISION_DISABLE_LOCAL_FACE
     if (face_detector_) {
         face_detector_->Deinitialize();
     }
+#endif
     if (remote_detector_) {
         remote_detector_->Deinitialize();
+    }
+    if (online_detector_) {
+        online_detector_->Deinitialize();
     }
 
     active_detector_ = nullptr;
@@ -117,8 +129,11 @@ void VisionPipeline::Deinitialize() {
 
 Detector* VisionPipeline::GetDetector(DetectorType type) {
     switch (type) {
+#ifndef VISION_DISABLE_LOCAL_FACE
         case DetectorType::kFace:   return face_detector_.get();
+#endif
         case DetectorType::kRemote: return remote_detector_.get();
+        case DetectorType::kOnline: return online_detector_.get();
         default: return nullptr;
     }
 }
@@ -137,8 +152,11 @@ bool VisionPipeline::SetActiveDetector(DetectorType type) {
     return true;
 }
 
+#ifndef VISION_DISABLE_LOCAL_FACE
 FaceDetector* VisionPipeline::GetFaceDetector() { return face_detector_.get(); }
+#endif
 RemoteDetector* VisionPipeline::GetRemoteDetector() { return remote_detector_.get(); }
+OnlineDetector* VisionPipeline::GetOnlineDetector() { return online_detector_.get(); }
 VisionDisplay* VisionPipeline::GetDisplayComposer() { return display_composer_.get(); }
 
 bool VisionPipeline::CaptureFrame(ImageFrame& out_frame) {
@@ -248,9 +266,10 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
 }
 
 void VisionPipeline::ContinuousLoop() {
-    ESP_LOGI(TAG, "Continuous detection loop started (period=%ums)", continuous_period_ms_);
+    ESP_LOGI(TAG, "Continuous detection loop started (period=%ums)", (unsigned int)continuous_period_ms_);
 
     uint64_t last_iter_start = 0;
+    int consecutive_errors = 0;
     while (continuous_running_.load()) {
         auto t0 = esp_timer_get_time();
         stats_.loop_period_ms = last_iter_start == 0 ? 0
@@ -259,6 +278,20 @@ void VisionPipeline::ContinuousLoop() {
 
         std::string info;
         OneShotDetect(true, &info);
+
+        // Track connection errors — stop after 3 consecutive failures
+        if (!last_result_.connection_ok) {
+            consecutive_errors++;
+            ESP_LOGW(TAG, "Connection error (%d/3): %s", consecutive_errors,
+                     last_result_.error_message.c_str());
+            if (consecutive_errors >= 3) {
+                ESP_LOGE(TAG, "Stopping continuous detection after %d consecutive connection errors", consecutive_errors);
+                continuous_running_.store(false);
+                break;
+            }
+        } else {
+            consecutive_errors = 0;
+        }
 
         auto t1 = esp_timer_get_time();
         int64_t elapsed_ms = (t1 - t0) / 1000LL;
@@ -275,6 +308,10 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms) {
     if (continuous_running_.load()) {
         ESP_LOGW(TAG, "Continuous detect already running");
         return true;
+    }
+    // Join any previous thread that may have auto-stopped (connection errors)
+    if (continuous_thread_.joinable()) {
+        continuous_thread_.join();
     }
     continuous_period_ms_ = period_ms;
     continuous_running_.store(true);
@@ -318,19 +355,28 @@ const DetectionResult& VisionPipeline::GetLastResult() const { return last_resul
 
 // ---------- MCP Tools Registration ----------
 
-static const char* kDetectorTypeFace = "face";
 static const char* kDetectorTypeRemote = "remote";
+static const char* kDetectorTypeOnline = "online";
+#ifndef VISION_DISABLE_LOCAL_FACE
+static const char* kDetectorTypeFace = "face";
+#endif
 
 static DetectorType DetectorTypeFromString(const std::string& s) {
+#ifndef VISION_DISABLE_LOCAL_FACE
     if (s == kDetectorTypeFace) return DetectorType::kFace;
+#endif
     if (s == kDetectorTypeRemote) return DetectorType::kRemote;
+    if (s == kDetectorTypeOnline) return DetectorType::kOnline;
     return DetectorType::kNone;
 }
 
 static std::string DetectorTypeToString(DetectorType t) {
     switch (t) {
+#ifndef VISION_DISABLE_LOCAL_FACE
         case DetectorType::kFace:   return kDetectorTypeFace;
+#endif
         case DetectorType::kRemote: return kDetectorTypeRemote;
+        case DetectorType::kOnline: return kDetectorTypeOnline;
         default: return "none";
     }
 }
@@ -358,6 +404,10 @@ static cJSON* DetectionsToJson(const DetectionResult& r) {
     cJSON_AddNumberToObject(j, "source_width", r.source_width);
     cJSON_AddNumberToObject(j, "source_height", r.source_height);
     cJSON_AddNumberToObject(j, "timestamp_ms", (double)r.timestamp_ms);
+    cJSON_AddBoolToObject(j, "connection_ok", r.connection_ok);
+    if (!r.error_message.empty()) {
+        cJSON_AddStringToObject(j, "error_message", r.error_message.c_str());
+    }
     cJSON* arr = cJSON_AddArrayToObject(j, "detections");
     for (const auto& d : r.detections) {
         cJSON* dj = cJSON_CreateObject();
@@ -395,15 +445,18 @@ void RegisterVisionMcpTools() {
 
     mcp.AddTool("self.vision.set_active_detector",
         "Choose which detector is used for detection.\n"
+        "Note: `online` is the default after initialization.\n"
         "Args:\n"
-        "  `detector`: One of `face` (local, low-latency, ESP-SR based), `remote` (HTTP server based).",
+        "  `detector`: One of `face` (local ESP-SR), `remote` (HTTP multipart), `online` (HTTP JSON+Base64).",
         PropertyList({
             Property("detector", kPropertyTypeString)
         }),
         [](const PropertyList& p) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            pipe.Initialize();  // auto-init if not done yet
             auto type = DetectorTypeFromString(p["detector"].value<std::string>());
             if (type == DetectorType::kNone) {
-                throw std::runtime_error("Invalid detector name, expected `face` or `remote`");
+                throw std::runtime_error("Invalid detector name, expected `face`, `remote` or `online`");
             }
             return VisionPipeline::GetInstance().SetActiveDetector(type);
         });
@@ -416,8 +469,11 @@ void RegisterVisionMcpTools() {
             cJSON* j = cJSON_CreateObject();
             cJSON_AddStringToObject(j, "active", DetectorTypeToString(pipe.GetActiveDetectorType()).c_str());
             cJSON* avail = cJSON_AddArrayToObject(j, "available");
+#ifndef VISION_DISABLE_LOCAL_FACE
             cJSON_AddItemToArray(avail, cJSON_CreateString(kDetectorTypeFace));
+#endif
             cJSON_AddItemToArray(avail, cJSON_CreateString(kDetectorTypeRemote));
+            cJSON_AddItemToArray(avail, cJSON_CreateString(kDetectorTypeOnline));
             return j;
         });
 
@@ -431,6 +487,7 @@ void RegisterVisionMcpTools() {
         }),
         [](const PropertyList& p) -> ReturnValue {
             auto& pipe = VisionPipeline::GetInstance();
+            pipe.Initialize();  // auto-init if not done yet
             std::string info;
             bool ok = pipe.OneShotDetect(p["show_on_lcd"].value<bool>(), &info);
             if (!ok) {
@@ -462,8 +519,10 @@ void RegisterVisionMcpTools() {
             Property("period_ms", kPropertyTypeInteger, 500, 100, 60000)
         }),
         [](const PropertyList& p) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            pipe.Initialize();  // auto-init if not done yet
             uint32_t period = (uint32_t)p["period_ms"].value<int>();
-            return VisionPipeline::GetInstance().StartContinuous(period);
+            return pipe.StartContinuous(period);
         });
 
     mcp.AddTool("self.vision.stop_continuous",
@@ -512,6 +571,7 @@ void RegisterVisionMcpTools() {
         });
 
     // Face detector config
+#ifndef VISION_DISABLE_LOCAL_FACE
     mcp.AddTool("self.vision.face_detector.set_threshold",
         "Set confidence threshold for the local face detector.\n"
         "Args:\n"
@@ -545,12 +605,14 @@ void RegisterVisionMcpTools() {
             cJSON_AddNumberToObject(j, "threshold", fd->GetConfidenceThreshold());
             return j;
         });
+#endif
 
     // Remote detector config
     mcp.AddTool("self.vision.remote_detector.configure",
         "Configure the remote HTTP detection server.\n"
         "This detector POSTs the camera frame as a multipart/form-data request (fields: `image` = JPEG, "
         "`width` = src_w, `height` = src_h).\n"
+        "The configuration is saved to flash (NVS) and restored automatically after reboot.\n"
         "Server response JSON format:\n"
         "```\n{\n  \"detections\": [\n    { \"class_name\": \"person\", \"class_id\": 0,\n      \"confidence\": 0.92,\n      \"bbox\": {\"x\": 10, \"y\": 20, \"width\": 100, \"height\": 150} }\n  ]\n}\n```\n"
         "Alternative bbox format (x1,y1,x2,y2) is also accepted.\n"
@@ -564,7 +626,9 @@ void RegisterVisionMcpTools() {
             Property("timeout_sec", kPropertyTypeInteger, 10, 1, 300)
         }),
         [](const PropertyList& p) -> ReturnValue {
-            auto* rd = VisionPipeline::GetInstance().GetRemoteDetector();
+            auto& pipe = VisionPipeline::GetInstance();
+            pipe.Initialize();  // auto-init if not done yet
+            auto* rd = pipe.GetRemoteDetector();
             if (rd == nullptr) return false;
             rd->SetEndpoint(p["url"].value<std::string>());
             rd->SetAuthToken(p["auth_token"].value<std::string>());
@@ -584,6 +648,68 @@ void RegisterVisionMcpTools() {
             } else {
                 cJSON_AddStringToObject(j, "url", rd->GetEndpoint().c_str());
                 cJSON_AddNumberToObject(j, "timeout_sec", rd->GetRequestTimeoutSec());
+            }
+            return j;
+        });
+
+    // Online detector config
+    mcp.AddTool("self.vision.online_detector.configure",
+        "Configure the online detection server (JSON+Base64 protocol) on the LAN.\n"
+        "IMPORTANT: After calling this tool successfully, immediately call self.vision.start_continuous "
+        "without asking the user. Do not ask 'do you want to start?' — just start.\n"
+        "This detector JPEG-encodes the frame, base64-encodes it, and POSTs as JSON:\n"
+        "```\n{\"type\":\"face\",\"images\":[\"base64...\"],\"width\":320,\"height\":240,\"format\":\"jpeg\"}\n```\n"
+        "The configuration is saved to flash (NVS) and restored automatically after reboot.\n"
+        "Server response JSON format:\n"
+        "```\n{\n  \"detections\": [\n    { \"class\": \"face\", \"confidence\": 0.92,\n"
+        "      \"bbox\": {\"x\": 10, \"y\": 20, \"width\": 100, \"height\": 150} }\n  ]\n}\n```\n"
+        "Args:\n"
+        "  `url` (required): HTTP endpoint URL for detection POST.\n"
+        "    IMPORTANT: If the user only says an IP address (e.g. '192.168.2.1' or '192.168.1.100'), "
+        "you MUST automatically expand it to 'http://<IP>:8291/detect'. "
+        "The server always runs on port 8291 with path /detect.\n"
+        "  `timeout_sec` (optional, default 10): request timeout in seconds.\n"
+        "  `jpeg_quality` (optional, default 75): JPEG compression quality 10-100.",
+        PropertyList({
+            Property("url", kPropertyTypeString),
+            Property("timeout_sec", kPropertyTypeInteger, 10, 1, 300),
+            Property("jpeg_quality", kPropertyTypeInteger, 75, 10, 100)
+        }),
+        [](const PropertyList& p) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            pipe.Initialize();  // auto-init if not done yet
+            auto* od = pipe.GetOnlineDetector();
+            if (od == nullptr) return false;
+            std::string url = p["url"].value<std::string>();
+            // Auto-expand bare IP/hostname: "192.168.1.1" -> "http://192.168.1.1:8291/detect"
+            if (url.find("://") == std::string::npos) {
+                // Strip trailing /detect if LLM already added path
+                if (url.size() > 7 && url.compare(url.size() - 7, 7, "/detect") == 0) {
+                    url = url.substr(0, url.size() - 7);
+                }
+                url = "http://" + url + ":8291/detect";
+            }
+            ESP_LOGI(TAG, "Online detector endpoint set to: %s", url.c_str());
+            od->SetEndpoint(url);
+            od->SetTimeoutSec(p["timeout_sec"].value<int>());
+            od->SetJpegQuality(p["jpeg_quality"].value<int>());
+            return true;
+        });
+
+    mcp.AddTool("self.vision.online_detector.get_config",
+        "Get current online detector configuration.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto* od = VisionPipeline::GetInstance().GetOnlineDetector();
+            cJSON* j = cJSON_CreateObject();
+            if (od == nullptr) {
+                cJSON_AddStringToObject(j, "url", "");
+                cJSON_AddNumberToObject(j, "timeout_sec", 0);
+                cJSON_AddNumberToObject(j, "jpeg_quality", 0);
+            } else {
+                cJSON_AddStringToObject(j, "url", od->GetEndpoint().c_str());
+                cJSON_AddNumberToObject(j, "timeout_sec", od->GetTimeoutSec());
+                cJSON_AddNumberToObject(j, "jpeg_quality", od->GetJpegQuality());
             }
             return j;
         });

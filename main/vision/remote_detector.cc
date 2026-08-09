@@ -8,6 +8,7 @@
 
 #include "board.h"
 #include "system_info.h"
+#include "settings.h"
 #include "jpg/image_to_jpeg.h"
 
 #include <freertos/FreeRTOS.h>
@@ -37,6 +38,24 @@ bool RemoteDetector::Initialize() {
     if (initialized_) {
         return true;
     }
+
+    // Load persisted configuration from NVS (saved by SetEndpoint/SetAuthToken/SetRequestTimeoutSec)
+    {
+        Settings settings("vision");
+        std::string url = settings.GetString("remote_url");
+        if (!url.empty()) {
+            endpoint_url_ = url;
+        }
+        std::string token = settings.GetString("remote_token");
+        if (!token.empty()) {
+            auth_token_ = token;
+        }
+        int32_t timeout = settings.GetInt("remote_timeout", 0);
+        if (timeout > 0) {
+            timeout_sec_ = timeout;
+        }
+    }
+
     if (endpoint_url_.empty()) {
         ESP_LOGW(TAG, "Remote detector endpoint URL not set - Initialize() will succeed but Detect() will fail");
     }
@@ -81,7 +100,7 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
     }
 
     std::thread encoder_thread([&frame, jpeg_queue]() {
-        image_to_jpeg_cb(frame.data, frame.len, frame.width, frame.height, frame.pixel_format, 80,
+        image_to_jpeg_cb((uint8_t*)frame.data, frame.len, frame.width, frame.height, (pixformat_t)frame.pixel_format, 80,
             [](void* arg, size_t index, const void* data, size_t len) -> size_t {
                 auto queue = (QueueHandle_t)arg;
                 JpegChunk chunk = {
@@ -95,7 +114,7 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
                 return len;
             }, jpeg_queue);
         JpegChunk sentinel = { .data = nullptr, .len = 0 };
-        xQueueSend(queue, &sentinel, portMAX_DELAY);
+        xQueueSend(jpeg_queue, &sentinel, portMAX_DELAY);
     });
 
     auto network = Board::GetInstance().GetNetwork();
@@ -249,14 +268,20 @@ bool RemoteDetector::ParseResponseJson(const std::string& json_str, DetectionRes
 
 void RemoteDetector::SetEndpoint(const std::string& url) {
     endpoint_url_ = url;
+    Settings settings("vision", true);
+    settings.SetString("remote_url", url);
 }
 
 void RemoteDetector::SetAuthToken(const std::string& token) {
     auth_token_ = token;
+    Settings settings("vision", true);
+    settings.SetString("remote_token", token);
 }
 
 void RemoteDetector::SetRequestTimeoutSec(int sec) {
     if (sec > 0) timeout_sec_ = sec;
+    Settings settings("vision", true);
+    settings.SetInt("remote_timeout", timeout_sec_);
 }
 
 void RemoteDetector::SetExtraHeader(const std::string& key, const std::string& value) {
