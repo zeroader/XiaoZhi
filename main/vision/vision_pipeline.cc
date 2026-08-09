@@ -265,27 +265,128 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     return true;
 }
 
-void VisionPipeline::ContinuousLoop() {
-    ESP_LOGI(TAG, "Continuous detection loop started (period=%ums)", (unsigned int)continuous_period_ms_);
+// ---------- Two-thread architecture: Preview (15 FPS) + Detect (async) ----------
 
-    uint64_t last_iter_start = 0;
-    int consecutive_errors = 0;
+void VisionPipeline::PreviewLoop() {
+    ESP_LOGI(TAG, "Preview loop started (15 FPS)");
+
+    constexpr uint32_t kPreviewPeriodMs = 67;  // ~15 FPS
+    uint64_t last_iter = 0;
+
     while (continuous_running_.load()) {
         auto t0 = esp_timer_get_time();
-        stats_.loop_period_ms = last_iter_start == 0 ? 0
-            : (uint32_t)((t0 - last_iter_start) / 1000LL);
-        last_iter_start = t0;
+        stats_.loop_period_ms = last_iter == 0 ? 0 : (uint32_t)((t0 - last_iter) / 1000LL);
+        last_iter = t0;
 
-        std::string info;
-        OneShotDetect(true, &info);
+        // Step 1: Capture frame
+        ImageFrame frame;
+        if (CaptureFrame(frame)) {
+            // Step 2: Copy to shared buffer for detection thread
+            {
+                std::lock_guard<std::mutex> lock(frame_mutex_);
+                shared_frame_.assign(frame.data, frame.data + frame.len);
+                shared_frame_w_ = frame.width;
+                shared_frame_h_ = frame.height;
+                shared_frame_version_++;
+            }
 
-        // Track connection errors — stop after 3 consecutive failures
-        if (!last_result_.connection_ok) {
+            // Step 3: Compose preview with latest bbox (if any)
+            if (display_composer_) {
+                auto* lcd = ResolveLvglDisplay();
+                if (lcd != nullptr) {
+                    DetectionResult current_result;
+                    {
+                        std::lock_guard<std::mutex> lock(result_mutex_);
+                        current_result = last_result_;
+                    }
+                    auto t_comp0 = esp_timer_get_time();
+                    auto image = display_composer_->ComposePreview(
+                        frame.data, frame.width, frame.height,
+                        (size_t)frame.width * 2, current_result);
+                    auto t_comp1 = esp_timer_get_time();
+                    stats_.total_compose_ms += (uint64_t)((t_comp1 - t_comp0) / 1000LL);
+
+                    if (image) {
+                        auto t_disp0 = esp_timer_get_time();
+                        lcd->SetPreviewImage(std::move(image));
+                        auto t_disp1 = esp_timer_get_time();
+                        stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
+                        stats_.display_count++;
+                    }
+                }
+            }
+
+            // Step 4: Release frame
+            ReleaseCurrentFrame();
+        }
+
+        // Step 5: Sleep to maintain FPS
+        auto t1 = esp_timer_get_time();
+        int64_t elapsed = (t1 - t0) / 1000LL;
+        int64_t wait = (int64_t)kPreviewPeriodMs - elapsed;
+        if (wait > 0 && continuous_running_.load()) {
+            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait));
+        }
+    }
+    ESP_LOGI(TAG, "Preview loop stopped");
+}
+
+void VisionPipeline::DetectionLoop() {
+    ESP_LOGI(TAG, "Detection loop started");
+
+    int consecutive_errors = 0;
+    uint32_t last_version = 0;  // avoid re-processing same frame
+
+    while (continuous_running_.load()) {
+        // Wait for a NEW shared frame (skip if same as last processed)
+        ImageFrame detect_frame;
+        uint32_t current_version;
+        {
+            std::lock_guard<std::mutex> lock(frame_mutex_);
+            if (shared_frame_.empty()) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            current_version = shared_frame_version_;
+            if (current_version == last_version) {
+                // Frame hasn't changed since last detection, wait
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            last_version = current_version;
+            detect_frame.data = shared_frame_.data();
+            detect_frame.len = shared_frame_.size();
+            detect_frame.width = shared_frame_w_;
+            detect_frame.height = shared_frame_h_;
+            detect_frame.pixel_format = (int)PIXFORMAT_RGB565;
+        }
+
+        if (active_detector_ == nullptr) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Run detection (JPEG encode + HTTP POST + parse response)
+        auto t_detect0 = esp_timer_get_time();
+        DetectionResult result = active_detector_->Detect(detect_frame);
+        auto t_detect1 = esp_timer_get_time();
+        stats_.total_detect_ms += (uint64_t)((t_detect1 - t_detect0) / 1000LL);
+        stats_.detect_count++;
+
+        // Update shared result (mutex-protected for preview thread reads)
+        {
+            std::lock_guard<std::mutex> lock(result_mutex_);
+            last_result_ = result;
+        }
+        stats_.last_detection_count = (uint32_t)result.detections.size();
+
+        // Track connection errors
+        if (!result.connection_ok) {
             consecutive_errors++;
-            ESP_LOGW(TAG, "Connection error (%d/3): %s", consecutive_errors,
-                     last_result_.error_message.c_str());
+            ESP_LOGW(TAG, "Detection error (%d/3): %s", consecutive_errors,
+                     result.error_message.c_str());
             if (consecutive_errors >= 3) {
-                ESP_LOGE(TAG, "Stopping continuous detection after %d consecutive connection errors", consecutive_errors);
+                ESP_LOGE(TAG, "Stopping after %d consecutive detection errors", consecutive_errors);
                 continuous_running_.store(false);
                 break;
             }
@@ -293,15 +394,14 @@ void VisionPipeline::ContinuousLoop() {
             consecutive_errors = 0;
         }
 
-        auto t1 = esp_timer_get_time();
-        int64_t elapsed_ms = (t1 - t0) / 1000LL;
-        int64_t wait_ms = (int64_t)continuous_period_ms_ - elapsed_ms;
-        if (wait_ms > 0 && continuous_running_.load()) {
-            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
-        }
+        ESP_LOGI(TAG, "Detect: %d faces, %lldms",
+                 (int)result.detections.size(),
+                 (long long)((t_detect1 - t_detect0) / 1000LL));
     }
-    ESP_LOGI(TAG, "Continuous detection loop stopped");
+    ESP_LOGI(TAG, "Detection loop stopped");
 }
+
+// ---------- Start/Stop ----------
 
 bool VisionPipeline::StartContinuous(uint32_t period_ms) {
     if (!initialized_) return false;
@@ -309,28 +409,44 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms) {
         ESP_LOGW(TAG, "Continuous detect already running");
         return true;
     }
-    // Join any previous thread that may have auto-stopped (connection errors)
-    if (continuous_thread_.joinable()) {
-        continuous_thread_.join();
+    // Join any previous threads that may have auto-stopped
+    if (preview_thread_.joinable()) preview_thread_.join();
+    if (detect_thread_.joinable()) detect_thread_.join();
+
+    // Clear shared frame buffer
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        shared_frame_.clear();
     }
+
     continuous_period_ms_ = period_ms;
     continuous_running_.store(true);
+
     try {
-        continuous_thread_ = std::thread([this]() { this->ContinuousLoop(); });
+        preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
     } catch (...) {
         continuous_running_.store(false);
-        ESP_LOGE(TAG, "Failed to spawn continuous detection thread");
+        ESP_LOGE(TAG, "Failed to spawn preview thread");
         return false;
     }
+
+    try {
+        detect_thread_ = std::thread([this]() { this->DetectionLoop(); });
+    } catch (...) {
+        continuous_running_.store(false);
+        if (preview_thread_.joinable()) preview_thread_.join();
+        ESP_LOGE(TAG, "Failed to spawn detection thread");
+        return false;
+    }
+
     return true;
 }
 
 void VisionPipeline::StopContinuous() {
     if (!continuous_running_.load()) return;
     continuous_running_.store(false);
-    if (continuous_thread_.joinable()) {
-        continuous_thread_.join();
-    }
+    if (preview_thread_.joinable()) preview_thread_.join();
+    if (detect_thread_.joinable()) detect_thread_.join();
 }
 
 bool VisionPipeline::IsContinuousRunning() const {
@@ -673,7 +789,7 @@ void RegisterVisionMcpTools() {
         PropertyList({
             Property("url", kPropertyTypeString),
             Property("timeout_sec", kPropertyTypeInteger, 10, 1, 300),
-            Property("jpeg_quality", kPropertyTypeInteger, 75, 10, 100)
+            Property("jpeg_quality", kPropertyTypeInteger, 50, 10, 100)
         }),
         [](const PropertyList& p) -> ReturnValue {
             auto& pipe = VisionPipeline::GetInstance();

@@ -127,6 +127,8 @@ class FaceDetector:
 # ============================================================
 
 detector: FaceDetector = None
+_last_frame_time = None  # 上一帧到达的时间戳，用于计算帧间隔和 FPS
+_last_response_time = None  # 上一次响应发出的时间戳，用于估算网络+客户端耗时
 
 
 # ============================================================
@@ -136,7 +138,13 @@ detector: FaceDetector = None
 @app.route("/detect", methods=["POST"])
 def detect():
     """人脸检测 API"""
+    global _last_frame_time, _last_response_time
     t_start = time.time()
+
+    # 客户端(ESP32)+网络耗时：上一次响应发出后到本次请求到达
+    client_net_ms = 0.0
+    if _last_response_time is not None:
+        client_net_ms = (t_start - _last_response_time) * 1000
 
     try:
         data = request.get_json(force=True)
@@ -153,10 +161,18 @@ def detect():
 
     all_detections = []
 
+    # 统计各阶段耗时（解码 / 推理）与请求体大小
+    t_decode_ms = 0.0
+    t_infer_ms = 0.0
+    payload_kb = 0.0
+
     for idx, img_b64 in enumerate(images_b64):
         if not img_b64:
             continue
 
+        payload_kb += len(img_b64) / 1024.0
+
+        t0 = time.time()
         try:
             # Base64 解码 -> JPEG bytes
             jpeg_bytes = base64.b64decode(img_b64)
@@ -169,14 +185,31 @@ def detect():
             image_rgb = np.array(image.convert("RGB"))
         except Exception as e:
             return jsonify({"error": f"image[{idx}]: decode failed - {str(e)}"}), 400
+        t1 = time.time()
 
         # 检测
         dets = detector.detect(image_rgb, src_width, src_height)
+        t2 = time.time()
+
         all_detections.extend(dets)
+        t_decode_ms += (t1 - t0) * 1000
+        t_infer_ms += (t2 - t1) * 1000
+
+    # 计算帧间隔并换算 FPS
+    now = time.time()
+    interval_ms = 0.0
+    fps = 0.0
+    if _last_frame_time is not None:
+        interval_ms = (now - _last_frame_time) * 1000
+        fps = 1000.0 / interval_ms if interval_ms > 0 else 0.0
+    _last_frame_time = now
+    _last_response_time = now
 
     t_elapsed = (time.time() - t_start) * 1000
-    print(f"[{time.strftime('%H:%M:%S')}] POST /detect: {len(images_b64)} images, "
-          f"{len(all_detections)} detections, {t_elapsed:.0f}ms")
+    print(f"[{time.strftime('%H:%M:%S')}] interval={interval_ms:.0f}ms FPS={fps:.1f} | "
+          f"client+net={client_net_ms:.0f}ms server={t_elapsed:.0f}ms "
+          f"(decode={t_decode_ms:.0f}ms infer={t_infer_ms:.0f}ms) "
+          f"payload={payload_kb:.1f}KB detections={len(all_detections)}")
 
     return jsonify({"detections": all_detections})
 

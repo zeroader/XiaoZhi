@@ -13,6 +13,8 @@
 #include <memory>
 #include <atomic>
 #include <thread>
+#include <mutex>
+#include <vector>
 
 #include <esp_camera.h>
 
@@ -93,15 +95,25 @@ private:
     Detector* active_detector_;
 
     DetectionResult last_result_;
+    std::mutex result_mutex_;  // protects last_result_ between preview & detect threads
     PipelineStats stats_;
 
     std::atomic<bool> continuous_running_;
-    std::thread continuous_thread_;
+    std::thread preview_thread_;
+    std::thread detect_thread_;
     uint32_t continuous_period_ms_;
+
+    // Shared frame buffer: preview thread writes, detect thread reads
+    std::mutex frame_mutex_;
+    std::vector<uint8_t> shared_frame_;
+    int shared_frame_w_ = 0;
+    int shared_frame_h_ = 0;
+    uint32_t shared_frame_version_ = 0;  // increments each time preview writes new frame
 
     Esp32Camera* ResolveEsp32Camera();
     LvglDisplay* ResolveLvglDisplay();
-    void ContinuousLoop();
+    void PreviewLoop();   // 15 FPS: capture → display (with latest bbox)
+    void DetectionLoop();  // async: send frame → receive bbox → update result
 
     bool CaptureFrame(ImageFrame& out_frame);
     bool ReleaseCurrentFrame();
