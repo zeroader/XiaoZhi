@@ -188,12 +188,12 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
     auto parse_end = esp_timer_get_time();
 
     auto total_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "Remote detect: jpeg=%zuB, detections=%d, total=%lldms (http+enc=%lldms, parse=%lldms)",
-             total_jpeg,
+    ESP_LOGI(TAG, "Remote detect: jpeg=%d B, detections=%d, total=%dms (http+enc=%dms, parse=%dms)",
+             (int)total_jpeg,
              (int)result.detections.size(),
-             (long long)((total_end - total_start) / 1000LL),
-             (long long)(((parse_start - total_start)) / 1000LL),
-             (long long)((parse_end - parse_start) / 1000LL));
+             (int)((total_end - total_start) / 1000LL),
+             (int)(((parse_start - total_start)) / 1000LL),
+             (int)((parse_end - parse_start) / 1000LL));
 
     return result;
 }

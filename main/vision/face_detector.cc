@@ -116,9 +116,9 @@ DetectionResult FaceDetector::Detect(const ImageFrame& frame) {
     }
 
     auto end = esp_timer_get_time();
-    ESP_LOGD(TAG, "Detected %d faces in %lld ms (threshold=%.2f)",
+    ESP_LOGD(TAG, "Detected %d faces in %d ms (threshold=%.2f)",
              (int)result.detections.size(),
-             (long long)((end - start) / 1000LL),
+             (int)((end - start) / 1000LL),
              confidence_threshold_);
 #else
     (void)frame;

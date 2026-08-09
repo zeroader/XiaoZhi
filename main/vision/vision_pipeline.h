@@ -67,9 +67,10 @@ public:
     OnlineDetector* GetOnlineDetector();
     VisionDisplay* GetDisplayComposer();
 
-    bool OneShotDetect(bool show_on_lcd = true, std::string* out_debug_info = nullptr);
+    bool OneShotDetect(bool show_on_lcd = true, std::string* out_debug_info = nullptr,
+                       const std::string& task = "");
 
-    bool StartContinuous(uint32_t period_ms = 500);
+    bool StartContinuous(uint32_t period_ms = 500, const std::string& task = "");
     void StopContinuous();
     bool IsContinuousRunning() const;
 
@@ -79,6 +80,10 @@ public:
     bool SetCameraMirror(bool h_mirror, bool v_flip);
 
     const DetectionResult& GetLastResult() const;
+
+    // 最近一次心率结果（跨帧保留，供查询）
+    HeartRateResult GetLatestHeartRate() const;
+    uint64_t GetHeartRateTimestampMs() const;
 
 private:
     bool initialized_;
@@ -102,6 +107,17 @@ private:
     std::thread preview_thread_;
     std::thread detect_thread_;
     uint32_t continuous_period_ms_;
+    std::string continuous_task_;   // 连续检测任务：face_emotion / posture / heart_rate / auto
+
+    // 跨帧缓存的感知结果：心率值供查询，坐姿用于 LCD 持续叠加
+    HeartRateResult latest_heart_rate_;
+    PostureResult latest_posture_;
+    uint64_t heart_rate_timestamp_ms_;
+    mutable std::mutex sensing_mutex_;  // 保护 latest_heart_rate_ / latest_posture_（const getter 中使用）
+
+    // 坐姿提醒状态
+    bool posture_reminded_ = false;      // 当前是否已处于"已提醒"的坏坐姿状态
+    uint64_t last_posture_remind_ms_ = 0;  // 上次提醒时间（防刷屏）
 
     // Shared frame buffer: preview thread writes, detect thread reads
     std::mutex frame_mutex_;
@@ -114,6 +130,9 @@ private:
     LvglDisplay* ResolveLvglDisplay();
     void PreviewLoop();   // 15 FPS: capture → display (with latest bbox)
     void DetectionLoop();  // async: send frame → receive bbox → update result
+
+    void CacheSensingResult(const DetectionResult& result);
+    void MaybeNotifyPosture(const DetectionResult& result);
 
     bool CaptureFrame(ImageFrame& out_frame);
     bool ReleaseCurrentFrame();
