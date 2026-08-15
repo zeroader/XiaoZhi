@@ -2,23 +2,19 @@
 
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
 #include <cstring>
+#include <cstdlib>
 
-#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
-#if __has_include("esp_face_detect.h")
-#define HAVE_ESP_FACE_DETECT 1
-#include "esp_face_detect.h"
-#include "esp_face_detect_default_run_model.h"
-#include "dl_image_draw.h"
-#endif
-#endif
+#include <human_face_detect.hpp>
+#include <dl_image_define.hpp>
 
 #define TAG "FaceDetector"
 
 FaceDetector::FaceDetector()
     : initialized_(false)
     , confidence_threshold_(0.5f)
-    , sr_handle_(nullptr) {
+    , detector_(nullptr) {
 }
 
 FaceDetector::~FaceDetector() {
@@ -34,31 +30,16 @@ bool FaceDetector::Initialize() {
         return true;
     }
 
-#ifdef HAVE_ESP_FACE_DETECT
-    ESP_LOGI(TAG, "Initializing ESP-SR face detector");
-    face_detect_model_data_t *model = NULL;
-    model = get_face_detect_model();
-    if (model == NULL) {
-        ESP_LOGE(TAG, "Failed to get face detect model");
+    detector_ = new HumanFaceDetect();
+    if (detector_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create HumanFaceDetect instance");
         return false;
     }
 
-    sr_handle_ = esp_face_detect_create(model);
-    if (sr_handle_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to create face detector");
-        return false;
-    }
-
-    esp_face_detect_set_threshold(sr_handle_, confidence_threshold_);
     initialized_ = true;
-    ESP_LOGI(TAG, "ESP-SR face detector initialized, threshold=%.2f", confidence_threshold_);
-#else
-    ESP_LOGW(TAG, "ESP-SR face detection not available in this build. "
-                  "Using stub detector - will return empty results. "
-                  "For real face detection, enable esp-sr with face_detect model.");
-    initialized_ = true;
-#endif
-    return initialized_;
+    ESP_LOGI(TAG, "ESP-DL face detector initialized (MSR_S8_V1+MNP_S8_V1, input=%dx%d, threshold=%.2f)",
+             kModelWidth, kModelHeight, confidence_threshold_);
+    return true;
 }
 
 void FaceDetector::Deinitialize() {
@@ -66,14 +47,42 @@ void FaceDetector::Deinitialize() {
         return;
     }
 
-#ifdef HAVE_ESP_FACE_DETECT
-    if (sr_handle_ != nullptr) {
-        esp_face_detect_destroy((esp_face_detect_handle_t)sr_handle_);
-        sr_handle_ = nullptr;
+    if (detector_ != nullptr) {
+        delete detector_;
+        detector_ = nullptr;
     }
-#endif
     initialized_ = false;
     ESP_LOGI(TAG, "Face detector deinitialized");
+}
+
+void FaceDetector::Rgb565ToRgb888(const uint8_t* src, uint8_t* dst, int width, int height) {
+    const uint16_t* src16 = (const uint16_t*)src;
+    int pixel_count = width * height;
+    for (int i = 0; i < pixel_count; i++) {
+        uint16_t pixel = src16[i];
+        uint8_t r5 = (pixel >> 11) & 0x1F;
+        uint8_t g6 = (pixel >> 5) & 0x3F;
+        uint8_t b5 = pixel & 0x1F;
+        // Scale to 8-bit per channel
+        dst[i * 3 + 0] = (r5 << 3) | (r5 >> 2);   // R
+        dst[i * 3 + 1] = (g6 << 2) | (g6 >> 4);   // G
+        dst[i * 3 + 2] = (b5 << 3) | (b5 >> 2);   // B
+    }
+}
+
+void FaceDetector::ResizeRgb888(const uint8_t* src, int src_w, int src_h,
+                                uint8_t* dst, int dst_w, int dst_h) {
+    for (int y = 0; y < dst_h; y++) {
+        int src_y = y * src_h / dst_h;
+        for (int x = 0; x < dst_w; x++) {
+            int src_x = x * src_w / dst_w;
+            int src_idx = (src_y * src_w + src_x) * 3;
+            int dst_idx = (y * dst_w + x) * 3;
+            dst[dst_idx + 0] = src[src_idx + 0];
+            dst[dst_idx + 1] = src[src_idx + 1];
+            dst[dst_idx + 2] = src[src_idx + 2];
+        }
+    }
 }
 
 DetectionResult FaceDetector::Detect(const ImageFrame& frame) {
@@ -82,58 +91,74 @@ DetectionResult FaceDetector::Detect(const ImageFrame& frame) {
     result.source_height = frame.height;
     result.timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000LL);
 
-    if (!initialized_ || frame.data == nullptr || frame.width <= 0 || frame.height <= 0) {
+    if (!initialized_ || detector_ == nullptr
+        || frame.data == nullptr || frame.width <= 0 || frame.height <= 0) {
         return result;
     }
 
-#ifdef HAVE_ESP_FACE_DETECT
-    auto start = esp_timer_get_time();
+    auto t_start = esp_timer_get_time();
 
-    esp_face_detect_result_list_t* faces = (esp_face_detect_result_list_t*)
-        esp_face_detect_run((esp_face_detect_handle_t)sr_handle_,
-                            (uint8_t*)frame.data, frame.width, frame.height,
-                            (pix_format_t)frame.pixel_format);
-
-    if (faces == nullptr) {
-        ESP_LOGW(TAG, "Face detect returned null");
+    // Copy camera RGB565 frame to a separate PSRAM buffer to isolate from DMA.
+    // HumanFaceDetect::run() internally handles: RGB565→RGB888 conversion,
+    // resize to model input, normalization, quantization, anchor decode, and NMS.
+    int frame_bytes = frame.width * frame.height * 2;
+    uint8_t* frame_copy = (uint8_t*)heap_caps_malloc(frame_bytes, MALLOC_CAP_SPIRAM);
+    if (frame_copy == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate frame copy (%d bytes)", frame_bytes);
         return result;
     }
+    memcpy(frame_copy, frame.data, frame_bytes);
 
-    int count = faces->count;
-    for (int i = 0; i < count; i++) {
-        auto& face = faces->results[i];
-        if (face.score < confidence_threshold_) {
-            continue;
-        }
+    dl::image::img_t img = {
+        .data = frame_copy,
+        .width = (uint16_t)frame.width,
+        .height = (uint16_t)frame.height,
+        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE
+    };
+
+    auto t_infer_start = esp_timer_get_time();
+    auto& detect_results = detector_->run(img);
+    auto t_infer_end = esp_timer_get_time();
+
+    // Coordinates are in original image space (model handles decode + clamp internally)
+    for (const auto& res : detect_results) {
+        ESP_LOGI(TAG, "Raw result: score=%.3f box=[%d,%d,%d,%d] keypoints=%d",
+                 res.score, res.box[0], res.box[1], res.box[2], res.box[3],
+                 (int)res.keypoint.size());
         Detection d;
         d.class_id = 0;
         d.class_name = "face";
-        d.confidence = face.score;
-        d.box = BoundingBox(face.box[0], face.box[1],
-                            face.box[2] - face.box[0],
-                            face.box[3] - face.box[1]);
+        d.confidence = res.score;
+        int x1 = res.box[0];
+        int y1 = res.box[1];
+        int x2 = res.box[2];
+        int y2 = res.box[3];
+        if (x1 < 0) x1 = 0;
+        if (y1 < 0) y1 = 0;
+        if (x2 > frame.width) x2 = frame.width;
+        if (y2 > frame.height) y2 = frame.height;
+        ESP_LOGI(TAG, "Final detection: score=%.3f box=[%d,%d,%d,%d] w=%d h=%d",
+                 res.score, x1, y1, x2, y2, x2-x1, y2-y1);
+        d.box = BoundingBox(x1, y1, x2 - x1, y2 - y1);
         result.detections.push_back(d);
     }
 
-    auto end = esp_timer_get_time();
-    ESP_LOGD(TAG, "Detected %d faces in %lld ms (threshold=%.2f)",
+    heap_caps_free(frame_copy);
+
+    auto t_end = esp_timer_get_time();
+    ESP_LOGD(TAG, "Detected %d faces: total=%dms (infer=%dms)",
              (int)result.detections.size(),
-             (long long)((end - start) / 1000LL),
-             confidence_threshold_);
-#else
-    (void)frame;
-#endif
+             (int)((t_end - t_start) / 1000LL),
+             (int)((t_infer_end - t_infer_start) / 1000LL));
 
     return result;
 }
 
 void FaceDetector::SetConfidenceThreshold(float threshold) {
     confidence_threshold_ = threshold;
-#ifdef HAVE_ESP_FACE_DETECT
-    if (sr_handle_ != nullptr) {
-        esp_face_detect_set_threshold((esp_face_detect_handle_t)sr_handle_, threshold);
-    }
-#endif
+    // HumanFaceDetect doesn't have a runtime threshold setter;
+    // filtering is done in Detect() against confidence_threshold_
+    ESP_LOGI(TAG, "Confidence threshold set to %.2f", threshold);
 }
 
 float FaceDetector::GetConfidenceThreshold() const {

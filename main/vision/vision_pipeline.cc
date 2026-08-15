@@ -2,6 +2,7 @@
 
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_pthread.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -58,8 +59,15 @@ Esp32Camera* VisionPipeline::ResolveEsp32Camera() {
 
 LvglDisplay* VisionPipeline::ResolveLvglDisplay() {
     auto* display = Board::GetInstance().GetDisplay();
-    if (display == nullptr) return nullptr;
-    return dynamic_cast<LvglDisplay*>(display);
+    if (display == nullptr) {
+        ESP_LOGW(TAG, "ResolveLvglDisplay: Board::GetDisplay() returns NULL");
+        return nullptr;
+    }
+    auto* lcd = dynamic_cast<LvglDisplay*>(display);
+    if (lcd == nullptr) {
+        ESP_LOGW(TAG, "ResolveLvglDisplay: dynamic_cast<LvglDisplay*> failed, display is not an LvglDisplay subclass");
+    }
+    return lcd;
 }
 
 bool VisionPipeline::Initialize() {
@@ -162,12 +170,14 @@ VisionDisplay* VisionPipeline::GetDisplayComposer() { return display_composer_.g
 bool VisionPipeline::CaptureFrame(ImageFrame& out_frame) {
     auto* cam = ResolveEsp32Camera();
     if (cam == nullptr) {
-        ESP_LOGE(TAG, "No Esp32Camera available for capture");
+        ESP_LOGE(TAG, "CaptureFrame: No Esp32Camera available for capture. "
+                 "Check that Board::GetCamera() returns non-NULL (camera may not be plugged in, "
+                 "or XL9555 PWDN/RESET pins are not set correctly)");
         return false;
     }
     auto t0 = esp_timer_get_time();
     if (!cam->Capture()) {
-        ESP_LOGE(TAG, "Camera Capture() failed");
+        ESP_LOGE(TAG, "CaptureFrame: Camera Capture() returned false. Check camera cable / PWDN pin.");
         return false;
     }
     auto t1 = esp_timer_get_time();
@@ -176,7 +186,12 @@ bool VisionPipeline::CaptureFrame(ImageFrame& out_frame) {
 
     camera_fb_t* fb = cam->GetLastCapturedFrame();
     if (fb == nullptr) {
-        ESP_LOGE(TAG, "Captured frame buffer is null");
+        ESP_LOGE(TAG, "CaptureFrame: GetLastCapturedFrame() returned NULL frame buffer");
+        return false;
+    }
+    if (fb->buf == nullptr || fb->width == 0 || fb->height == 0) {
+        ESP_LOGE(TAG, "CaptureFrame: invalid frame buf=%p %dx%d len=%u",
+                 fb->buf, fb->width, fb->height, (unsigned)fb->len);
         return false;
     }
     out_frame.data = fb->buf;
@@ -230,20 +245,28 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     bool displayed = false;
     if (show_on_lcd && display_composer_) {
         auto* lcd = ResolveLvglDisplay();
-        if (lcd != nullptr) {
+        if (lcd == nullptr) {
+            ESP_LOGW(TAG, "OneShotDetect: ResolveLvglDisplay returned NULL, skip showing on LCD");
+        } else {
             auto t_comp0 = esp_timer_get_time();
+            ESP_LOGI(TAG, "OneShotDetect: ComposePreview frame=%dx%d format=%d len=%u",
+                     frame.width, frame.height, frame.pixel_format, (unsigned)frame.len);
             auto image = display_composer_->ComposePreview(frame.data, frame.width, frame.height,
                                                           (size_t)frame.width * 2, result);
             auto t_comp1 = esp_timer_get_time();
             stats_.total_compose_ms += (uint64_t)((t_comp1 - t_comp0) / 1000LL);
 
-            if (image) {
+            if (!image) {
+                ESP_LOGW(TAG, "OneShotDetect: ComposePreview returned NULL (bad alloc or invalid dims?)");
+            } else {
                 auto t_disp0 = esp_timer_get_time();
                 lcd->SetPreviewImage(std::move(image));
                 auto t_disp1 = esp_timer_get_time();
                 stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
                 stats_.display_count++;
                 displayed = true;
+                ESP_LOGI(TAG, "OneShotDetect: SetPreviewImage done (took %dms)",
+                         (int)((t_disp1 - t_disp0) / 1000LL));
             }
         }
     }
@@ -253,12 +276,12 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     auto t_all1 = esp_timer_get_time();
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "detector=%s, detections=%d, dimensions=%dx%d, total=%lldms, detect=%lldms, shown=%s",
+             "detector=%s, detections=%d, dimensions=%dx%d, total=%dms, detect=%dms, shown=%s",
              active_detector_->GetName(),
              (int)result.detections.size(),
              frame.width, frame.height,
-             (long long)((t_all1 - t_all) / 1000LL),
-             (long long)((t_detect1 - t_detect0) / 1000LL),
+             (int)((t_all1 - t_all) / 1000LL),
+             (int)((t_detect1 - t_detect0) / 1000LL),
              displayed ? "true" : "false");
     ESP_LOGI(TAG, "OneShotDetect: %s", buf);
     if (out_debug_info) *out_debug_info = buf;
@@ -421,24 +444,21 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms) {
 
     continuous_period_ms_ = period_ms;
     continuous_running_.store(true);
-
+    // The loop thread runs snprintf/ESP_LOGI and LVGL calls; the default pthread
+    // stack (3072B) is too small and caused a printf crash. Use a larger stack.
+    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    cfg.stack_size = 8192;
+    cfg.prio = 5;
+    esp_pthread_set_cfg(&cfg);
     try {
         preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
     } catch (...) {
+        esp_pthread_set_cfg(nullptr);
         continuous_running_.store(false);
         ESP_LOGE(TAG, "Failed to spawn preview thread");
         return false;
     }
-
-    try {
-        detect_thread_ = std::thread([this]() { this->DetectionLoop(); });
-    } catch (...) {
-        continuous_running_.store(false);
-        if (preview_thread_.joinable()) preview_thread_.join();
-        ESP_LOGE(TAG, "Failed to spawn detection thread");
-        return false;
-    }
-
+    esp_pthread_set_cfg(nullptr);
     return true;
 }
 
@@ -451,6 +471,75 @@ void VisionPipeline::StopContinuous() {
 
 bool VisionPipeline::IsContinuousRunning() const {
     return continuous_running_.load();
+}
+
+// --- Preview-only (no detection) ---
+
+void VisionPipeline::PreviewLoop() {
+    ESP_LOGI(TAG, "Preview loop started (period=%ums)", preview_period_ms_);
+    while (preview_running_.load()) {
+        auto t0 = esp_timer_get_time();
+
+        ImageFrame frame;
+        if (!CaptureFrame(frame)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        DetectionResult empty_result;  // no detections
+        empty_result.source_width = frame.width;
+        empty_result.source_height = frame.height;
+
+        auto* lcd = ResolveLvglDisplay();
+        if (lcd != nullptr && display_composer_) {
+            auto image = display_composer_->ComposePreview(
+                frame.data, frame.width, frame.height,
+                (size_t)frame.width * 2, empty_result);
+            if (image) {
+                lcd->SetPreviewImage(std::move(image));
+            }
+        }
+
+        ReleaseCurrentFrame();
+
+        auto t1 = esp_timer_get_time();
+        int64_t elapsed_ms = (t1 - t0) / 1000LL;
+        int64_t wait_ms = (int64_t)preview_period_ms_ - elapsed_ms;
+        if (wait_ms > 0 && preview_running_.load()) {
+            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
+        }
+    }
+    ESP_LOGI(TAG, "Preview loop stopped");
+}
+
+bool VisionPipeline::StartPreview(uint32_t period_ms) {
+    if (!initialized_) return false;
+    if (preview_running_.load()) {
+        ESP_LOGW(TAG, "Preview already running");
+        return true;
+    }
+    preview_period_ms_ = period_ms;
+    preview_running_.store(true);
+    try {
+        preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
+    } catch (...) {
+        preview_running_.store(false);
+        ESP_LOGE(TAG, "Failed to spawn preview thread");
+        return false;
+    }
+    return true;
+}
+
+void VisionPipeline::StopPreview() {
+    if (!preview_running_.load()) return;
+    preview_running_.store(false);
+    if (preview_thread_.joinable()) {
+        preview_thread_.join();
+    }
+}
+
+bool VisionPipeline::IsPreviewRunning() const {
+    return preview_running_.load();
 }
 
 const PipelineStats& VisionPipeline::GetStats() const { return stats_; }
@@ -545,7 +634,9 @@ void RegisterVisionMcpTools() {
 
     mcp.AddTool("self.vision.init",
         "Initialize the vision pipeline (camera + detectors + display composer). "
-        "Must be called before other self.vision.* tools. Safe to call multiple times.",
+        "Must be called before other self.vision.* tools. Safe to call multiple times.\n"
+        "NOTE: all self.vision.* tools process images LOCALLY on the device - no image is ever uploaded "
+        "(unless you explicitly configure and select the `remote` detector).",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             return VisionPipeline::GetInstance().Initialize();
@@ -563,7 +654,8 @@ void RegisterVisionMcpTools() {
         "Choose which detector is used for detection.\n"
         "Note: `online` is the default after initialization.\n"
         "Args:\n"
-        "  `detector`: One of `face` (local ESP-SR), `remote` (HTTP multipart), `online` (HTTP JSON+Base64).",
+        "  `detector`: One of `face` (local, low-latency, ESP-SR based, NO upload), "
+        "`remote` (HTTP server based, UPLOADS the frame to the configured server).",
         PropertyList({
             Property("detector", kPropertyTypeString)
         }),
@@ -594,8 +686,10 @@ void RegisterVisionMcpTools() {
         });
 
     mcp.AddTool("self.vision.detect_once",
-        "Capture one frame from the camera, run the active detector, and draw detection boxes "
-        "on the LCD preview image. Returns full detection result JSON.\n"
+        "Capture ONE frame from the camera, run the active detector LOCALLY, and draw detection boxes "
+        "on the LCD preview image. The frame never leaves the device (no upload).\n"
+        "Use for a single snapshot check. For continuous REAL-TIME detection, call `self.vision.start_continuous` instead "
+        "(do not call this tool repeatedly in a loop).\n"
         "Args:\n"
         "  `show_on_lcd` (optional, default true): if false, do not update the LCD.\n",
         PropertyList({
@@ -627,7 +721,11 @@ void RegisterVisionMcpTools() {
         });
 
     mcp.AddTool("self.vision.start_continuous",
-        "Start continuous detection loop: capture -> detect -> show on LCD, repeated.\n"
+        "Start REAL-TIME detection loop: capture -> detect LOCALLY -> draw boxes on LCD, repeated continuously.\n"
+        "Use this when the user asks for real-time / continuous / live face detection, or wants the device to "
+        "keep watching the camera (e.g. \"实时人脸检测\", \"持续盯着我\", \"检测到人脸就告诉我\").\n"
+        "LOCAL-ONLY: every frame is processed on the device, nothing is uploaded to any server.\n"
+        "While this loop is running, `self.camera.take_photo` (which uploads to the cloud) is blocked.\n"
         "Args:\n"
         "  `period_ms` (optional, default 500): target time between iterations in ms. "
         "Actual rate may be lower if detector is slow.",
@@ -642,7 +740,8 @@ void RegisterVisionMcpTools() {
         });
 
     mcp.AddTool("self.vision.stop_continuous",
-        "Stop the continuous detection loop.",
+        "Stop the REAL-TIME detection loop started by `self.vision.start_continuous`. "
+        "Call this when the user no longer wants continuous face detection, or before switching to a single snapshot.",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             VisionPipeline::GetInstance().StopContinuous();
@@ -654,6 +753,36 @@ void RegisterVisionMcpTools() {
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             return (bool)VisionPipeline::GetInstance().IsContinuousRunning();
+        });
+
+    mcp.AddTool("self.vision.start_preview",
+        "Start live camera preview on LCD (capture + display, NO face detection). "
+        "Use this to verify the camera → LCD pipeline without any AI overhead. "
+        "Much lighter than start_continuous — does not run any model.\n"
+        "Args:\n"
+        "  `period_ms` (optional, default 200): target interval between frames.",
+        PropertyList({
+             Property("period_ms", kPropertyTypeInteger, 200, 50, 5000)
+         }),
+        [](const PropertyList& properties) -> ReturnValue {
+             uint32_t period = 200;
+             try {
+                 period = (uint32_t)properties["period_ms"].value<int>();
+             } catch (...) {
+                 // use default
+             }
+             if (!VisionPipeline::GetInstance().StartPreview(period)) {
+                throw std::runtime_error("Failed to start preview (pipeline not initialized?)");
+            }
+            return std::string("Preview started successfully. Call self.vision.stop_preview to stop.");
+        });
+
+    mcp.AddTool("self.vision.stop_preview",
+        "Stop the live camera preview started by `self.vision.start_preview`.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            VisionPipeline::GetInstance().StopPreview();
+            return true;
         });
 
     mcp.AddTool("self.vision.get_stats",

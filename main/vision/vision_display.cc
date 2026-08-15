@@ -220,7 +220,7 @@ std::unique_ptr<LvglImage> VisionDisplay::ComposePreview(const uint8_t* frame_rg
     size_t total = dst_stride * (size_t)height;
     uint8_t* dst = (uint8_t*)heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
     if (dst == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate %zu bytes for preview", total);
+        ESP_LOGE(TAG, "Failed to allocate %u bytes for preview", (unsigned)total);
         return nullptr;
     }
 
@@ -234,7 +234,7 @@ std::unique_ptr<LvglImage> VisionDisplay::ComposePreview(const uint8_t* frame_rg
         }
     }
 
-    // Swap RGB565 byte pairs for LVGL compatibility (LVGL expects BGR565 byte order on ESP32-S3)
+    // Swap RGB565 byte pairs for LVGL compatibility (LVGL expects BGR565 byte order)
     {
         uint16_t* pixels = (uint16_t*)dst;
         size_t pixel_count = total / 2;

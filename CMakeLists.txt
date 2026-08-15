@@ -8,6 +8,8 @@ set(PROJECT_VER "2.0.3")
 
 # Add this line to disable the specific warning
 add_compile_options(-Wno-missing-field-initializers)
+# Fix Windows toolchain format mismatch: uint32_t = long unsigned int vs PRIu32 = %u
+add_compile_options(-Wno-format)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(xiaozhi)

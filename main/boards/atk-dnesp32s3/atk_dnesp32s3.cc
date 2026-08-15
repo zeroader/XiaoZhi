@@ -44,6 +44,24 @@ public:
     }
 };
 
+class Xl9555Backlight : public Backlight {
+public:
+    Xl9555Backlight(XL9555* xl9555, uint8_t bit, bool invert = false)
+        : Backlight(), xl9555_(xl9555), bit_(bit), invert_(invert) {}
+
+protected:
+    void SetBrightnessImpl(uint8_t brightness) override {
+        uint8_t level = (brightness > 0) ? 1 : 0;
+        if (invert_) level = !level;
+        xl9555_->SetOutputState(bit_, level);
+    }
+
+private:
+    XL9555* xl9555_;
+    uint8_t bit_;
+    bool invert_;
+};
+
 class atk_dnesp32s3 : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -51,6 +69,7 @@ private:
     LcdDisplay* display_;
     XL9555* xl9555_;
     Esp32Camera* camera_;
+    Backlight* backlight_ = nullptr;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -119,11 +138,16 @@ private:
         esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel);
         
         esp_lcd_panel_reset(panel);
-        xl9555_->SetOutputState(8, 1);
+
+        // XL9555 扩展IO输出：
+        //   bit 2 = 0：根据正点原子的设计，通常是 LCD_RST/相关电源控制的低电平释放
+        //   bit 8 = 1：疑似背光使能（高电平开启）；如果实测不亮，可在下方 Xl9555Backlight 中调整脚位
         xl9555_->SetOutputState(2, 0);
+        xl9555_->SetOutputState(8, 1);
+        ESP_LOGI(TAG, "XL9555: set bit2=0 (LCD CTRL), bit8=1 (BL tentative)");
 
         esp_lcd_panel_init(panel);
-        esp_lcd_panel_invert_color(panel, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
+        esp_lcd_panel_invert_color(panel, true);
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY); 
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         display_ = new SpiLcdDisplay(panel_io, panel,
@@ -194,11 +218,19 @@ public:
         InitializeSt7789Display();
         InitializeButtons();
         InitializeCamera();
+        // 背光控制：正点原子 ATK-DNESP32S3 板通过 XL9555 的第8脚控制 LCD 背光使能
+        // 如果你实测还是黑屏，请把这里的 8 改成其他 XL9555 IO（如 3/4/9 等）
+        backlight_ = new Xl9555Backlight(xl9555_, 8, false);
+        backlight_->RestoreBrightness();
     }
 
     virtual Led* GetLed() override {
         static SingleLed led(BUILTIN_LED_GPIO);
         return &led;
+    }
+
+    virtual Backlight* GetBacklight() override {
+        return backlight_;
     }
 
     virtual AudioCodec* GetAudioCodec() override {

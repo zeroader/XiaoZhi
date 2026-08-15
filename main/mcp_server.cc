@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "vision_pipeline.h"
 
 #define TAG "MCP"
 
@@ -100,7 +101,13 @@ void McpServer::AddCommonTools() {
     auto camera = board.GetCamera();
     if (camera) {
         AddTool("self.camera.take_photo",
-            "Take a photo and explain it. Use this tool after the user asks you to see something.\n"
+            "Take a photo and explain it. **This tool uploads the captured photo to the cloud AI server for analysis** "
+            "(the image leaves the device, network and server URL required).\n"
+            "Use it ONLY when the user explicitly asks you to look at / understand / describe what the camera sees "
+            "(e.g. \"看看这是什么\", \"描述一下你看到的\").\n"
+            "IMPORTANT: For face detection or live camera preview, do NOT use this tool. "
+            "Use `self.vision.*` tools instead - they detect faces LOCALLY on the device and never upload any image.\n"
+            "This tool is blocked while real-time detection (`self.vision.start_continuous`) is running.\n"
             "Args:\n"
             "  `question`: The question that you want to ask about the photo.\n"
             "Return:\n"
@@ -109,6 +116,11 @@ void McpServer::AddCommonTools() {
                 Property("question", kPropertyTypeString)
             }),
             [camera](const PropertyList& properties) -> ReturnValue {
+                if (VisionPipeline::GetInstance().IsContinuousRunning()) {
+                    throw std::runtime_error(
+                        "Real-time detection is currently running in LOCAL mode (no image is uploaded). "
+                        "Stop it with `self.vision.stop_continuous` first if you really need a cloud photo analysis.");
+                }
                 // Lower the priority to do the camera capture
                 TaskPriorityReset priority_reset(1);
 
