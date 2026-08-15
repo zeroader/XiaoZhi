@@ -45,8 +45,7 @@ bool Esp32Camera::Capture() {
     }
 
     auto start_time = esp_timer_get_time();
-    int frames_to_get = 2;
-    // Try to get a stable frame
+    int frames_to_get = 1;  // single frame for max FPS
     for (int i = 0; i < frames_to_get; i++) {
         if (fb_ != nullptr) {
             esp_camera_fb_return(fb_);

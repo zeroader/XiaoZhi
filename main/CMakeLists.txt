@@ -35,8 +35,9 @@ set(SOURCES "audio/audio_codec.cc"
             "device_state_event.cc"
             "assets.cc"
             "main.cc"
-            "vision/face_detector.cc"
+            # "vision/face_detector.cc"  # disabled: VISION_DISABLE_LOCAL_FACE
             "vision/remote_detector.cc"
+            "vision/online_detector.cc"
             "vision/vision_display.cc"
             "vision/vision_pipeline.cc"
             )
@@ -599,6 +600,7 @@ endif()
 target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BOARD_TYPE=\"${BOARD_TYPE}\" BOARD_NAME=\"${BOARD_NAME}\"
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
+                    PRIVATE VISION_DISABLE_LOCAL_FACE
                     )
 
 # Add generation rules

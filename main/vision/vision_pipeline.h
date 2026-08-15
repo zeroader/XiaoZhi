@@ -2,14 +2,19 @@
 #define VISION_PIPELINE_H
 
 #include "detector.h"
+#ifndef VISION_DISABLE_LOCAL_FACE
 #include "face_detector.h"
+#endif
 #include "remote_detector.h"
+#include "online_detector.h"
 #include "vision_display.h"
 
 #include <string>
 #include <memory>
 #include <atomic>
 #include <thread>
+#include <mutex>
+#include <vector>
 
 #include <esp_camera.h>
 
@@ -21,6 +26,7 @@ enum class DetectorType {
     kNone = 0,
     kFace = 1,
     kRemote = 2,
+    kOnline = 3,
 };
 
 struct PipelineStats {
@@ -54,8 +60,11 @@ public:
     DetectorType GetActiveDetectorType() const;
     bool SetActiveDetector(DetectorType type);
 
+#ifndef VISION_DISABLE_LOCAL_FACE
     FaceDetector* GetFaceDetector();
+#endif
     RemoteDetector* GetRemoteDetector();
+    OnlineDetector* GetOnlineDetector();
     VisionDisplay* GetDisplayComposer();
 
     bool OneShotDetect(bool show_on_lcd = true, std::string* out_debug_info = nullptr);
@@ -80,18 +89,23 @@ private:
     bool initialized_;
     bool has_camera_;
 
+#ifndef VISION_DISABLE_LOCAL_FACE
     std::unique_ptr<FaceDetector> face_detector_;
+#endif
     std::unique_ptr<RemoteDetector> remote_detector_;
+    std::unique_ptr<OnlineDetector> online_detector_;
     std::unique_ptr<VisionDisplay> display_composer_;
 
     DetectorType active_detector_type_;
     Detector* active_detector_;
 
     DetectionResult last_result_;
+    std::mutex result_mutex_;  // protects last_result_ between preview & detect threads
     PipelineStats stats_;
 
     std::atomic<bool> continuous_running_;
-    std::thread continuous_thread_;
+    std::thread preview_thread_;
+    std::thread detect_thread_;
     uint32_t continuous_period_ms_;
 
     std::atomic<bool> preview_running_;

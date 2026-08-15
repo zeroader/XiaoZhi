@@ -31,8 +31,10 @@ struct DetectionResult {
     int source_width;
     int source_height;
     uint64_t timestamp_ms;
+    bool connection_ok;       // false = server unreachable or HTTP error
+    std::string error_message; // detail when connection_ok is false
 
-    DetectionResult() : source_width(0), source_height(0), timestamp_ms(0) {}
+    DetectionResult() : source_width(0), source_height(0), timestamp_ms(0), connection_ok(true) {}
 };
 
 struct ImageFrame {
