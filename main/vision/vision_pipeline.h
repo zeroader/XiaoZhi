@@ -15,6 +15,7 @@
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <deque>
 
 #include <esp_camera.h>
 
@@ -85,6 +86,15 @@ public:
     HeartRateResult GetLatestHeartRate() const;
     uint64_t GetHeartRateTimestampMs() const;
 
+    // 最近一次坐姿结果（跨帧保留，供查询）
+    PostureResult GetLatestPosture() const;
+    uint64_t GetPostureTimestampMs() const;
+
+    // 用户情绪（10帧平滑：同一情绪 >=7 次判为特殊情绪，否则 neutral）
+    std::string GetUserEmotion() const;
+    int GetUserEmotionHits() const;
+    uint64_t GetUserEmotionTimestampMs() const;
+
 private:
     bool initialized_;
     bool has_camera_;
@@ -113,7 +123,14 @@ private:
     HeartRateResult latest_heart_rate_;
     PostureResult latest_posture_;
     uint64_t heart_rate_timestamp_ms_;
-    mutable std::mutex sensing_mutex_;  // 保护 latest_heart_rate_ / latest_posture_（const getter 中使用）
+    uint64_t posture_timestamp_ms_;
+    mutable std::mutex sensing_mutex_;  // 保护 latest_heart_rate_ / latest_posture_ / 情绪窗口
+
+    // 用户情绪平滑窗口（最近10帧）
+    std::deque<std::string> emotion_window_;
+    std::string user_emotion_;          // 平滑结果：特殊情绪或 neutral
+    int user_emotion_hits_;             // 该情绪的命中次数
+    uint64_t user_emotion_timestamp_ms_;
 
     // 坐姿提醒状态
     bool posture_reminded_ = false;      // 当前是否已处于"已提醒"的坏坐姿状态

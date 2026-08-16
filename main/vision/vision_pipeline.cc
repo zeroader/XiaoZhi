@@ -222,6 +222,18 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
         return false;
     }
 
+    // 连续检测运行时摄像头被 PreviewLoop 独占，此处不再取帧，
+    // 避免并发 esp_camera_fb_get 失败被大模型误判为"摄像头坏了"。
+    // 引导大模型改用缓存读取工具。
+    if (continuous_running_.load()) {
+        if (out_debug_info) {
+            *out_debug_info = "continuous detection is running (camera busy). "
+                              "Use self.vision.get_user_emotion / get_posture / "
+                              "get_heart_rate / get_last_detections instead";
+        }
+        return false;
+    }
+
     // 可选：切换 online 检测器任务（face_emotion / posture / heart_rate）
     ApplyTaskToOnlineDetector(active_detector_, task);
 
@@ -390,16 +402,17 @@ void VisionPipeline::DetectionLoop() {
             continue;
         }
 
-        // 任务调度：auto 模式下按 每帧(face_emotion) / 5s(posture) / 1s(heart_rate) 轮询
+        // 任务调度：auto 模式下按 每帧(face_emotion) / 5s(posture) / 10s(heart_rate) 轮询。
+        // posture 优先，保证 5s 一次不被心率请求饿死；其余帧全部跑 face_emotion。
         if (continuous_task_ == kTaskAutoSchedule) {
             uint64_t now_ms = esp_timer_get_time() / 1000LL;
             std::string task = kTaskFaceEmotion;
-            if (now_ms - last_heart_ms >= 1000) {
-                task = kTaskHeartRate;
-                last_heart_ms = now_ms;
-            } else if (now_ms - last_posture_ms >= 5000) {
+            if (now_ms - last_posture_ms >= 5000) {
                 task = kTaskPosture;
                 last_posture_ms = now_ms;
+            } else if (now_ms - last_heart_ms >= 10000) {
+                task = kTaskHeartRate;
+                last_heart_ms = now_ms;
             }
             ApplyTaskToOnlineDetector(active_detector_, task);
         }
@@ -470,14 +483,12 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
     if (preview_thread_.joinable()) preview_thread_.join();
     if (detect_thread_.joinable()) detect_thread_.join();
 
-    // 设置任务：task 为空时沿用 online 检测器持久化的任务
+    // 设置任务：task 为空时默认进入自动调度（每帧情绪 + 5s 坐姿 + 10s 心率），
+    // 避免回退到 online 检测器持久化的单一任务导致情绪/心率任务不跑
     if (!task.empty()) {
         continuous_task_ = task;
-    } else if (active_detector_ != nullptr) {
-        auto* od = dynamic_cast<OnlineDetector*>(active_detector_);
-        if (od != nullptr) {
-            continuous_task_ = od->GetTask();
-        }
+    } else {
+        continuous_task_ = kTaskAutoSchedule;
     }
 
     // Clear shared frame buffer
@@ -543,7 +554,38 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
         heart_rate_timestamp_ms_ = result.timestamp_ms;
     }
     if (result.posture.available) {
-        latest_posture_ = result.posture;
+        // "calibrated" 是标定成功的瞬时状态，不是坐姿状态，不覆盖 LCD 叠加
+        if (result.posture.state != "calibrated") {
+            latest_posture_ = result.posture;
+            posture_timestamp_ms_ = result.timestamp_ms;
+        }
+    }
+    if (result.emotion.available && !result.emotion.label.empty()) {
+        // 10 帧平滑窗口：同一情绪 >=7 次判为特殊情绪，否则 neutral
+        emotion_window_.push_back(result.emotion.label);
+        if (emotion_window_.size() > 10) {
+            emotion_window_.pop_front();
+        }
+        std::string majority;
+        int majority_count = 0;
+        for (const auto& a : emotion_window_) {
+            int c = 0;
+            for (const auto& b : emotion_window_) {
+                if (a == b) c++;
+            }
+            if (c > majority_count) {
+                majority_count = c;
+                majority = a;
+            }
+        }
+        if (emotion_window_.size() >= 10 && majority_count >= 7 && majority != "neutral") {
+            user_emotion_ = majority;
+            user_emotion_hits_ = majority_count;
+        } else {
+            user_emotion_ = "neutral";
+            user_emotion_hits_ = 0;
+        }
+        user_emotion_timestamp_ms_ = result.timestamp_ms;
     }
 }
 
@@ -555,6 +597,31 @@ HeartRateResult VisionPipeline::GetLatestHeartRate() const {
 uint64_t VisionPipeline::GetHeartRateTimestampMs() const {
     std::lock_guard<std::mutex> lock(sensing_mutex_);
     return heart_rate_timestamp_ms_;
+}
+
+PostureResult VisionPipeline::GetLatestPosture() const {
+    std::lock_guard<std::mutex> lock(sensing_mutex_);
+    return latest_posture_;
+}
+
+uint64_t VisionPipeline::GetPostureTimestampMs() const {
+    std::lock_guard<std::mutex> lock(sensing_mutex_);
+    return posture_timestamp_ms_;
+}
+
+std::string VisionPipeline::GetUserEmotion() const {
+    std::lock_guard<std::mutex> lock(sensing_mutex_);
+    return user_emotion_;
+}
+
+int VisionPipeline::GetUserEmotionHits() const {
+    std::lock_guard<std::mutex> lock(sensing_mutex_);
+    return user_emotion_hits_;
+}
+
+uint64_t VisionPipeline::GetUserEmotionTimestampMs() const {
+    std::lock_guard<std::mutex> lock(sensing_mutex_);
+    return user_emotion_timestamp_ms_;
 }
 
 // 坏坐姿时通过 MCP Notification 触发大模型提醒（进入坏坐姿立即提醒，之后每 60s 复查仍坏则再提醒）
@@ -750,6 +817,9 @@ void RegisterVisionMcpTools() {
     mcp.AddTool("self.vision.detect_once",
         "Capture one frame from the camera, run the active detector, and draw detection boxes "
         "on the LCD preview image. Returns full detection result JSON.\n"
+        "IMPORTANT: if continuous detection is running, this tool refuses (camera busy); "
+        "use self.vision.get_user_emotion / get_posture / get_heart_rate / get_last_detections "
+        "to read cached results instead.\n"
         "Args:\n"
         "  `show_on_lcd` (optional, default true): if false, do not update the LCD.\n"
         "  `task` (optional): for the online detector, one of `face_emotion` (default), "
@@ -808,14 +878,56 @@ void RegisterVisionMcpTools() {
             return j;
         });
 
+    mcp.AddTool("self.vision.get_posture",
+        "Get the latest posture result, cached from the most recent `posture` task "
+        "(updated every ~5s in auto mode). Does NOT trigger a new detection.\n"
+        "Returns state (normal/bad_posture/unknown), reason and age_ms.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            cJSON* j = cJSON_CreateObject();
+            PostureResult pose = pipe.GetLatestPosture();
+            if (pose.available) {
+                cJSON_AddStringToObject(j, "state", pose.state.c_str());
+                cJSON_AddStringToObject(j, "reason", pose.reason.c_str());
+            } else {
+                cJSON_AddStringToObject(j, "state", "");
+                cJSON_AddStringToObject(j, "reason", "no posture measurement yet");
+            }
+            uint64_t ts = pipe.GetPostureTimestampMs();
+            uint64_t age_ms = (ts == 0) ? 0 : (esp_timer_get_time() / 1000LL - ts);
+            cJSON_AddNumberToObject(j, "age_ms", (double)age_ms);
+            return j;
+        });
+
+    mcp.AddTool("self.vision.get_user_emotion",
+        "Get the user's current emotion, smoothed over the last 10 detection frames: "
+        "a single emotion needs >=7 hits in the window to be reported, otherwise it "
+        "returns `neutral`. Does NOT trigger a new detection.\n"
+        "Returns emotion (one of angry/contempt/disgust/fear/happy/neutral/sad/surprise), "
+        "hits, and age_ms (how old the estimate is).\n"
+        "Call this to understand the user's mood before/while answering.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            cJSON* j = cJSON_CreateObject();
+            cJSON_AddStringToObject(j, "emotion", pipe.GetUserEmotion().c_str());
+            cJSON_AddNumberToObject(j, "hits", pipe.GetUserEmotionHits());
+            uint64_t ts = pipe.GetUserEmotionTimestampMs();
+            uint64_t age_ms = (ts == 0) ? 0 : (esp_timer_get_time() / 1000LL - ts);
+            cJSON_AddNumberToObject(j, "age_ms", (double)age_ms);
+            return j;
+        });
+
     mcp.AddTool("self.vision.start_continuous",
         "Start continuous detection loop: capture -> detect -> show on LCD, repeated.\n"
         "Args:\n"
         "  `period_ms` (optional, default 500): target time between iterations in ms. "
         "Actual rate may be lower if detector is slow.\n"
-        "  `task` (optional): for the online detector, one of `face_emotion` (default), "
-        "`posture`, `heart_rate`, or `auto`.\n"
-        "  `auto` schedules: face_emotion every frame, posture every 5s, heart_rate every 1s.",
+        "  `task` (optional, default `auto`): for the online detector, one of "
+        "`face_emotion`, `posture`, `heart_rate`, or `auto`.\n"
+        "  `auto` (recommended) schedules: face_emotion every frame, posture every 5s, "
+        "heart_rate every 10s. If `task` is omitted, `auto` is used.",
         PropertyList({
             Property("period_ms", kPropertyTypeInteger, 500, 100, 60000),
             Property("task", kPropertyTypeString, std::string(""))
@@ -1033,6 +1145,41 @@ void RegisterVisionMcpTools() {
             if (od == nullptr) return false;
             od->SetTask(p["task"].value<std::string>());
             return true;
+        });
+
+    mcp.AddTool("self.vision.posture.calibrate",
+        "Calibrate the posture baseline: record the CURRENT posture as the reference "
+        "('sitting straight') baseline on the server, then run one posture detection "
+        "immediately. Ask the user to sit straight first.\n"
+        "The server response state is `calibrated` when successful.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            pipe.Initialize();  // auto-init if not done yet
+            auto* od = pipe.GetOnlineDetector();
+            if (od == nullptr) {
+                cJSON* j = cJSON_CreateObject();
+                cJSON_AddBoolToObject(j, "success", false);
+                cJSON_AddStringToObject(j, "message", "online detector unavailable");
+                return j;
+            }
+            od->SetCalibrateOnce(true);
+            // 连续检测运行时摄像头忙，不取帧：标志会在下一个 posture 周期（≤5s）自动生效
+            if (pipe.IsContinuousRunning()) {
+                cJSON* j = cJSON_CreateObject();
+                cJSON_AddBoolToObject(j, "success", true);
+                cJSON_AddStringToObject(j, "message",
+                    "calibration armed - will apply on the next posture cycle (within ~5s)");
+                return j;
+            }
+            std::string prev_task = od->GetTask();
+            std::string info;
+            bool ok = pipe.OneShotDetect(true, &info, kTaskPosture);
+            od->SetTask(prev_task);  // 恢复原任务，避免校准把持久化任务改成 posture
+            cJSON* j = DetectionsToJson(pipe.GetLastResult());
+            cJSON_AddBoolToObject(j, "success", ok);
+            cJSON_AddStringToObject(j, "debug", info.c_str());
+            return j;
         });
 
     ESP_LOGI(TAG, "Vision MCP tools registered");

@@ -34,7 +34,7 @@ import state as state_mod
 from detectors.face_detector import FaceDetector
 from detectors.emotion_detector import EmotionDetector
 from detectors.pose_detector import PoseDetector
-from detectors.heart_detector import HeartRateDetector
+from detectors.heart_detector import HeartRateDetector, METHODS as HEART_METHODS
 
 app = Flask(__name__)
 
@@ -223,7 +223,18 @@ def detect():
         state.set_face(result["face"])
         state.set_emotion(result["emotion"])
     elif req.task == protocol.TASK_POSTURE:
-        result = _detect_posture(rgb)
+        # calibrate=true 时，将当前姿态记录为基准坐姿（需先完成一次完整检测）
+        if req.calibrate:
+            m = pose_detector.detect(rgb).get("metrics", {})
+            if "raw_cva" in m:
+                pose_detector.calibrate(m["raw_cva"], m["raw_trunk"])
+                result = {"state": "calibrated", "reason": "baseline_set",
+                          "metrics": m}
+            else:
+                result = {"state": "unknown", "reason": "calibrate_failed",
+                          "metrics": m}
+        else:
+            result = _detect_posture(rgb)
         state.set_posture(result)
     elif req.task == protocol.TASK_HEART_RATE:
         result = _detect_heart_rate()
@@ -317,6 +328,8 @@ def main():
     parser.add_argument("--pose-model", default=str(MODEL_POSE), help="YOLOv8-pose model path")
     parser.add_argument("--buffer-size", type=int, default=BUFFER_MAXLEN,
                         help=f"frame_buffer maxlen (default: {BUFFER_MAXLEN})")
+    parser.add_argument("--heart-method", default="pos", choices=list(HEART_METHODS),
+                        help=f"rPPG 心率信号提取方法 (default: pos, 可选: {', '.join(HEART_METHODS)})")
     parser.add_argument("--download-model", action="store_true",
                         help="Download ONNX models and exit")
     args = parser.parse_args()
@@ -347,13 +360,14 @@ def main():
         pose_detector = None
         print(f"[WARN] Pose model not found: {args.pose_model} (posture 任务将不可用)")
 
-    heart_detector = HeartRateDetector(face_detector)
+    heart_detector = HeartRateDetector(face_detector, method=args.heart_method)
     print(f"[Init] Models loaded in {(time.time() - t0) * 1000:.0f}ms")
 
     print(f"\n{'='*54}")
     print(f"  ESP32 Bio-Perception Server")
     print(f"  Listen: http://{args.host}:{args.port}")
     print(f"  Tasks : face_emotion / posture / heart_rate")
+    print(f"  rPPG  : {args.heart_method} (可选: {', '.join(HEART_METHODS)})")
     print(f"  Buffer: {args.buffer_size} frames (server keeps NO timing)")
     print(f"{'='*54}\n")
 

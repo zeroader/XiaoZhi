@@ -33,7 +33,8 @@ OnlineDetector::OnlineDetector()
     , jpeg_quality_(75)
     , task_(kTaskFaceEmotion)
     , frame_id_(0)
-    , auto_frame_id_(true) {
+    , auto_frame_id_(true)
+    , calibrate_once_(false) {
 }
 
 OnlineDetector::~OnlineDetector() {
@@ -103,6 +104,10 @@ std::string OnlineDetector::BuildRequestBody(const std::string& base64_image, in
     cJSON* root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "frame_id", (double)frame_id_);
     cJSON_AddStringToObject(root, "task", task_.c_str());
+    if (calibrate_once_ && task_ == kTaskPosture) {
+        cJSON_AddBoolToObject(root, "calibrate", true);
+        calibrate_once_ = false;  // 一次性标定请求
+    }
     cJSON* image = cJSON_AddObjectToObject(root, "image");
     cJSON_AddStringToObject(image, "data", base64_image.c_str());
     cJSON_AddNumberToObject(image, "width", width);
@@ -449,6 +454,12 @@ void OnlineDetector::SetTask(const std::string& task) {
 
 void OnlineDetector::SetAutoFrameId(bool enabled) {
     auto_frame_id_ = enabled;
+}
+
+void OnlineDetector::SetCalibrateOnce(bool enabled) {
+    calibrate_once_ = enabled;
+    ESP_LOGI(TAG, "Online detector posture calibration %s",
+             enabled ? "armed (next posture request)" : "cancelled");
 }
 
 const std::string& OnlineDetector::GetEndpoint() const { return endpoint_url_; }

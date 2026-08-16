@@ -71,6 +71,7 @@ class DetectRequest:
     frame_id: int
     task: str
     image: ImageRequest
+    calibrate: bool = False   # posture 任务: 是否将当前姿态记录为基准坐姿
 
 
 class ProtocolError(ValueError):
@@ -108,10 +109,13 @@ def parse_detect_request(payload: Dict[str, Any]) -> DetectRequest:
 
     fmt = img.get("format", "jpeg") or "jpeg"
 
+    calibrate = bool(payload.get("calibrate", False))
+
     return DetectRequest(
         frame_id=frame_id,
         task=task,
         image=ImageRequest(data=data, width=width, height=height, format=fmt),
+        calibrate=calibrate,
     )
 
 

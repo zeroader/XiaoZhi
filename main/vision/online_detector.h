@@ -19,6 +19,7 @@ public:
     void SetJpegQuality(int quality);
     void SetTask(const std::string& task);
     void SetAutoFrameId(bool enabled);
+    void SetCalibrateOnce(bool enabled);
 
     const std::string& GetEndpoint() const;
     int GetTimeoutSec() const;
@@ -34,6 +35,7 @@ private:
     std::string task_;       // 当前任务：face_emotion / posture / heart_rate
     int64_t frame_id_;       // 自增帧号
     bool auto_frame_id_;     // 是否每次请求自动递增 frame_id
+    bool calibrate_once_;    // 下一次 posture 请求携带 calibrate=true（坐姿基准标定）
 
     // Encode binary data to base64 string
     static std::string Base64Encode(const uint8_t* data, size_t len);
