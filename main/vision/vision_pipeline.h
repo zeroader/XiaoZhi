@@ -124,6 +124,13 @@ private:
     uint32_t continuous_period_ms_;
     std::string continuous_task_;   // 连续检测任务：face_emotion / posture / heart_rate / auto
 
+    // Preview 线程与 Detection 线程之间的共享帧缓冲
+    std::mutex frame_mutex_;            // 保护 shared_frame_ / shared_frame_* / shared_frame_version_
+    std::vector<uint8_t> shared_frame_;
+    uint32_t shared_frame_w_ = 0;
+    uint32_t shared_frame_h_ = 0;
+    uint32_t shared_frame_version_ = 0; // 每次新帧自增，Detection 线程据此跳过重复帧
+
     // 跨帧缓存的感知结果：心率值供查询，坐姿用于 LCD 持续叠加
     HeartRateResult latest_heart_rate_;
     PostureResult latest_posture_;
@@ -141,14 +148,15 @@ private:
     bool posture_reminded_ = false;      // 当前是否已处于"已提醒"的坏坐姿状态
     uint64_t last_posture_remind_ms_ = 0;  // 上次提醒时间（防刷屏）
 
+    // Preview-only (capture + display, NO detection)：与 start_continuous 共用 preview_thread_
     std::atomic<bool> preview_running_;
-    std::thread preview_thread_;
     uint32_t preview_period_ms_;
 
     Esp32Camera* ResolveEsp32Camera();
     LvglDisplay* ResolveLvglDisplay();
-    void ContinuousLoop();
-    void PreviewLoop();   // capture + display only, no detection
+    void PreviewLoop();   // capture + display + 填充共享帧缓冲（连续检测用）
+    void PreviewOnlyLoop();  // capture + display only，无检测
+    void DetectionLoop();
 
     void CacheSensingResult(const DetectionResult& result);
     void MaybeNotifyPosture(const DetectionResult& result);

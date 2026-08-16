@@ -226,10 +226,12 @@ def detect():
         # calibrate=true 时，将当前姿态记录为基准坐姿（需先完成一次完整检测）
         if req.calibrate:
             m = pose_detector.detect(rgb).get("metrics", {})
-            if "raw_cva" in m:
-                pose_detector.calibrate(m["raw_cva"], m["raw_trunk"])
-                result = {"state": "calibrated", "reason": "baseline_set",
-                          "metrics": m}
+            if "cva" in m:
+                # 用 EMA 平滑值作基准（比单帧 raw 稳定），躯干角仅在髋可见时校准
+                pose_detector.calibrate(m["cva"], m["trunk_angle"],
+                                        bool(m.get("trunk_valid", False)))
+                reason = "baseline_set" if m.get("trunk_valid") else "baseline_set_cva_only"
+                result = {"state": "calibrated", "reason": reason, "metrics": m}
             else:
                 result = {"state": "unknown", "reason": "calibrate_failed",
                           "metrics": m}

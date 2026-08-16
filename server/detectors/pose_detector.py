@@ -92,6 +92,7 @@ class PoseDetector:
         self.is_calibrated = False
         self.base_cva = 0.0
         self.base_trunk_angle = 0.0
+        self._base_trunk_valid = False   # 基准躯干角是否由有效髋关键点测得
         self._manual_calib = False     # 手动校准优先于自动校准
 
         # 自动校准: 滑动窗口缓存 (cva, trunk)，中位数作为习惯坐姿基准
@@ -108,18 +109,24 @@ class PoseDetector:
 
     # ---------- 校准 API ----------
 
-    def calibrate(self, raw_cva: float, raw_trunk: float):
-        """手动校准：记录当前 CVA 与躯干角度作为基准坐姿（标准零点）"""
-        self.base_cva = raw_cva
-        self.base_trunk_angle = raw_trunk
+    def calibrate(self, cva: float, trunk: float, trunk_valid: bool = True):
+        """手动校准：记录当前 CVA 与躯干角度作为基准坐姿（标准零点）。
+
+        trunk_valid=False 表示髋关键点不可用，此时不设定躯干基准，
+        避免 delta_trunk = |当前-0| 恒大于阈值导致误报坏坐姿。
+        """
+        self.base_cva = cva
+        self._base_trunk_valid = trunk_valid
+        self.base_trunk_angle = trunk if trunk_valid else 0.0
         self.is_calibrated = True
         self._manual_calib = True
-        print(f"[Calibration] 手动基准已设定: Base CVA={raw_cva:.1f}°, Base Trunk={raw_trunk:.1f}°")
+        print(f"[Calibration] 手动基准已设定: Base CVA={cva:.1f}°, "
+              f"Base Trunk={self.base_trunk_angle:.1f}° (trunk_valid={trunk_valid})")
 
-    def _auto_calibrate(self, raw_cva: float, raw_trunk: float):
+    def _auto_calibrate(self, cva: float, trunk: float, trunk_valid: bool):
         """自动校准：累积滑动窗口，用"最直"样本（CVA 较大的后 1/3 中位数）
         作为个人习惯坐姿基准。ESP32 无需任何操作即可逐步建立基准。"""
-        self.auto_win.append((raw_cva, raw_trunk))
+        self.auto_win.append((cva, trunk, trunk_valid))
         if len(self.auto_win) > self.AUTO_CALIB_WINDOW:
             self.auto_win.pop(0)
 
@@ -132,10 +139,15 @@ class PoseDetector:
         good = cvas[-n_good:]
         med_cva = good[len(good) // 2]
 
-        # 躯干角同样取"最直"（最小）的样本中位数
-        trunks = sorted(v[1] for v in self.auto_win)
-        good_t = trunks[:n_good]
-        med_trunk = good_t[len(good_t) // 2]
+        # 躯干角只用"髋可见"的有效样本中"最直"（最小）的中位数
+        trunks = sorted(v[1] for v in self.auto_win if v[2])
+        if trunks:
+            good_t = trunks[:max(1, len(trunks) // 3)]
+            med_trunk = good_t[len(good_t) // 2]
+            self._base_trunk_valid = True
+        else:
+            med_trunk = 0.0
+            self._base_trunk_valid = False
 
         self.base_cva = med_cva
         self.base_trunk_angle = med_trunk
@@ -147,6 +159,7 @@ class PoseDetector:
         self.is_calibrated = False
         self.base_cva = 0.0
         self.base_trunk_angle = 0.0
+        self._base_trunk_valid = False
         self.auto_win.clear()
         print("[Calibration] 已重置")
 
@@ -308,13 +321,14 @@ class PoseDetector:
             hip_x, hip_y = hip_pt
             trunk_raw = self._angle_deg(sh_x, sh_y, hip_x, hip_y, 0.0, 1.0)
 
-        # 3) EMA 平滑去噪
+        # 3) EMA 平滑去噪（躯干角只在髋可见时更新，避免缺髋帧把平滑值拖向 0）
         if self.smooth_cva is None:
             self.smooth_cva = cva_raw
-            self.smooth_trunk_angle = trunk_raw
+            self.smooth_trunk_angle = trunk_raw if hip_valid else 0.0
         else:
             self.smooth_cva = self.alpha * cva_raw + (1 - self.alpha) * self.smooth_cva
-            self.smooth_trunk_angle = self.alpha * trunk_raw + (1 - self.alpha) * self.smooth_trunk_angle
+            if hip_valid:
+                self.smooth_trunk_angle = self.alpha * trunk_raw + (1 - self.alpha) * self.smooth_trunk_angle
 
         curr_cva = self.smooth_cva
         curr_trunk = self.smooth_trunk_angle
@@ -325,7 +339,7 @@ class PoseDetector:
 
         # 4b) 自动校准（手动校准后不再覆盖）
         if not self._manual_calib:
-            self._auto_calibrate(cva_raw, trunk_raw)
+            self._auto_calibrate(cva_raw, trunk_raw, hip_valid)
 
         metrics = {
             "raw_cva": round(cva_raw, 1),
@@ -337,6 +351,7 @@ class PoseDetector:
             "delta_cva": round(delta_cva, 1),
             "delta_trunk": round(delta_trunk, 1),
             "calibrated": self.is_calibrated,
+            "trunk_valid": bool(hip_valid),
         }
 
         # 5) 趴桌/低头特例: 头部高度低于肩膀
@@ -348,8 +363,10 @@ class PoseDetector:
         # CVA 过小 = 头前倾/低头（绝对）；校准后若比基准再减小更多也判不良
         if curr_cva < CVA_BAD_ANGLE or (self.is_calibrated and delta_cva > DELTA_NECK_BAD_ANGLE):
             return "bad_posture", "head_forward", metrics
-        # 躯干倾斜（绝对）；校准后相对增量也判不良
-        if curr_trunk > TRUNK_BAD_ANGLE or (self.is_calibrated and delta_trunk > DELTA_TRUNK_BAD_ANGLE):
+        # 躯干倾斜（绝对）；校准后相对增量也判不良（仅当基准躯干角有效时）
+        if curr_trunk > TRUNK_BAD_ANGLE or (
+                self.is_calibrated and self._base_trunk_valid
+                and delta_trunk > DELTA_TRUNK_BAD_ANGLE):
             return "bad_posture", "trunk_lean", metrics
 
         return "normal", "ok", metrics

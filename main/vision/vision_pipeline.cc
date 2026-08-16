@@ -20,6 +20,10 @@
 
 #define TAG "VisionPipeline"
 
+// 人脸/情绪检测最小间隔（ms）：降低 JPEG 编码 + HTTP 的 CPU/网络占用，
+// 避免与 TTS 解码抢资源导致语音卡顿。posture(5s)/heart_rate(10s) 不受此限制。
+static constexpr uint64_t kFaceEmotionMinIntervalMs = 500;
+
 PipelineStats::PipelineStats() { Reset(); }
 
 void PipelineStats::Reset() {
@@ -395,6 +399,7 @@ void VisionPipeline::DetectionLoop() {
     uint32_t last_version = 0;  // avoid re-processing same frame
     uint64_t last_posture_ms = 0;  // 距上次 posture 任务的毫秒数
     uint64_t last_heart_ms = 0;    // 距上次 heart_rate 任务的毫秒数
+    uint64_t last_face_ms = 0;     // 距上次 face_emotion 任务的毫秒数（节流用）
 
     while (continuous_running_.load()) {
         // Wait for a NEW shared frame (skip if same as last processed)
@@ -427,9 +432,10 @@ void VisionPipeline::DetectionLoop() {
 
         // 任务调度：auto 模式下按 每帧(face_emotion) / 5s(posture) / 10s(heart_rate) 轮询。
         // posture 优先，保证 5s 一次不被心率请求饿死；其余帧全部跑 face_emotion。
+        std::string task = continuous_task_;
         if (continuous_task_ == kTaskAutoSchedule) {
             uint64_t now_ms = esp_timer_get_time() / 1000LL;
-            std::string task = kTaskFaceEmotion;
+            task = kTaskFaceEmotion;
             if (now_ms - last_posture_ms >= 5000) {
                 task = kTaskPosture;
                 last_posture_ms = now_ms;
@@ -438,6 +444,17 @@ void VisionPipeline::DetectionLoop() {
                 last_heart_ms = now_ms;
             }
             ApplyTaskToOnlineDetector(active_detector_, task);
+        }
+
+        // 节流：face_emotion 至少间隔 kFaceEmotionMinIntervalMs，降低 JPEG 编码 + HTTP
+        // 的 CPU/网络占用，避免与 TTS 解码抢资源导致语音卡顿（posture/heart 不受限）
+        if (task == kTaskFaceEmotion) {
+            uint64_t now_ms = esp_timer_get_time() / 1000LL;
+            if ((now_ms - last_face_ms) < kFaceEmotionMinIntervalMs) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            last_face_ms = now_ms;
         }
 
         // Run detection (JPEG encode + HTTP POST + parse response)
@@ -536,6 +553,15 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
         ESP_LOGE(TAG, "Failed to spawn preview thread");
         return false;
     }
+    try {
+        detect_thread_ = std::thread([this]() { this->DetectionLoop(); });
+    } catch (...) {
+        esp_pthread_set_cfg(nullptr);
+        continuous_running_.store(false);
+        if (preview_thread_.joinable()) preview_thread_.join();
+        ESP_LOGE(TAG, "Failed to spawn detection thread");
+        return false;
+    }
     esp_pthread_set_cfg(nullptr);
     return true;
 }
@@ -553,7 +579,7 @@ bool VisionPipeline::IsContinuousRunning() const {
 
 // --- Preview-only (no detection) ---
 
-void VisionPipeline::PreviewLoop() {
+void VisionPipeline::PreviewOnlyLoop() {
     ESP_LOGI(TAG, "Preview loop started (period=%ums)", preview_period_ms_);
     while (preview_running_.load()) {
         auto t0 = esp_timer_get_time();
@@ -599,7 +625,7 @@ bool VisionPipeline::StartPreview(uint32_t period_ms) {
     preview_period_ms_ = period_ms;
     preview_running_.store(true);
     try {
-        preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
+        preview_thread_ = std::thread([this]() { this->PreviewOnlyLoop(); });
     } catch (...) {
         preview_running_.store(false);
         ESP_LOGE(TAG, "Failed to spawn preview thread");
