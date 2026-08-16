@@ -25,5 +25,11 @@ CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
 
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
+# Partition: 2×5MB OTA (vs default 2×4MB) to fit face detection model
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m_vision.csv"
+
 # LVGL Graphics
 CONFIG_LV_USE_SNAPSHOT=y
+
+# ESP-DL Face Detection Model (stored in app RODATA)
+CONFIG_HUMAN_FACE_DETECT_MODEL_IN_FLASH_RODATA=y

@@ -146,11 +146,11 @@ private:
         config.pin_reset = CAMERA_PIN_RESET;
         config.xclk_freq_hz = XCLK_FREQ_HZ;
         config.pixel_format = PIXFORMAT_RGB565;
-        config.frame_size = FRAMESIZE_QVGA;
+        config.frame_size = FRAMESIZE_QVGA;   // 320×240
         config.jpeg_quality = 12;
-        config.fb_count = 1;
+        config.fb_count = 1;  // single buffer to avoid DMA conflicts
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;  // safer for RGB565 single buffer
         camera_ = new Esp32Camera(config);
         camera_->SetHMirror(false);
     }

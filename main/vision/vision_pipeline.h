@@ -75,6 +75,11 @@ public:
     void StopContinuous();
     bool IsContinuousRunning() const;
 
+    // Preview-only: capture + display, NO detection (for debugging camera pipeline)
+    bool StartPreview(uint32_t period_ms = 200);
+    void StopPreview();
+    bool IsPreviewRunning() const;
+
     const PipelineStats& GetStats() const;
     void ResetStats();
 
@@ -136,17 +141,14 @@ private:
     bool posture_reminded_ = false;      // 当前是否已处于"已提醒"的坏坐姿状态
     uint64_t last_posture_remind_ms_ = 0;  // 上次提醒时间（防刷屏）
 
-    // Shared frame buffer: preview thread writes, detect thread reads
-    std::mutex frame_mutex_;
-    std::vector<uint8_t> shared_frame_;
-    int shared_frame_w_ = 0;
-    int shared_frame_h_ = 0;
-    uint32_t shared_frame_version_ = 0;  // increments each time preview writes new frame
+    std::atomic<bool> preview_running_;
+    std::thread preview_thread_;
+    uint32_t preview_period_ms_;
 
     Esp32Camera* ResolveEsp32Camera();
     LvglDisplay* ResolveLvglDisplay();
-    void PreviewLoop();   // 15 FPS: capture → display (with latest bbox)
-    void DetectionLoop();  // async: send frame → receive bbox → update result
+    void ContinuousLoop();
+    void PreviewLoop();   // capture + display only, no detection
 
     void CacheSensingResult(const DetectionResult& result);
     void MaybeNotifyPosture(const DetectionResult& result);
