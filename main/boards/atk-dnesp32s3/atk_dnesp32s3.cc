@@ -189,13 +189,16 @@ private:
         config.ledc_timer = LEDC_TIMER_0;
         config.ledc_channel = LEDC_CHANNEL_0;
 
-        config.pixel_format = PIXFORMAT_RGB565;   /* YUV422,GRAYSCALE,RGB565,JPEG */
-        config.frame_size = FRAMESIZE_QVGA;       /* QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates */
+        // 让 OV2640 直接输出 JPEG：视觉流水线可直接上传，避免 ESP32 端
+        // 每帧将 RGB565 软编码成 JPEG 所造成的 CPU / PSRAM 争用。
+        config.pixel_format = PIXFORMAT_JPEG;
+        config.frame_size = FRAMESIZE_QVGA;
 
         config.jpeg_quality = 12;                 /* 0-63, for OV series camera sensors, lower number means higher quality */
-        config.fb_count = 2;                      /* When jpeg mode is used, if fb_count more than one, the driver will work in continuous mode */
+        // JPEG 配合双帧缓冲可连续采集；一个缓冲由流水线处理时，另一个继续采集。
+        config.fb_count = 2;
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+        config.grab_mode = CAMERA_GRAB_LATEST;
 
         esp_err_t err = esp_camera_init(&config); // 测试相机是否存在
         if (err != ESP_OK) {

@@ -129,6 +129,7 @@ private:
     std::vector<uint8_t> shared_frame_;
     uint32_t shared_frame_w_ = 0;
     uint32_t shared_frame_h_ = 0;
+    int shared_frame_pixfmt_ = PIXFORMAT_RGB565;  // 记录共享帧格式（OV2640 直出 JPEG 时上传零编码）
     uint32_t shared_frame_version_ = 0; // 每次新帧自增，Detection 线程据此跳过重复帧
 
     // 跨帧缓存的感知结果：心率值供查询，坐姿用于 LCD 持续叠加
@@ -164,6 +165,13 @@ private:
     bool CaptureFrame(ImageFrame& out_frame);
     bool ReleaseCurrentFrame();
     camera_fb_t* GetCameraFb();
+
+    // OV2640 直出 JPEG 帧的解码（esp_new_jpeg 软解码，仅用于 LCD 预览）
+    void* jpeg_dec_ = nullptr;           // 解码器句柄（懒初始化，仅预览线程使用）
+    uint8_t* preview_rgb565_ = nullptr;  // PSRAM 解码缓冲（16 字节对齐）
+    size_t preview_rgb565_cap_ = 0;
+    bool DecodeJpegFrame(const ImageFrame& jpeg, uint8_t** out_rgb565,
+                         size_t* out_len, int* out_w, int* out_h);
 };
 
 void RegisterVisionMcpTools();

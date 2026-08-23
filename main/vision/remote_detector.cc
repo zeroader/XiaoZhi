@@ -93,29 +93,36 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
 
     auto total_start = esp_timer_get_time();
 
-    QueueHandle_t jpeg_queue = xQueueCreate(40, sizeof(JpegChunk));
-    if (jpeg_queue == nullptr) {
-        ESP_LOGE(TAG, "Failed to create JPEG queue");
-        return result;
-    }
+    // OV2640 硬件 JPEG 直出时跳过软编码，直接上传帧字节（防止把 JPEG 当 RGB565 二次编码）
+    bool jpeg_direct = (frame.pixel_format == PIXFORMAT_JPEG);
 
-    std::thread encoder_thread([&frame, jpeg_queue]() {
-        image_to_jpeg_cb((uint8_t*)frame.data, frame.len, frame.width, frame.height, (pixformat_t)frame.pixel_format, 80,
-            [](void* arg, size_t index, const void* data, size_t len) -> size_t {
-                auto queue = (QueueHandle_t)arg;
-                JpegChunk chunk = {
-                    .data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM),
-                    .len = len
-                };
-                if (chunk.data != nullptr) {
-                    memcpy(chunk.data, data, len);
-                    xQueueSend(queue, &chunk, portMAX_DELAY);
-                }
-                return len;
-            }, jpeg_queue);
-        JpegChunk sentinel = { .data = nullptr, .len = 0 };
-        xQueueSend(jpeg_queue, &sentinel, portMAX_DELAY);
-    });
+    QueueHandle_t jpeg_queue = nullptr;
+    std::thread encoder_thread;
+    if (!jpeg_direct) {
+        jpeg_queue = xQueueCreate(40, sizeof(JpegChunk));
+        if (jpeg_queue == nullptr) {
+            ESP_LOGE(TAG, "Failed to create JPEG queue");
+            return result;
+        }
+
+        encoder_thread = std::thread([&frame, jpeg_queue]() {
+            image_to_jpeg_cb((uint8_t*)frame.data, frame.len, frame.width, frame.height, (pixformat_t)frame.pixel_format, 80,
+                [](void* arg, size_t index, const void* data, size_t len) -> size_t {
+                    auto queue = (QueueHandle_t)arg;
+                    JpegChunk chunk = {
+                        .data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM),
+                        .len = len
+                    };
+                    if (chunk.data != nullptr) {
+                        memcpy(chunk.data, data, len);
+                        xQueueSend(queue, &chunk, portMAX_DELAY);
+                    }
+                    return len;
+                }, jpeg_queue);
+            JpegChunk sentinel = { .data = nullptr, .len = 0 };
+            xQueueSend(jpeg_queue, &sentinel, portMAX_DELAY);
+        });
+    }
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(timeout_sec_);
@@ -132,12 +139,14 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
 
     if (!http->Open("POST", endpoint_url_)) {
         ESP_LOGE(TAG, "Failed to open HTTP connection to %s", endpoint_url_.c_str());
-        encoder_thread.join();
-        JpegChunk chunk;
-        while (xQueueReceive(jpeg_queue, &chunk, 0) == pdPASS) {
-            if (chunk.data != nullptr) heap_caps_free(chunk.data);
+        if (!jpeg_direct) {
+            encoder_thread.join();
+            JpegChunk chunk;
+            while (xQueueReceive(jpeg_queue, &chunk, 0) == pdPASS) {
+                if (chunk.data != nullptr) heap_caps_free(chunk.data);
+            }
+            vQueueDelete(jpeg_queue);
         }
-        vQueueDelete(jpeg_queue);
         return result;
     }
 
@@ -154,21 +163,27 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
     http->Write(meta_header.c_str(), meta_header.size());
 
     size_t total_jpeg = 0;
-    while (true) {
-        JpegChunk chunk;
-        if (xQueueReceive(jpeg_queue, &chunk, pdMS_TO_TICKS(5000)) != pdPASS) {
-            ESP_LOGE(TAG, "Timeout receiving JPEG chunk from encoder");
-            break;
+    if (jpeg_direct) {
+        // OV2640 硬件 JPEG 直出：零编码直接上传
+        http->Write((const char*)frame.data, frame.len);
+        total_jpeg = frame.len;
+    } else {
+        while (true) {
+            JpegChunk chunk;
+            if (xQueueReceive(jpeg_queue, &chunk, pdMS_TO_TICKS(5000)) != pdPASS) {
+                ESP_LOGE(TAG, "Timeout receiving JPEG chunk from encoder");
+                break;
+            }
+            if (chunk.data == nullptr) {
+                break;
+            }
+            http->Write((const char*)chunk.data, chunk.len);
+            total_jpeg += chunk.len;
+            heap_caps_free(chunk.data);
         }
-        if (chunk.data == nullptr) {
-            break;
-        }
-        http->Write((const char*)chunk.data, chunk.len);
-        total_jpeg += chunk.len;
-        heap_caps_free(chunk.data);
+        encoder_thread.join();
+        vQueueDelete(jpeg_queue);
     }
-    encoder_thread.join();
-    vQueueDelete(jpeg_queue);
 
     std::string footer = "\r\n--" + boundary + "--\r\n";
     http->Write(footer.c_str(), footer.size());

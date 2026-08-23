@@ -145,12 +145,15 @@ private:
         config.pin_pwdn = CAMERA_PIN_PWDN;
         config.pin_reset = CAMERA_PIN_RESET;
         config.xclk_freq_hz = XCLK_FREQ_HZ;
-        config.pixel_format = PIXFORMAT_RGB565;
+        // OV2640 传感器内置硬件 JPEG 编码器：直出 JPEG 零 CPU 编码成本，
+        // 且上传体积约为 RGB565 的 1/10（320×240 JPEG ≈ 10~20KB vs RGB565 153KB）。
+        // LCD 预览由 vision_pipeline 用 esp_new_jpeg 软件解码后显示。
+        config.pixel_format = PIXFORMAT_JPEG;
         config.frame_size = FRAMESIZE_QVGA;   // 320×240
         config.jpeg_quality = 12;
         config.fb_count = 1;  // single buffer to avoid DMA conflicts
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;  // safer for RGB565 single buffer
+        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;  // safer for single buffer
         camera_ = new Esp32Camera(config);
         camera_->SetHMirror(false);
     }

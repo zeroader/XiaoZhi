@@ -37,13 +37,6 @@ private:
     bool auto_frame_id_;     // 是否每次请求自动递增 frame_id
     bool calibrate_once_;    // 下一次 posture 请求携带 calibrate=true（坐姿基准标定）
 
-    // Encode binary data to base64 string
-    static std::string Base64Encode(const uint8_t* data, size_t len);
-
-    // Build JSON request body (new protocol):
-    // {"frame_id":N,"task":"...","image":{"data":"base64...","width":W,"height":H,"format":"jpeg"}}
-    std::string BuildRequestBody(const std::string& base64_image, int width, int height);
-
     // Parse JSON response: new unified format (result + performance) or legacy {detections}
     bool ParseResponse(const std::string& json_str, DetectionResult& result);
 };

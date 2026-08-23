@@ -59,26 +59,8 @@ bool Esp32Camera::Capture() {
     auto end_time = esp_timer_get_time();
     ESP_LOGI(TAG, "Camera captured %d frames in %d ms", frames_to_get, int((end_time - start_time) / 1000));
 
-    // 显示预览图片
-    auto display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay());
-    if (display != nullptr) {
-        auto data = (uint8_t*)heap_caps_malloc(fb_->len, MALLOC_CAP_SPIRAM);
-        if (data == nullptr) {
-            ESP_LOGE(TAG, "Failed to allocate memory for preview image");
-            return false;
-        }
-
-        auto src = (uint16_t*)fb_->buf;
-        auto dst = (uint16_t*)data;
-        size_t pixel_count = fb_->len / 2;
-        for (size_t i = 0; i < pixel_count; i++) {
-            // 交换每个16位字内的字节
-            dst[i] = __builtin_bswap16(src[i]);
-        }
-
-        auto image = std::make_unique<LvglAllocatedImage>(data, fb_->len, fb_->width, fb_->height, fb_->width * 2, LV_COLOR_FORMAT_RGB565);
-        display->SetPreviewImage(std::move(image));
-    }
+    // 预览由 VisionPipeline 统一完成。不要在此处额外复制、交换 RGB565 字节并
+    // 提交显示：这会与视觉预览重复，并且 JPEG 帧不能按 RGB565 解释。
     return true;
 }
 

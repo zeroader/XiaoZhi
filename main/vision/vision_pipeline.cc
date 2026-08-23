@@ -3,6 +3,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_pthread.h>
+#include <esp_heap_caps.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -18,11 +19,9 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#define TAG "VisionPipeline"
+#include "esp_jpeg_dec.h"
 
-// 人脸/情绪检测最小间隔（ms）：降低 JPEG 编码 + HTTP 的 CPU/网络占用，
-// 避免与 TTS 解码抢资源导致语音卡顿。posture(5s)/heart_rate(10s) 不受此限制。
-static constexpr uint64_t kFaceEmotionMinIntervalMs = 500;
+#define TAG "VisionPipeline"
 
 PipelineStats::PipelineStats() { Reset(); }
 
@@ -135,6 +134,17 @@ void VisionPipeline::Deinitialize() {
         online_detector_->Deinitialize();
     }
 
+    // 释放 JPEG 解码器与预览缓冲（OV2640 直出 JPEG 时使用）
+    if (jpeg_dec_ != nullptr) {
+        jpeg_dec_close((jpeg_dec_handle_t)jpeg_dec_);
+        jpeg_dec_ = nullptr;
+    }
+    if (preview_rgb565_ != nullptr) {
+        heap_caps_free(preview_rgb565_);
+        preview_rgb565_ = nullptr;
+        preview_rgb565_cap_ = 0;
+    }
+
     active_detector_ = nullptr;
     active_detector_type_ = DetectorType::kNone;
     initialized_ = false;
@@ -224,6 +234,67 @@ bool VisionPipeline::ReleaseCurrentFrame() {
     return true;
 }
 
+// 将 OV2640 直出的 JPEG 帧解码为 RGB565（esp_new_jpeg 软解码），仅用于 LCD 预览。
+// 检测线程无需解码——JPEG 字节直接上传到服务器，编码成本为零。
+bool VisionPipeline::DecodeJpegFrame(const ImageFrame& jpeg, uint8_t** out_rgb565,
+                                     size_t* out_len, int* out_w, int* out_h) {
+    if (jpeg.data == nullptr || jpeg.len == 0) return false;
+
+    // 懒初始化解码器（仅预览线程使用，无并发访问）
+    if (jpeg_dec_ == nullptr) {
+        jpeg_dec_config_t config = {};
+        // ComposePreview 会将输入 RGB565 转为 LVGL 所需的字节序，
+        // 因此这里保持与 OV2640 RGB565 原始帧一致的 big-endian 格式。
+        config.output_type = JPEG_PIXEL_FORMAT_RGB565_BE;
+        config.rotate = JPEG_ROTATE_0D;
+        if (jpeg_dec_open(&config, &jpeg_dec_) != JPEG_ERR_OK) {
+            ESP_LOGE(TAG, "DecodeJpegFrame: failed to open JPEG decoder");
+            jpeg_dec_ = nullptr;
+            return false;
+        }
+    }
+
+    jpeg_dec_io_t io = {};
+    io.inbuf = (uint8_t*)jpeg.data;
+    io.inbuf_len = (int)jpeg.len;
+
+    jpeg_dec_header_info_t info = {};
+    if (jpeg_dec_parse_header(jpeg_dec_, &io, &info) != JPEG_ERR_OK) {
+        ESP_LOGE(TAG, "DecodeJpegFrame: parse header failed");
+        return false;
+    }
+
+    size_t need = (size_t)info.width * info.height * 2;  // RGB565
+    if (need == 0 || need > 1024 * 1024) {
+        ESP_LOGE(TAG, "DecodeJpegFrame: bad dims %dx%d", info.width, info.height);
+        return false;
+    }
+    if (preview_rgb565_ == nullptr || preview_rgb565_cap_ < need) {
+        if (preview_rgb565_ != nullptr) heap_caps_free(preview_rgb565_);
+        // esp_new_jpeg 要求 S3 上输出缓冲 16 字节对齐
+        preview_rgb565_ = (uint8_t*)heap_caps_aligned_alloc(16, need, MALLOC_CAP_SPIRAM);
+        preview_rgb565_cap_ = preview_rgb565_ != nullptr ? need : 0;
+    }
+    if (preview_rgb565_ == nullptr) {
+        ESP_LOGE(TAG, "DecodeJpegFrame: no memory for %d bytes", (int)need);
+        return false;
+    }
+
+    io.outbuf = preview_rgb565_;
+    // jpeg_dec_parse_header 已在 io 中更新输入位置；不要再次手动偏移，
+    // 否则会跳过 JPEG 数据而导致解码画面损坏。
+    if (jpeg_dec_process(jpeg_dec_, &io) != JPEG_ERR_OK) {
+        ESP_LOGE(TAG, "DecodeJpegFrame: decode failed");
+        return false;
+    }
+
+    *out_rgb565 = preview_rgb565_;
+    *out_len = need;
+    *out_w = info.width;
+    *out_h = info.height;
+    return true;
+}
+
 camera_fb_t* VisionPipeline::GetCameraFb() {
     auto* cam = ResolveEsp32Camera();
     return cam ? cam->GetLastCapturedFrame() : nullptr;
@@ -283,8 +354,18 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
             auto t_comp0 = esp_timer_get_time();
             ESP_LOGI(TAG, "OneShotDetect: ComposePreview frame=%dx%d format=%d len=%u",
                      frame.width, frame.height, frame.pixel_format, (unsigned)frame.len);
-            auto image = display_composer_->ComposePreview(frame.data, frame.width, frame.height,
-                                                          (size_t)frame.width * 2, result);
+            // OV2640 直出 JPEG：解码成 RGB565 再送 LCD
+            const uint8_t* disp_data = frame.data;
+            int disp_w = frame.width;
+            int disp_h = frame.height;
+            if (frame.pixel_format == PIXFORMAT_JPEG) {
+                uint8_t* dec = nullptr; size_t dec_len = 0; int dw = 0, dh = 0;
+                if (DecodeJpegFrame(frame, &dec, &dec_len, &dw, &dh)) {
+                    disp_data = dec; disp_w = dw; disp_h = dh;
+                }
+            }
+            auto image = display_composer_->ComposePreview(disp_data, disp_w, disp_h,
+                                                          (size_t)disp_w * 2, result);
             auto t_comp1 = esp_timer_get_time();
             stats_.total_compose_ms += (uint64_t)((t_comp1 - t_comp0) / 1000LL);
 
@@ -342,6 +423,7 @@ void VisionPipeline::PreviewLoop() {
                 shared_frame_.assign(frame.data, frame.data + frame.len);
                 shared_frame_w_ = frame.width;
                 shared_frame_h_ = frame.height;
+                shared_frame_pixfmt_ = frame.pixel_format;
                 shared_frame_version_++;
             }
 
@@ -360,19 +442,33 @@ void VisionPipeline::PreviewLoop() {
                         current_result.posture = latest_posture_;
                         current_result.heart_rate = latest_heart_rate_;
                     }
-                    auto t_comp0 = esp_timer_get_time();
-                    auto image = display_composer_->ComposePreview(
-                        frame.data, frame.width, frame.height,
-                        (size_t)frame.width * 2, current_result);
-                    auto t_comp1 = esp_timer_get_time();
-                    stats_.total_compose_ms += (uint64_t)((t_comp1 - t_comp0) / 1000LL);
+                    // OV2640 直出 JPEG：解码成 RGB565 再送 LCD（检测线程直接用 JPEG 上传，互不影响）
+                    const uint8_t* disp_data = frame.data;
+                    int disp_w = frame.width;
+                    int disp_h = frame.height;
+                    if (frame.pixel_format == PIXFORMAT_JPEG) {
+                        uint8_t* dec = nullptr; size_t dec_len = 0; int dw = 0, dh = 0;
+                        if (!DecodeJpegFrame(frame, &dec, &dec_len, &dw, &dh)) {
+                            disp_data = nullptr;  // 解码失败则本次不显示
+                        } else {
+                            disp_data = dec; disp_w = dw; disp_h = dh;
+                        }
+                    }
+                    if (disp_data != nullptr) {
+                        auto t_comp0 = esp_timer_get_time();
+                        auto image = display_composer_->ComposePreview(
+                            disp_data, disp_w, disp_h,
+                            (size_t)disp_w * 2, current_result);
+                        auto t_comp1 = esp_timer_get_time();
+                        stats_.total_compose_ms += (uint64_t)((t_comp1 - t_comp0) / 1000LL);
 
-                    if (image) {
-                        auto t_disp0 = esp_timer_get_time();
-                        lcd->SetPreviewImage(std::move(image));
-                        auto t_disp1 = esp_timer_get_time();
-                        stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
-                        stats_.display_count++;
+                        if (image) {
+                            auto t_disp0 = esp_timer_get_time();
+                            lcd->SetPreviewImage(std::move(image));
+                            auto t_disp1 = esp_timer_get_time();
+                            stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
+                            stats_.display_count++;
+                        }
                     }
                 }
             }
@@ -399,11 +495,14 @@ void VisionPipeline::DetectionLoop() {
     uint32_t last_version = 0;  // avoid re-processing same frame
     uint64_t last_posture_ms = 0;  // 距上次 posture 任务的毫秒数
     uint64_t last_heart_ms = 0;    // 距上次 heart_rate 任务的毫秒数
-    uint64_t last_face_ms = 0;     // 距上次 face_emotion 任务的毫秒数（节流用）
 
     while (continuous_running_.load()) {
         // Wait for a NEW shared frame (skip if same as last processed)
         ImageFrame detect_frame;
+        // 检测（HTTP 上传）在线程锁外执行，因此必须拥有独立的帧副本。
+        // 不能只保存 shared_frame_.data()：预览线程可能在上传期间用下一帧
+        // 覆盖或重分配 shared_frame_，从而发送损坏的 JPEG 并触发服务器 400。
+        std::vector<uint8_t> detect_frame_data;
         uint32_t current_version;
         {
             std::lock_guard<std::mutex> lock(frame_mutex_);
@@ -418,11 +517,12 @@ void VisionPipeline::DetectionLoop() {
                 continue;
             }
             last_version = current_version;
-            detect_frame.data = shared_frame_.data();
-            detect_frame.len = shared_frame_.size();
+            detect_frame_data = shared_frame_;
+            detect_frame.data = detect_frame_data.data();
+            detect_frame.len = detect_frame_data.size();
             detect_frame.width = shared_frame_w_;
             detect_frame.height = shared_frame_h_;
-            detect_frame.pixel_format = (int)PIXFORMAT_RGB565;
+            detect_frame.pixel_format = shared_frame_pixfmt_;  // JPEG 直出时上传零编码
         }
 
         if (active_detector_ == nullptr) {
@@ -444,17 +544,6 @@ void VisionPipeline::DetectionLoop() {
                 last_heart_ms = now_ms;
             }
             ApplyTaskToOnlineDetector(active_detector_, task);
-        }
-
-        // 节流：face_emotion 至少间隔 kFaceEmotionMinIntervalMs，降低 JPEG 编码 + HTTP
-        // 的 CPU/网络占用，避免与 TTS 解码抢资源导致语音卡顿（posture/heart 不受限）
-        if (task == kTaskFaceEmotion) {
-            uint64_t now_ms = esp_timer_get_time() / 1000LL;
-            if ((now_ms - last_face_ms) < kFaceEmotionMinIntervalMs) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            last_face_ms = now_ms;
         }
 
         // Run detection (JPEG encode + HTTP POST + parse response)
@@ -596,9 +685,19 @@ void VisionPipeline::PreviewOnlyLoop() {
 
         auto* lcd = ResolveLvglDisplay();
         if (lcd != nullptr && display_composer_) {
+            // OV2640 直出 JPEG：解码成 RGB565 再送 LCD
+            const uint8_t* disp_data = frame.data;
+            int disp_w = frame.width;
+            int disp_h = frame.height;
+            if (frame.pixel_format == PIXFORMAT_JPEG) {
+                uint8_t* dec = nullptr; size_t dec_len = 0; int dw = 0, dh = 0;
+                if (DecodeJpegFrame(frame, &dec, &dec_len, &dw, &dh)) {
+                    disp_data = dec; disp_w = dw; disp_h = dh;
+                }
+            }
             auto image = display_composer_->ComposePreview(
-                frame.data, frame.width, frame.height,
-                (size_t)frame.width * 2, empty_result);
+                disp_data, disp_w, disp_h,
+                (size_t)disp_w * 2, empty_result);
             if (image) {
                 lcd->SetPreviewImage(std::move(image));
             }

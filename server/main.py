@@ -82,6 +82,11 @@ _last_response_time = None
 def decode_image(image: protocol.ImageRequest) -> np.ndarray:
     """Base64 -> JPEG -> RGB numpy 数组"""
     jpeg_bytes = base64.b64decode(image.data)
+    return decode_jpeg_bytes(jpeg_bytes)
+
+
+def decode_jpeg_bytes(jpeg_bytes: bytes) -> np.ndarray:
+    """JPEG bytes -> RGB numpy 数组"""
     pil_img = Image.open(io.BytesIO(jpeg_bytes))
     return np.array(pil_img.convert("RGB"))
 
@@ -136,9 +141,116 @@ def _detect_heart_rate() -> dict:
     return heart_detector.detect(frames)
 
 
+def _dispatch_task(task: str, rgb: np.ndarray, src_w: int, src_h: int,
+                   calibrate: bool = False) -> dict:
+    """按 task 分发推理（JSON 与 multipart 协议共用）"""
+    if task == protocol.TASK_FACE_EMOTION:
+        result = _detect_face_emotion(rgb, src_w, src_h)
+        state.set_face(result["face"])
+        state.set_emotion(result["emotion"])
+    elif task == protocol.TASK_POSTURE:
+        # calibrate=true 时，将当前姿态记录为基准坐姿（需先完成一次完整检测）
+        if calibrate:
+            m = pose_detector.detect(rgb).get("metrics", {})
+            if "cva" in m:
+                # 用 EMA 平滑值作基准（比单帧 raw 稳定），躯干角仅在髋可见时校准
+                pose_detector.calibrate(m["cva"], m["trunk_angle"],
+                                        bool(m.get("trunk_valid", False)))
+                reason = "baseline_set" if m.get("trunk_valid") else "baseline_set_cva_only"
+                result = {"state": "calibrated", "reason": reason, "metrics": m}
+            else:
+                result = {"state": "unknown", "reason": "calibrate_failed",
+                          "metrics": m}
+        else:
+            result = _detect_posture(rgb)
+        state.set_posture(result)
+    elif task == protocol.TASK_HEART_RATE:
+        result = _detect_heart_rate()
+        state.set_heart_rate(result)
+    else:
+        result = {"error": f"unsupported task: {task}"}
+    return result
+
+
 # ============================================================
 # HTTP API
 # ============================================================
+
+def _handle_multipart_detect(t_start: float, client_net_ms: float):
+    """multipart/form-data 协议：二进制 JPEG 上传（免 base64）。
+
+    请求字段:
+      frame_id / task / calibrate(可选 "true") 为 form 字段
+      image 为文件字段（JPEG 二进制）
+    响应: 与 JSON 协议相同的统一格式 {frame_id, task, result, performance}
+    """
+    global _last_frame_time, _last_response_time
+
+    # 解析 form 字段
+    try:
+        frame_id = int(request.form.get("frame_id", -1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "`frame_id` must be an integer"}), 400
+
+    task = request.form.get("task", "")
+    if task not in protocol.VALID_TASKS:
+        return jsonify({"error": f"`task` must be one of {sorted(protocol.VALID_TASKS)}"}), 400
+
+    calibrate = request.form.get("calibrate", "false") in ("true", "1", "True")
+
+    # 读取 JPEG 文件字段
+    f = request.files.get("image")
+    if f is None:
+        return jsonify({"error": "missing `image` file field"}), 400
+    jpeg_bytes = f.read()
+    if not jpeg_bytes:
+        return jsonify({"error": "empty `image` file"}), 400
+
+    # 解码
+    t0 = time.time()
+    try:
+        rgb = decode_jpeg_bytes(jpeg_bytes)
+    except Exception as e:
+        return jsonify({"error": f"decode failed - {e}"}), 400
+    t_decode_ms = (time.time() - t0) * 1000
+
+    # 若未提供原始尺寸，回退到实际图像尺寸
+    try:
+        src_w = int(request.form.get("width", 0)) or rgb.shape[1]
+        src_h = int(request.form.get("height", 0)) or rgb.shape[0]
+    except (TypeError, ValueError):
+        src_w, src_h = rgb.shape[1], rgb.shape[0]
+
+    # 保存当前帧（所有 task 均缓存，供 rPPG 时序分析）
+    cache_id = state.push_frame(cache_resized(rgb), src_w, src_h)
+
+    t1 = time.time()
+    result = _dispatch_task(task, rgb, src_w, src_h, calibrate=calibrate)
+    t_infer_ms = (time.time() - t1) * 1000
+
+    # FPS 统计
+    now = time.time()
+    interval_ms = 0.0
+    fps = 0.0
+    if _last_frame_time is not None:
+        interval_ms = (now - _last_frame_time) * 1000
+        fps = 1000.0 / interval_ms if interval_ms > 0 else 0.0
+    _last_frame_time = now
+    _last_response_time = now
+
+    t_elapsed = (time.time() - t_start) * 1000
+    print(f"[{time.strftime('%H:%M:%S')}] [mp] frame={cache_id} task={task} "
+          f"interval={interval_ms:.0f}ms FPS={fps:.1f} | client+net={client_net_ms:.0f}ms "
+          f"server={t_elapsed:.0f}ms (decode={t_decode_ms:.0f}ms infer={t_infer_ms:.0f}ms) "
+          f"jpeg={len(jpeg_bytes)}B")
+
+    perf = {
+        "decode_ms": round(t_decode_ms, 2),
+        "infer_ms": round(t_infer_ms, 2),
+        "total_ms": round(t_elapsed, 2),
+    }
+    return jsonify(protocol.build_response(frame_id, task, result, perf))
+
 
 @app.route("/detect", methods=["POST"])
 def detect():
@@ -150,6 +262,11 @@ def detect():
     if _last_response_time is not None:
         client_net_ms = (t_start - _last_response_time) * 1000
 
+    # ---------------- multipart 协议（二进制 JPEG，免 base64） ----------------
+    if request.mimetype == "multipart/form-data":
+        return _handle_multipart_detect(t_start, client_net_ms)
+
+    # ---------------- JSON 协议 ----------------
     try:
         data = request.get_json(force=True)
     except Exception:
@@ -217,32 +334,8 @@ def detect():
     frame_id = state.push_frame(cache_resized(rgb), src_w, src_h)
 
     t1 = time.time()
-    # 按 task 分发
-    if req.task == protocol.TASK_FACE_EMOTION:
-        result = _detect_face_emotion(rgb, src_w, src_h)
-        state.set_face(result["face"])
-        state.set_emotion(result["emotion"])
-    elif req.task == protocol.TASK_POSTURE:
-        # calibrate=true 时，将当前姿态记录为基准坐姿（需先完成一次完整检测）
-        if req.calibrate:
-            m = pose_detector.detect(rgb).get("metrics", {})
-            if "cva" in m:
-                # 用 EMA 平滑值作基准（比单帧 raw 稳定），躯干角仅在髋可见时校准
-                pose_detector.calibrate(m["cva"], m["trunk_angle"],
-                                        bool(m.get("trunk_valid", False)))
-                reason = "baseline_set" if m.get("trunk_valid") else "baseline_set_cva_only"
-                result = {"state": "calibrated", "reason": reason, "metrics": m}
-            else:
-                result = {"state": "unknown", "reason": "calibrate_failed",
-                          "metrics": m}
-        else:
-            result = _detect_posture(rgb)
-        state.set_posture(result)
-    elif req.task == protocol.TASK_HEART_RATE:
-        result = _detect_heart_rate()
-        state.set_heart_rate(result)
-    else:
-        result = {"error": f"unsupported task: {req.task}"}
+    # 按 task 分发（JSON 与 multipart 共用）
+    result = _dispatch_task(req.task, rgb, src_w, src_h, calibrate=req.calibrate)
     t_infer_ms = (time.time() - t1) * 1000
 
     # FPS 统计（新协议响应频率）
