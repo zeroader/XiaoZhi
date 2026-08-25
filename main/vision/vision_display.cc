@@ -280,7 +280,9 @@ std::unique_ptr<LvglImage> VisionDisplay::ComposePreview(const uint8_t* frame_rg
         }
     }
 
-    DrawDetections(dst, width, height, dst_stride, detections);
+    // The LCD preview is intentionally a clean live video surface.  Detection
+    // values are shown in the four dashboard tiles, so do not burn text,
+    // labels, boxes, or status strings into the video frame itself.
 
     return std::make_unique<LvglAllocatedImage>(dst, total, width, height, (int)dst_stride, LV_COLOR_FORMAT_RGB565);
 }

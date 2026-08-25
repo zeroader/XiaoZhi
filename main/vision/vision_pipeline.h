@@ -161,6 +161,10 @@ private:
 
     void CacheSensingResult(const DetectionResult& result);
     void MaybeNotifyPosture(const DetectionResult& result);
+    void MaybeNotifyHealth(const DetectionResult& result);
+
+    uint64_t last_health_alert_ms_ = 0;
+    bool health_alert_active_ = false;
 
     bool CaptureFrame(ImageFrame& out_frame);
     bool ReleaseCurrentFrame();

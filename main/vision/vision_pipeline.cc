@@ -344,6 +344,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     last_result_ = result;
     CacheSensingResult(result);
     MaybeNotifyPosture(result);
+    MaybeNotifyHealth(result);
 
     bool displayed = false;
     if (show_on_lcd && display_composer_) {
@@ -373,7 +374,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
                 ESP_LOGW(TAG, "OneShotDetect: ComposePreview returned NULL (bad alloc or invalid dims?)");
             } else {
                 auto t_disp0 = esp_timer_get_time();
-                lcd->SetPreviewImage(std::move(image));
+                lcd->SetVisionPreviewImage(std::move(image), result);
                 auto t_disp1 = esp_timer_get_time();
                 stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
                 stats_.display_count++;
@@ -401,12 +402,12 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     return true;
 }
 
-// ---------- Two-thread architecture: Preview (15 FPS) + Detect (async) ----------
+// ---------- Two-thread architecture: Preview (20 FPS) + Detect (async) ----------
 
 void VisionPipeline::PreviewLoop() {
-    ESP_LOGI(TAG, "Preview loop started (15 FPS)");
+    ESP_LOGI(TAG, "Preview loop started (20 FPS, latest-frame mode)");
 
-    constexpr uint32_t kPreviewPeriodMs = 67;  // ~15 FPS
+    constexpr uint32_t kPreviewPeriodMs = 50;  // ~20 FPS; camera is configured for CAMERA_GRAB_LATEST
     uint64_t last_iter = 0;
 
     while (continuous_running_.load()) {
@@ -464,7 +465,7 @@ void VisionPipeline::PreviewLoop() {
 
                         if (image) {
                             auto t_disp0 = esp_timer_get_time();
-                            lcd->SetPreviewImage(std::move(image));
+                            lcd->SetVisionPreviewImage(std::move(image), current_result);
                             auto t_disp1 = esp_timer_get_time();
                             stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
                             stats_.display_count++;
@@ -564,6 +565,7 @@ void VisionPipeline::DetectionLoop() {
         CacheSensingResult(result);
         // 坏坐姿触发大模型提醒
         MaybeNotifyPosture(result);
+        MaybeNotifyHealth(result);
 
         // Track connection errors
         if (!result.connection_ok) {
@@ -656,10 +658,14 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
 }
 
 void VisionPipeline::StopContinuous() {
-    if (!continuous_running_.load()) return;
     continuous_running_.store(false);
     if (preview_thread_.joinable()) preview_thread_.join();
     if (detect_thread_.joinable()) detect_thread_.join();
+
+    // Leave the full-screen detection dashboard and restore the normal chat UI.
+    if (auto* lcd = ResolveLvglDisplay()) {
+        lcd->SetPreviewImage(nullptr);
+    }
 }
 
 bool VisionPipeline::IsContinuousRunning() const {
@@ -699,7 +705,7 @@ void VisionPipeline::PreviewOnlyLoop() {
                 disp_data, disp_w, disp_h,
                 (size_t)disp_w * 2, empty_result);
             if (image) {
-                lcd->SetPreviewImage(std::move(image));
+                lcd->SetVisionPreviewImage(std::move(image), empty_result);
             }
         }
 
@@ -734,10 +740,14 @@ bool VisionPipeline::StartPreview(uint32_t period_ms) {
 }
 
 void VisionPipeline::StopPreview() {
-    if (!preview_running_.load()) return;
     preview_running_.store(false);
     if (preview_thread_.joinable()) {
         preview_thread_.join();
+    }
+
+    // Preview mode uses the same full-screen dashboard as continuous mode.
+    if (auto* lcd = ResolveLvglDisplay()) {
+        lcd->SetPreviewImage(nullptr);
     }
 }
 
@@ -863,6 +873,7 @@ void VisionPipeline::MaybeNotifyPosture(const DetectionResult& result) {
     cJSON* params = cJSON_AddObjectToObject(note, "params");
     cJSON_AddStringToObject(params, "state", result.posture.state.c_str());
     cJSON_AddStringToObject(params, "reason", result.posture.reason.c_str());
+    cJSON_AddStringToObject(params, "message", "提示：检测到坐姿不正，请保持头部居中、背部挺直并减少左右晃动。");
     char* json_str = cJSON_PrintUnformatted(note);
     if (json_str != nullptr) {
         Application::GetInstance().SendMcpMessage(std::string(json_str));
@@ -871,6 +882,45 @@ void VisionPipeline::MaybeNotifyPosture(const DetectionResult& result) {
                  result.posture.state.c_str(), result.posture.reason.c_str());
     }
     cJSON_Delete(note);
+}
+
+void VisionPipeline::MaybeNotifyHealth(const DetectionResult& result) {
+    // 成人静息筛查范围：心率 60-100 bpm；血压低于 90/60 或达到 140/90 触发提醒。
+    bool hr_abnormal = result.heart_rate.available &&
+        (result.heart_rate.bpm < 60.0f || result.heart_rate.bpm > 100.0f);
+    bool bp_abnormal = result.blood_pressure.available &&
+        (result.blood_pressure.systolic < 90.0f || result.blood_pressure.systolic >= 140.0f ||
+         result.blood_pressure.diastolic < 60.0f || result.blood_pressure.diastolic >= 90.0f);
+    bool abnormal = hr_abnormal || bp_abnormal;
+    if (!abnormal) {
+        health_alert_active_ = false;
+        return;
+    }
+
+    uint64_t now_ms = esp_timer_get_time() / 1000LL;
+    constexpr uint64_t kAlertCooldownMs = 60000;
+    if (health_alert_active_ && now_ms - last_health_alert_ms_ < kAlertCooldownMs) return;
+    health_alert_active_ = true;
+    last_health_alert_ms_ = now_ms;
+
+    std::string message = "健康提醒：";
+    if (hr_abnormal) message += "心率超出静息参考范围，请保持安静后复测。";
+    if (bp_abnormal) message += "血压超出参考范围，请休息后复测；如持续异常请咨询医生。";
+
+    cJSON* note = cJSON_CreateObject();
+    cJSON_AddStringToObject(note, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(note, "method", "notifications/health_alert");
+    cJSON* params = cJSON_AddObjectToObject(note, "params");
+    cJSON_AddStringToObject(params, "message", message.c_str());
+    cJSON_AddBoolToObject(params, "heart_rate_abnormal", hr_abnormal);
+    cJSON_AddBoolToObject(params, "blood_pressure_abnormal", bp_abnormal);
+    char* json_str = cJSON_PrintUnformatted(note);
+    if (json_str != nullptr) {
+        Application::GetInstance().SendMcpMessage(std::string(json_str));
+        cJSON_free(json_str);
+    }
+    cJSON_Delete(note);
+    ESP_LOGW(TAG, "%s", message.c_str());
 }
 
 
@@ -952,6 +1002,11 @@ static cJSON* DetectionsToJson(const DetectionResult& r) {
     } else if (!r.heart_rate.error_message.empty()) {
         cJSON* hr = cJSON_AddObjectToObject(j, "heart_rate");
         cJSON_AddStringToObject(hr, "error", r.heart_rate.error_message.c_str());
+    }
+    if (r.blood_pressure.available) {
+        cJSON* bp = cJSON_AddObjectToObject(j, "blood_pressure");
+        cJSON_AddNumberToObject(bp, "systolic", r.blood_pressure.systolic);
+        cJSON_AddNumberToObject(bp, "diastolic", r.blood_pressure.diastolic);
     }
     if (r.decode_ms > 0 || r.infer_ms > 0 || r.total_ms > 0) {
         cJSON* perf = cJSON_AddObjectToObject(j, "performance");

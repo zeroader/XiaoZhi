@@ -62,6 +62,14 @@ struct HeartRateResult {
     HeartRateResult() : bpm(0.0f), confidence(0.0f), fs(0.0f), frames_used(0), available(false) {}
 };
 
+struct BloodPressureResult {
+    float systolic;
+    float diastolic;
+    bool available;
+
+    BloodPressureResult() : systolic(0.0f), diastolic(0.0f), available(false) {}
+};
+
 struct DetectionResult {
     std::vector<Detection> detections;
     int source_width;
@@ -76,6 +84,7 @@ struct DetectionResult {
     EmotionResult emotion;
     PostureResult posture;
     HeartRateResult heart_rate;
+    BloodPressureResult blood_pressure;
     float decode_ms;          // 服务器解码耗时
     float infer_ms;           // 服务器推理耗时
     float total_ms;           // 服务器总耗时

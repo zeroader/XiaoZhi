@@ -33,6 +33,7 @@ import protocol
 import state as state_mod
 from detectors.face_detector import FaceDetector
 from detectors.emotion_detector import EmotionDetector
+from detectors.face_posture_detector import FacePostureDetector
 from detectors.pose_detector import PoseDetector
 from detectors.heart_detector import HeartRateDetector, METHODS as HEART_METHODS
 
@@ -67,7 +68,8 @@ CACHE_MAX_WIDTH = 320
 state: state_mod.ServerState = None
 face_detector: FaceDetector = None
 emotion_detector: EmotionDetector = None
-pose_detector: PoseDetector = None
+pose_detector: FacePostureDetector = None
+pose_keypoint_detector: PoseDetector = None
 heart_detector: HeartRateDetector = None
 
 # 旧协议专用：上一帧/响应时间（FPS 统计）
@@ -152,14 +154,12 @@ def _dispatch_task(task: str, rgb: np.ndarray, src_w: int, src_h: int,
         # calibrate=true 时，将当前姿态记录为基准坐姿（需先完成一次完整检测）
         if calibrate:
             m = pose_detector.detect(rgb).get("metrics", {})
-            if "cva" in m:
+            if "calibrated" in m:
                 # 用 EMA 平滑值作基准（比单帧 raw 稳定），躯干角仅在髋可见时校准
-                pose_detector.calibrate(m["cva"], m["trunk_angle"],
-                                        bool(m.get("trunk_valid", False)))
-                reason = "baseline_set" if m.get("trunk_valid") else "baseline_set_cva_only"
-                result = {"state": "calibrated", "reason": reason, "metrics": m}
+                pose_detector.calibrate(m)
+                result = {"state": "normal", "reason": "baseline_set", "metrics": m}
             else:
-                result = {"state": "unknown", "reason": "calibrate_failed",
+                result = {"state": "normal", "reason": "calibrate_failed",
                           "metrics": m}
         else:
             result = _detect_posture(rgb)
@@ -413,14 +413,14 @@ def download_models():
 # ============================================================
 
 def main():
-    global face_detector, emotion_detector, pose_detector, heart_detector, state
+    global face_detector, emotion_detector, pose_detector, pose_keypoint_detector, heart_detector, state
 
     parser = argparse.ArgumentParser(description="ESP32 Bio-Perception Server")
     parser.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8291, help="Listen port (default: 8291)")
     parser.add_argument("--face-model", default=str(MODEL_FACE), help="YuNet face model path")
     parser.add_argument("--emotion-model", default=str(MODEL_EMOTION), help="Emotion ONNX model path")
-    parser.add_argument("--pose-model", default=str(MODEL_POSE), help="YOLOv8-pose model path")
+    parser.add_argument("--pose-model", default=str(MODEL_POSE), help="兼容旧参数，当前坐姿检测不再使用 YOLO Pose")
     parser.add_argument("--buffer-size", type=int, default=BUFFER_MAXLEN,
                         help=f"frame_buffer maxlen (default: {BUFFER_MAXLEN})")
     parser.add_argument("--heart-method", default="pos", choices=list(HEART_METHODS),
@@ -450,10 +450,11 @@ def main():
 
     # 坐姿模型可选
     if Path(args.pose_model).exists():
-        pose_detector = PoseDetector(args.pose_model)
+        pose_keypoint_detector = PoseDetector(args.pose_model)
     else:
-        pose_detector = None
-        print(f"[WARN] Pose model not found: {args.pose_model} (posture 任务将不可用)")
+        pose_keypoint_detector = None
+        print(f"[WARN] YOLO Pose model not found: {args.pose_model}; using face-box posture only")
+    pose_detector = FacePostureDetector(face_detector, pose_keypoint_detector)
 
     heart_detector = HeartRateDetector(face_detector, method=args.heart_method)
     print(f"[Init] Models loaded in {(time.time() - t0) * 1000:.0f}ms")

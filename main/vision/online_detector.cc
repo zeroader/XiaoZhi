@@ -427,6 +427,18 @@ bool OnlineDetector::ParseResponse(const std::string& json_str, DetectionResult&
             if (herr && cJSON_IsString(herr)) result.heart_rate.error_message = herr->valuestring;
         }
 
+        // blood_pressure: {systolic, diastolic}（供支持血压传感器/服务端时序接入）
+        cJSON* bp = cJSON_GetObjectItem(result_obj, "blood_pressure");
+        if (bp != nullptr && cJSON_IsObject(bp)) {
+            cJSON* sys = cJSON_GetObjectItem(bp, "systolic");
+            cJSON* dia = cJSON_GetObjectItem(bp, "diastolic");
+            if (sys && dia && cJSON_IsNumber(sys) && cJSON_IsNumber(dia)) {
+                result.blood_pressure.available = true;
+                result.blood_pressure.systolic = (float)sys->valuedouble;
+                result.blood_pressure.diastolic = (float)dia->valuedouble;
+            }
+        }
+
         cJSON_Delete(json);
         return true;
     }
