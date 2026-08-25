@@ -988,6 +988,7 @@ void RegisterVisionMcpTools() {
             return VisionPipeline::GetInstance().Initialize();
         });
 
+    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
     mcp.AddTool("self.vision.shutdown",
         "Shutdown the vision pipeline, release detectors, stop continuous loop if running.",
         PropertyList(),
@@ -995,6 +996,7 @@ void RegisterVisionMcpTools() {
             VisionPipeline::GetInstance().Deinitialize();
             return true;
         });
+    */
 
     mcp.AddTool("self.vision.set_active_detector",
         "Choose which detector is used for detection.\n"
@@ -1015,6 +1017,7 @@ void RegisterVisionMcpTools() {
             return VisionPipeline::GetInstance().SetActiveDetector(type);
         });
 
+    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
     mcp.AddTool("self.vision.get_active_detector",
         "Returns the currently active detector name and list of available detectors.",
         PropertyList(),
@@ -1030,6 +1033,7 @@ void RegisterVisionMcpTools() {
             cJSON_AddItemToArray(avail, cJSON_CreateString(kDetectorTypeOnline));
             return j;
         });
+    */
 
     mcp.AddTool("self.vision.detect_once",
         "Capture ONE frame from the camera, run the active detector LOCALLY, and draw detection boxes "
@@ -1168,12 +1172,14 @@ void RegisterVisionMcpTools() {
             return true;
         });
 
+    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
     mcp.AddTool("self.vision.is_continuous_running",
         "Check if the continuous loop is currently running.",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             return (bool)VisionPipeline::GetInstance().IsContinuousRunning();
         });
+    */
 
     mcp.AddTool("self.vision.start_preview",
         "Start live camera preview on LCD (capture + display, NO face detection). "
@@ -1205,6 +1211,7 @@ void RegisterVisionMcpTools() {
             return true;
         });
 
+    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
     mcp.AddTool("self.vision.get_stats",
         "Get pipeline performance stats (counts and average times).",
         PropertyList(),
@@ -1219,7 +1226,9 @@ void RegisterVisionMcpTools() {
             VisionPipeline::GetInstance().ResetStats();
             return true;
         });
+    */
 
+    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
     mcp.AddTool("self.vision.set_camera_mirror",
         "Control camera horizontal mirror and vertical flip.\n"
         "Args:\n"
@@ -1234,6 +1243,7 @@ void RegisterVisionMcpTools() {
                 p["h_mirror"].value<bool>(),
                 p["v_flip"].value<bool>());
         });
+    */
 
     // Face detector config
 #ifndef VISION_DISABLE_LOCAL_FACE
@@ -1301,6 +1311,7 @@ void RegisterVisionMcpTools() {
             return true;
         });
 
+    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
     mcp.AddTool("self.vision.remote_detector.get_config",
         "Get current remote detector configuration (without auth_token value).",
         PropertyList(),
@@ -1316,6 +1327,7 @@ void RegisterVisionMcpTools() {
             }
             return j;
         });
+    */
 
     // Online detector config
     mcp.AddTool("self.vision.online_detector.configure",
@@ -1361,6 +1373,7 @@ void RegisterVisionMcpTools() {
             return true;
         });
 
+    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
     mcp.AddTool("self.vision.online_detector.get_config",
         "Get current online detector configuration.",
         PropertyList(),
@@ -1380,6 +1393,7 @@ void RegisterVisionMcpTools() {
             }
             return j;
         });
+    */
 
     mcp.AddTool("self.vision.online_detector.set_task",
         "Set the task for the online detection server (saved to flash, restored after reboot).\n"
