@@ -1,5 +1,5 @@
 {
-  "ip": "192.168.0.105",
   "token": "YOUR_DEVICE_TOKEN_HERE",
+  "ip": "auto",
   "model": "xiaomi.light.lamp31"
 }
