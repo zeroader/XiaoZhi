@@ -381,6 +381,77 @@ def health():
 
 
 # ============================================================
+# 米家台灯控制（MIoT，需 python-miio）
+# ============================================================
+
+_lamp_controller = None
+_lamp_error = None
+
+
+def _get_lamp_controller():
+    """懒加载台灯控制器：第一次调用时才连接台灯。
+
+    这样即使未安装 python-miio 或未配置 lamp_config.json，
+    服务器照常启动，其它（视觉）接口不受影响。
+    """
+    global _lamp_controller, _lamp_error
+    if _lamp_controller is not None:
+        return _lamp_controller
+    if _lamp_error is not None:
+        raise _lamp_error
+    try:
+        from lamp_controller import MijiaLampController
+        _lamp_controller = MijiaLampController()
+    except Exception as e:  # 记录错误，避免每次请求都重试
+        _lamp_error = e
+        raise
+    return _lamp_controller
+
+
+@app.route("/lamp", methods=["POST"])
+def lamp():
+    """台灯控制接口。
+
+    请求体 (JSON):
+      {"action": "get_status"}
+      {"action": "set_power", "value": true}
+      {"action": "set_brightness", "value": 60}
+      {"action": "set_color_temp", "value": 4000}
+
+    响应体 (JSON):
+      {"ok": true, "power": false, "brightness": 1, "color_temp": 5100}
+      {"ok": true, "power": true}
+      {"ok": false, "error": "..."}
+
+    统一返回 200，成功/失败用 ok 字段区分，便于 ESP32 侧解析错误信息。
+    """
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid JSON"})
+
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "request body must be a JSON object"})
+
+    action = data.get("action", "")
+    value = data.get("value")
+
+    try:
+        ctrl = _get_lamp_controller()
+        if action == "get_status":
+            return jsonify({"ok": True, **ctrl.get_status()})
+        if action == "set_power":
+            return jsonify({"ok": True, **ctrl.set_power(value)})
+        if action == "set_brightness":
+            return jsonify({"ok": True, **ctrl.set_brightness(value)})
+        if action == "set_color_temp":
+            return jsonify({"ok": True, **ctrl.set_color_temp(value)})
+        return jsonify({"ok": False, "error": f"unknown action: {action}"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+# ============================================================
 # 模型下载
 # ============================================================
 

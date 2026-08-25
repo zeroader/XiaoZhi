@@ -4,3 +4,4 @@ numpy>=1.24
 opencv-python>=4.8
 onnxruntime>=1.16
 scipy>=1.10
+python-miio>=0.5.12

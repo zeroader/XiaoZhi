@@ -19,3 +19,6 @@ mmap_generate_*.h
 
 # Temporary backup directory created during vision feature commit
 _vision_modifications_backup/
+
+# Mijia lamp server config (contains the device token — never commit)
+server/lamp_config.json
