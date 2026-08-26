@@ -15,6 +15,7 @@
 #include "mcp_server.h"
 #include "system_info.h"
 #include "application.h"
+#include "assets/lang_config.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -437,11 +438,16 @@ void VisionPipeline::PreviewLoop() {
                         std::lock_guard<std::mutex> lock(result_mutex_);
                         current_result = last_result_;
                     }
-                    // 合并跨帧缓存的坐姿/心率，保证 LCD 上持续显示（不被每帧 face_emotion 覆盖）
+                    // 合并跨帧缓存，避免自动调度切换任务时缺失字段让仪表盘图片来回跳。
                     {
                         std::lock_guard<std::mutex> lock(sensing_mutex_);
+                        current_result.emotion = latest_emotion_;
                         current_result.posture = latest_posture_;
                         current_result.heart_rate = latest_heart_rate_;
+                        current_result.blood_pressure = latest_blood_pressure_;
+                        current_result.heart_rate_alert = heart_rate_alert_.active;
+                        current_result.blood_pressure_alert = blood_pressure_alert_.active;
+                        current_result.posture_alert = posture_alert_.active;
                     }
                     // OV2640 直出 JPEG：解码成 RGB565 再送 LCD（检测线程直接用 JPEG 上传，互不影响）
                     const uint8_t* disp_data = frame.data;
@@ -554,6 +560,11 @@ void VisionPipeline::DetectionLoop() {
         stats_.total_detect_ms += (uint64_t)((t_detect1 - t_detect0) / 1000LL);
         stats_.detect_count++;
 
+        // Update cross-frame sensing values before publishing the result. This
+        // prevents the preview thread from observing a new task's empty fields
+        // before the corresponding cached values are ready.
+        CacheSensingResult(result);
+
         // Update shared result (mutex-protected for preview thread reads)
         {
             std::lock_guard<std::mutex> lock(result_mutex_);
@@ -561,8 +572,6 @@ void VisionPipeline::DetectionLoop() {
         }
         stats_.last_detection_count = (uint32_t)result.detections.size();
 
-        // 缓存跨帧感知结果（心率值供查询、坐姿供 LCD 持续叠加）
-        CacheSensingResult(result);
         // 坏坐姿触发大模型提醒
         MaybeNotifyPosture(result);
         MaybeNotifyHealth(result);
@@ -770,12 +779,18 @@ bool VisionPipeline::SetCameraMirror(bool h_mirror, bool v_flip) {
 
 const DetectionResult& VisionPipeline::GetLastResult() const { return last_result_; }
 
-// 缓存跨帧感知结果：心率值供查询，坐姿供 LCD 持续叠加
+// 缓存跨帧感知结果，供查询和 LCD 在自动调度切换任务时持续叠加
 void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
     std::lock_guard<std::mutex> lock(sensing_mutex_);
+    if (result.emotion.available && !result.emotion.label.empty()) {
+        latest_emotion_ = result.emotion;
+    }
     if (result.heart_rate.available) {
         latest_heart_rate_ = result.heart_rate;
         heart_rate_timestamp_ms_ = result.timestamp_ms;
+    }
+    if (result.blood_pressure.available) {
+        latest_blood_pressure_ = result.blood_pressure;
     }
     if (result.posture.available) {
         // "calibrated" 是标定成功的瞬时状态，不是坐姿状态，不覆盖 LCD 叠加
@@ -848,24 +863,40 @@ uint64_t VisionPipeline::GetUserEmotionTimestampMs() const {
     return user_emotion_timestamp_ms_;
 }
 
-// 坏坐姿时通过 MCP Notification 触发大模型提醒（进入坏坐姿立即提醒，之后每 60s 复查仍坏则再提醒）
+// Two consecutive valid samples activate or clear an alert. In auto mode this
+// means about 10 seconds for posture and 20 seconds for heart rate.
 void VisionPipeline::MaybeNotifyPosture(const DetectionResult& result) {
     if (!result.posture.available) return;
 
     bool bad = (result.posture.state == "bad_posture");
     uint64_t now_ms = esp_timer_get_time() / 1000LL;
-
-    if (!bad) {
-        posture_reminded_ = false;  // 恢复坐姿后重置，下次再趴会重新提醒
-        return;
+    bool should_remind = false;
+    {
+        std::lock_guard<std::mutex> lock(sensing_mutex_);
+        if (bad) {
+            posture_alert_.abnormal_count++;
+            posture_alert_.normal_count = 0;
+            if (posture_alert_.abnormal_count >= 2) posture_alert_.active = true;
+        } else {
+            posture_alert_.normal_count++;
+            posture_alert_.abnormal_count = 0;
+            if (posture_alert_.normal_count >= 2) posture_alert_.active = false;
+        }
+        constexpr uint64_t kRemindCooldownMs = 60000;
+        if (posture_alert_.active &&
+            (posture_alert_.last_remind_ms == 0 ||
+             now_ms - posture_alert_.last_remind_ms >= kRemindCooldownMs)) {
+            posture_alert_.last_remind_ms = now_ms;
+            should_remind = true;
+        }
     }
+    if (!should_remind) return;
 
-    constexpr uint64_t kRemindCooldownMs = 60000;
-    if (posture_reminded_ && (now_ms - last_posture_remind_ms_) < kRemindCooldownMs) {
-        return;  // 冷却期内不重复提醒
-    }
-    last_posture_remind_ms_ = now_ms;
-    posture_reminded_ = true;
+    const std::string message = "检测到坐姿不正，请保持头部居中、背部挺直。";
+    Application::GetInstance().Schedule([message]() {
+        Application::GetInstance().Alert("坐姿提醒", message.c_str(), "warning",
+                                         Lang::Sounds::OGG_EXCLAMATION);
+    });
 
     cJSON* note = cJSON_CreateObject();
     cJSON_AddStringToObject(note, "jsonrpc", "2.0");
@@ -873,7 +904,7 @@ void VisionPipeline::MaybeNotifyPosture(const DetectionResult& result) {
     cJSON* params = cJSON_AddObjectToObject(note, "params");
     cJSON_AddStringToObject(params, "state", result.posture.state.c_str());
     cJSON_AddStringToObject(params, "reason", result.posture.reason.c_str());
-    cJSON_AddStringToObject(params, "message", "提示：检测到坐姿不正，请保持头部居中、背部挺直并减少左右晃动。");
+    cJSON_AddStringToObject(params, "message", message.c_str());
     char* json_str = cJSON_PrintUnformatted(note);
     if (json_str != nullptr) {
         Application::GetInstance().SendMcpMessage(std::string(json_str));
@@ -885,35 +916,57 @@ void VisionPipeline::MaybeNotifyPosture(const DetectionResult& result) {
 }
 
 void VisionPipeline::MaybeNotifyHealth(const DetectionResult& result) {
-    // 成人静息筛查范围：心率 60-100 bpm；血压低于 90/60 或达到 140/90 触发提醒。
+    // Adult resting screening ranges. These are reminders, not diagnoses.
     bool hr_abnormal = result.heart_rate.available &&
-        (result.heart_rate.bpm < 60.0f || result.heart_rate.bpm > 100.0f);
+        (result.heart_rate.bpm < 50.0f || result.heart_rate.bpm > 100.0f);
     bool bp_abnormal = result.blood_pressure.available &&
         (result.blood_pressure.systolic < 90.0f || result.blood_pressure.systolic >= 140.0f ||
          result.blood_pressure.diastolic < 60.0f || result.blood_pressure.diastolic >= 90.0f);
-    bool abnormal = hr_abnormal || bp_abnormal;
-    if (!abnormal) {
-        health_alert_active_ = false;
-        return;
-    }
-
     uint64_t now_ms = esp_timer_get_time() / 1000LL;
-    constexpr uint64_t kAlertCooldownMs = 60000;
-    if (health_alert_active_ && now_ms - last_health_alert_ms_ < kAlertCooldownMs) return;
-    health_alert_active_ = true;
-    last_health_alert_ms_ = now_ms;
+    bool remind_hr = false;
+    bool remind_bp = false;
+    {
+        std::lock_guard<std::mutex> lock(sensing_mutex_);
+        auto update = [now_ms](AlertTracker& tracker, bool abnormal, bool available) {
+            if (!available) return false;
+            if (abnormal) {
+                tracker.abnormal_count++;
+                tracker.normal_count = 0;
+                if (tracker.abnormal_count >= 2) tracker.active = true;
+            } else {
+                tracker.normal_count++;
+                tracker.abnormal_count = 0;
+                if (tracker.normal_count >= 2) tracker.active = false;
+            }
+            constexpr uint64_t kAlertCooldownMs = 60000;
+            if (tracker.active &&
+                (tracker.last_remind_ms == 0 || now_ms - tracker.last_remind_ms >= kAlertCooldownMs)) {
+                tracker.last_remind_ms = now_ms;
+                return true;
+            }
+            return false;
+        };
+        remind_hr = update(heart_rate_alert_, hr_abnormal, result.heart_rate.available);
+        remind_bp = update(blood_pressure_alert_, bp_abnormal, result.blood_pressure.available);
+    }
+    if (!remind_hr && !remind_bp) return;
 
     std::string message = "健康提醒：";
-    if (hr_abnormal) message += "心率超出静息参考范围，请保持安静后复测。";
-    if (bp_abnormal) message += "血压超出参考范围，请休息后复测；如持续异常请咨询医生。";
+    if (remind_hr) message += "心率异常，请保持安静后复测。";
+    if (remind_bp) message += "血压异常，请休息后复测；如持续异常请咨询医生。";
+
+    Application::GetInstance().Schedule([message]() {
+        Application::GetInstance().Alert("健康提醒", message.c_str(), "warning",
+                                         Lang::Sounds::OGG_EXCLAMATION);
+    });
 
     cJSON* note = cJSON_CreateObject();
     cJSON_AddStringToObject(note, "jsonrpc", "2.0");
     cJSON_AddStringToObject(note, "method", "notifications/health_alert");
     cJSON* params = cJSON_AddObjectToObject(note, "params");
     cJSON_AddStringToObject(params, "message", message.c_str());
-    cJSON_AddBoolToObject(params, "heart_rate_abnormal", hr_abnormal);
-    cJSON_AddBoolToObject(params, "blood_pressure_abnormal", bp_abnormal);
+    cJSON_AddBoolToObject(params, "heart_rate_abnormal", remind_hr);
+    cJSON_AddBoolToObject(params, "blood_pressure_abnormal", remind_bp);
     char* json_str = cJSON_PrintUnformatted(note);
     if (json_str != nullptr) {
         Application::GetInstance().SendMcpMessage(std::string(json_str));

@@ -85,13 +85,18 @@ struct DetectionResult {
     PostureResult posture;
     HeartRateResult heart_rate;
     BloodPressureResult blood_pressure;
+    // Stable alert states are populated by VisionPipeline after debounce.
+    bool heart_rate_alert;
+    bool blood_pressure_alert;
+    bool posture_alert;
     float decode_ms;          // 服务器解码耗时
     float infer_ms;           // 服务器推理耗时
     float total_ms;           // 服务器总耗时
 
     DetectionResult()
         : source_width(0), source_height(0), timestamp_ms(0), connection_ok(true),
-          frame_id(-1), decode_ms(0.0f), infer_ms(0.0f), total_ms(0.0f) {}
+          frame_id(-1), heart_rate_alert(false), blood_pressure_alert(false),
+          posture_alert(false), decode_ms(0.0f), infer_ms(0.0f), total_ms(0.0f) {}
 };
 
 struct ImageFrame {

@@ -132,12 +132,14 @@ private:
     int shared_frame_pixfmt_ = PIXFORMAT_RGB565;  // 记录共享帧格式（OV2640 直出 JPEG 时上传零编码）
     uint32_t shared_frame_version_ = 0; // 每次新帧自增，Detection 线程据此跳过重复帧
 
-    // 跨帧缓存的感知结果：心率值供查询，坐姿用于 LCD 持续叠加
+    // 跨帧缓存的感知结果：自动调度切换任务时供 LCD 持续叠加
+    EmotionResult latest_emotion_;
     HeartRateResult latest_heart_rate_;
+    BloodPressureResult latest_blood_pressure_;
     PostureResult latest_posture_;
     uint64_t heart_rate_timestamp_ms_;
     uint64_t posture_timestamp_ms_;
-    mutable std::mutex sensing_mutex_;  // 保护 latest_heart_rate_ / latest_posture_ / 情绪窗口
+    mutable std::mutex sensing_mutex_;  // 保护跨帧感知结果和情绪窗口
 
     // 用户情绪平滑窗口（最近10帧）
     std::deque<std::string> emotion_window_;
@@ -145,9 +147,15 @@ private:
     int user_emotion_hits_;             // 该情绪的命中次数
     uint64_t user_emotion_timestamp_ms_;
 
-    // 坐姿提醒状态
-    bool posture_reminded_ = false;      // 当前是否已处于"已提醒"的坏坐姿状态
-    uint64_t last_posture_remind_ms_ = 0;  // 上次提醒时间（防刷屏）
+    struct AlertTracker {
+        int abnormal_count = 0;
+        int normal_count = 0;
+        bool active = false;
+        uint64_t last_remind_ms = 0;
+    };
+    AlertTracker heart_rate_alert_;
+    AlertTracker blood_pressure_alert_;
+    AlertTracker posture_alert_;
 
     // Preview-only (capture + display, NO detection)：与 start_continuous 共用 preview_thread_
     std::atomic<bool> preview_running_;
@@ -162,9 +170,6 @@ private:
     void CacheSensingResult(const DetectionResult& result);
     void MaybeNotifyPosture(const DetectionResult& result);
     void MaybeNotifyHealth(const DetectionResult& result);
-
-    uint64_t last_health_alert_ms_ = 0;
-    bool health_alert_active_ = false;
 
     bool CaptureFrame(ImageFrame& out_frame);
     bool ReleaseCurrentFrame();

@@ -1100,55 +1100,40 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     lv_label_set_text(vision_posture_label_, posture_bad ? "\xE5\x9D\x90\xE5\xA7\xBF\xE4\xB8\x8D\xE6\xAD\xA3" : "\xE5\x9D\x90\xE5\xA7\xBF\xE7\xAB\xAF\xE6\xAD\xA3");
     const char* posture_asset = posture_bad ? "vision_posture_incorrect.png" : "vision_posture_correct.png";
     if (vision_posture_asset_name_ != posture_asset) {
-        vision_posture_asset_image_ = LoadVisionAsset(posture_asset);
-        vision_posture_asset_name_ = posture_asset;
-    }
-    if (vision_posture_asset_image_ != nullptr) {
-        lv_image_set_src(vision_posture_image_, vision_posture_asset_image_->image_dsc());
-        lv_obj_set_size(vision_posture_image_, 76, 70);
-        lv_obj_set_align(vision_posture_image_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_posture_image_, 2, 27);
-        lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
-        lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        auto posture_image = LoadVisionAsset(posture_asset);
+        if (posture_image != nullptr) {
+            lv_image_set_src(vision_posture_image_, posture_image->image_dsc());
+            vision_posture_asset_image_ = std::move(posture_image);
+            vision_posture_asset_name_ = posture_asset;
+            lv_obj_set_size(vision_posture_image_, 76, 70);
+            lv_obj_set_align(vision_posture_image_, LV_ALIGN_DEFAULT);
+            lv_obj_set_pos(vision_posture_image_, 2, 27);
+            lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
+            lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
-    if (posture_bad != vision_posture_alert_active_) {
-        vision_posture_alert_active_ = posture_bad;
-        lv_obj_set_style_bg_color(vision_posture_panel_, posture_bad ? lv_color_hex(0xE85D75) : lv_color_hex(0xF2FFF3), 0);
-        if (posture_bad) StartVisionAlertAnimation(vision_posture_panel_);
-        else StopVisionAlertAnimation(vision_posture_panel_);
-    }
     std::string emotion_asset_name = "vision_emotion_";
     emotion_asset_name += EmotionAssetKey(result.emotion.label);
     emotion_asset_name += ".png";
     if (vision_emotion_asset_name_ != emotion_asset_name) {
-        vision_emotion_asset_image_ = LoadVisionAsset(emotion_asset_name.c_str());
-        vision_emotion_asset_name_ = emotion_asset_name;
-    }
-    if (vision_emotion_asset_image_ != nullptr) {
-        lv_image_set_src(vision_emotion_image_, vision_emotion_asset_image_->image_dsc());
-        lv_obj_set_size(vision_emotion_image_, 76, 80);
-        lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_emotion_image_, 2, 5);
-        lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
-        lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        auto emotion_image = LoadVisionAsset(emotion_asset_name.c_str());
+        if (emotion_image != nullptr) {
+            lv_image_set_src(vision_emotion_image_, emotion_image->image_dsc());
+            vision_emotion_asset_image_ = std::move(emotion_image);
+            vision_emotion_asset_name_ = emotion_asset_name;
+            lv_obj_set_size(vision_emotion_image_, 76, 80);
+            lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
+            lv_obj_set_pos(vision_emotion_image_, 2, 27);
+            lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
+            lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
-    lv_color_t emotion_color = lv_color_hex(0x808080);
-    if (result.emotion.label == "happy") emotion_color = lv_color_hex(0x22AA55);
-    else if (result.emotion.label == "sad") emotion_color = lv_color_hex(0x3388CC);
-    else if (result.emotion.label == "angry") emotion_color = lv_color_hex(0xDD3333);
-    else if (result.emotion.label == "fear") emotion_color = lv_color_hex(0x9944CC);
-    else if (result.emotion.label == "surprise") emotion_color = lv_color_hex(0xEE9922);
-    lv_obj_set_style_text_color(vision_emotion_label_, emotion_color, 0);
-    bool health_alert = (result.heart_rate.available &&
-        (result.heart_rate.bpm < 60.0f || result.heart_rate.bpm > 100.0f)) ||
-        (result.blood_pressure.available &&
-         (result.blood_pressure.systolic < 90.0f || result.blood_pressure.systolic >= 140.0f ||
-          result.blood_pressure.diastolic < 60.0f || result.blood_pressure.diastolic >= 90.0f));
-    bool hr_alert = result.heart_rate.available && (result.heart_rate.bpm < 60.0f || result.heart_rate.bpm > 100.0f);
-    bool bp_alert = result.blood_pressure.available && (result.blood_pressure.systolic < 90.0f || result.blood_pressure.systolic >= 140.0f || result.blood_pressure.diastolic < 60.0f || result.blood_pressure.diastolic >= 90.0f);
+    bool hr_alert = result.heart_rate_alert;
+    bool bp_alert = result.blood_pressure_alert;
+    bool posture_alert = result.posture_alert;
     if (hr_alert != vision_hr_alert_active_) {
         vision_hr_alert_active_ = hr_alert;
         lv_obj_set_style_bg_color(vision_heart_panel_, hr_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xFFF5F7), 0);
@@ -1161,6 +1146,19 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         if (bp_alert) StartVisionAlertAnimation(vision_pressure_panel_);
         else StopVisionAlertAnimation(vision_pressure_panel_);
     }
+    if (posture_alert != vision_posture_alert_active_) {
+        vision_posture_alert_active_ = posture_alert;
+        lv_obj_set_style_bg_color(vision_posture_panel_, posture_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xF2FFF3), 0);
+        if (posture_alert) StartVisionAlertAnimation(vision_posture_panel_);
+        else StopVisionAlertAnimation(vision_posture_panel_);
+    }
+    lv_color_t emotion_color = lv_color_hex(0x808080);
+    if (result.emotion.label == "happy") emotion_color = lv_color_hex(0x22AA55);
+    else if (result.emotion.label == "sad") emotion_color = lv_color_hex(0x3388CC);
+    else if (result.emotion.label == "angry") emotion_color = lv_color_hex(0xDD3333);
+    else if (result.emotion.label == "fear") emotion_color = lv_color_hex(0x9944CC);
+    else if (result.emotion.label == "surprise") emotion_color = lv_color_hex(0xEE9922);
+    lv_obj_set_style_text_color(vision_emotion_label_, emotion_color, 0);
     // Re-assert the full-screen dashboard viewport on every camera frame.
     lv_obj_set_parent(preview_image_, vision_dashboard_);
     lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
@@ -1304,16 +1302,17 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     lv_label_set_text(vision_posture_label_, posture_bad ? "\xE5\x9D\x90\xE5\xA7\xBF\xE4\xB8\x8D\xE6\xAD\xA3" : "\xE5\x9D\x90\xE5\xA7\xBF\xE7\xAB\xAF\xE6\xAD\xA3");
     const char* posture_asset = posture_bad ? "vision_posture_incorrect.png" : "vision_posture_correct.png";
     if (vision_posture_asset_name_ != posture_asset) {
-        vision_posture_asset_image_ = LoadVisionAsset(posture_asset);
-        vision_posture_asset_name_ = posture_asset;
-    }
-    if (vision_posture_asset_image_ != nullptr) {
-        lv_image_set_src(vision_posture_image_, vision_posture_asset_image_->image_dsc());
-        lv_obj_set_size(vision_posture_image_, 76, 70);
-        lv_obj_set_align(vision_posture_image_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_posture_image_, 2, 27);
-        lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
-        lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        auto posture_image = LoadVisionAsset(posture_asset);
+        if (posture_image != nullptr) {
+            lv_image_set_src(vision_posture_image_, posture_image->image_dsc());
+            vision_posture_asset_image_ = std::move(posture_image);
+            vision_posture_asset_name_ = posture_asset;
+            lv_obj_set_size(vision_posture_image_, 76, 70);
+            lv_obj_set_align(vision_posture_image_, LV_ALIGN_DEFAULT);
+            lv_obj_set_pos(vision_posture_image_, 2, 27);
+            lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
+            lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
@@ -1321,20 +1320,22 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     emotion_asset_name += EmotionAssetKey(result.emotion.label);
     emotion_asset_name += ".png";
     if (vision_emotion_asset_name_ != emotion_asset_name) {
-        vision_emotion_asset_image_ = LoadVisionAsset(emotion_asset_name.c_str());
-        vision_emotion_asset_name_ = emotion_asset_name;
-    }
-    if (vision_emotion_asset_image_ != nullptr) {
-        lv_image_set_src(vision_emotion_image_, vision_emotion_asset_image_->image_dsc());
-        lv_obj_set_size(vision_emotion_image_, 76, 80);
-        lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_emotion_image_, 2, 5);
-        lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
-        lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        auto emotion_image = LoadVisionAsset(emotion_asset_name.c_str());
+        if (emotion_image != nullptr) {
+            lv_image_set_src(vision_emotion_image_, emotion_image->image_dsc());
+            vision_emotion_asset_image_ = std::move(emotion_image);
+            vision_emotion_asset_name_ = emotion_asset_name;
+            lv_obj_set_size(vision_emotion_image_, 76, 80);
+            lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
+            lv_obj_set_pos(vision_emotion_image_, 2, 27);
+            lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
+            lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
-    bool hr_alert = result.heart_rate.available && (result.heart_rate.bpm < 60.0f || result.heart_rate.bpm > 100.0f);
-    bool bp_alert = result.blood_pressure.available && (result.blood_pressure.systolic < 90.0f || result.blood_pressure.systolic >= 140.0f || result.blood_pressure.diastolic < 60.0f || result.blood_pressure.diastolic >= 90.0f);
+    bool hr_alert = result.heart_rate_alert;
+    bool bp_alert = result.blood_pressure_alert;
+    bool posture_alert = result.posture_alert;
     if (hr_alert != vision_hr_alert_active_) {
         vision_hr_alert_active_ = hr_alert;
         lv_obj_set_style_bg_color(vision_heart_panel_, hr_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xFFF5F7), 0);
@@ -1347,10 +1348,10 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         if (bp_alert) StartVisionAlertAnimation(vision_pressure_panel_);
         else StopVisionAlertAnimation(vision_pressure_panel_);
     }
-    if (posture_bad != vision_posture_alert_active_) {
-        vision_posture_alert_active_ = posture_bad;
-        lv_obj_set_style_bg_color(vision_posture_panel_, posture_bad ? lv_color_hex(0xE85D75) : lv_color_hex(0xF2FFF3), 0);
-        if (posture_bad) StartVisionAlertAnimation(vision_posture_panel_);
+    if (posture_alert != vision_posture_alert_active_) {
+        vision_posture_alert_active_ = posture_alert;
+        lv_obj_set_style_bg_color(vision_posture_panel_, posture_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xF2FFF3), 0);
+        if (posture_alert) StartVisionAlertAnimation(vision_posture_panel_);
         else StopVisionAlertAnimation(vision_posture_panel_);
     }
     lv_color_t emotion_color = lv_color_hex(0x808080);
