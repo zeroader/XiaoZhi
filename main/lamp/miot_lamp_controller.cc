@@ -37,11 +37,15 @@ std::string NormalizeServerUrl(const std::string& raw) {
 
 // 台灯服务器默认地址（NVS 里没配过时使用）。
 // 改成你家庭服务器实际的局域网 IP，端口 8291 与视觉服务器共用同一个 Flask 进程。
-constexpr const char* kDefaultLampServerUrl = "http://192.168.0.104:8291";
+constexpr const char* kDefaultLampServerUrl = "http://192.168.0.106:8291";
 
-// 直接返回硬编码的服务器地址（忽略 NVS）。
-// 如果以后想恢复成"用 self.lamp.configure 运行时配置"，改回读 NVS 的逻辑即可。
+// 优先用 NVS 里 self.lamp.configure 配置过的地址；没配过则用默认地址。
 std::string LoadServerUrl() {
+    Settings settings("lamp", false);
+    std::string url = settings.GetString("server_url");
+    if (!url.empty()) {
+        return url;
+    }
     return kDefaultLampServerUrl;
 }
 
