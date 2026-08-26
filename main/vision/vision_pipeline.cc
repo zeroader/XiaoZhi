@@ -436,11 +436,12 @@ void VisionPipeline::PreviewLoop() {
                         std::lock_guard<std::mutex> lock(result_mutex_);
                         current_result = last_result_;
                     }
-                    // 合并跨帧缓存的坐姿/心率，保证 LCD 上持续显示（不被每帧 face_emotion 覆盖）
+                    // 合并跨帧缓存的坐姿/心率/血压，保证 LCD 上持续显示（不被每帧 face_emotion 覆盖）
                     {
                         std::lock_guard<std::mutex> lock(sensing_mutex_);
                         current_result.posture = latest_posture_;
                         current_result.heart_rate = latest_heart_rate_;
+                        current_result.blood_pressure = latest_blood_pressure_;
                     }
                     // OV2640 直出 JPEG：解码成 RGB565 再送 LCD（检测线程直接用 JPEG 上传，互不影响）
                     const uint8_t* disp_data = frame.data;
@@ -495,6 +496,7 @@ void VisionPipeline::DetectionLoop() {
     uint32_t last_version = 0;  // avoid re-processing same frame
     uint64_t last_posture_ms = 0;  // 距上次 posture 任务的毫秒数
     uint64_t last_heart_ms = 0;    // 距上次 heart_rate 任务的毫秒数
+    uint64_t last_blood_pressure_ms = 0;  // auto 模式下每约 2s 查询一次 BP 状态
 
     while (continuous_running_.load()) {
         // Wait for a NEW shared frame (skip if same as last processed)
@@ -530,13 +532,16 @@ void VisionPipeline::DetectionLoop() {
             continue;
         }
 
-        // 任务调度：auto 模式下按 每帧(face_emotion) / 5s(posture) / 10s(heart_rate) 轮询。
-        // posture 优先，保证 5s 一次不被心率请求饿死；其余帧全部跑 face_emotion。
+        // auto 模式下持续上传高频 face 帧供 rPPG，并每约 2s 请求一次 BP，
+        // 同时保留 posture/heart_rate 的低频任务。
         std::string task = continuous_task_;
         if (continuous_task_ == kTaskAutoSchedule) {
             uint64_t now_ms = esp_timer_get_time() / 1000LL;
             task = kTaskFaceEmotion;
-            if (now_ms - last_posture_ms >= 5000) {
+            if (now_ms - last_blood_pressure_ms >= 2000) {
+                task = kTaskBloodPressure;
+                last_blood_pressure_ms = now_ms;
+            } else if (now_ms - last_posture_ms >= 5000) {
                 task = kTaskPosture;
                 last_posture_ms = now_ms;
             } else if (now_ms - last_heart_ms >= 10000) {
@@ -589,6 +594,15 @@ void VisionPipeline::DetectionLoop() {
         if (result.heart_rate.available) {
             detail += " hr=" + std::to_string((int)result.heart_rate.bpm);
         }
+        if (result.blood_pressure.available) {
+            detail += " bp=" + result.blood_pressure.status;
+            if (result.blood_pressure.ready) {
+                detail += "=" + std::to_string((int)result.blood_pressure.sbp_mmHg) + "/" +
+                          std::to_string((int)result.blood_pressure.dbp_mmHg);
+            } else if (!result.blood_pressure.reason.empty()) {
+                detail += "(" + result.blood_pressure.reason + ")";
+            }
+        }
         ESP_LOGI(TAG, "Detect: task=%s frame=%d, %d boxes, %dms, server(dec=%.1fms inf=%.1fms tot=%.1fms)%s",
                  result.task.c_str(),
                  (int)result.frame_id,
@@ -616,8 +630,17 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
     // 避免回退到 online 检测器持久化的单一任务导致情绪/心率任务不跑
     if (!task.empty()) {
         continuous_task_ = task;
+        if (task != kTaskAutoSchedule) {
+            ApplyTaskToOnlineDetector(active_detector_, task);
+        }
     } else {
         continuous_task_ = kTaskAutoSchedule;
+    }
+
+    // BP quality gating needs roughly 10 FPS. Auto mode must not keep the old
+    // 500ms preview cadence, otherwise the server rejects the 7s waveform.
+    if (continuous_task_ == kTaskAutoSchedule && period_ms > 100) {
+        period_ms = 100;
     }
 
     // Clear shared frame buffer
@@ -664,6 +687,10 @@ void VisionPipeline::StopContinuous() {
 
 bool VisionPipeline::IsContinuousRunning() const {
     return continuous_running_.load();
+}
+
+const std::string& VisionPipeline::GetContinuousTask() const {
+    return continuous_task_;
 }
 
 // --- Preview-only (no detection) ---
@@ -767,6 +794,10 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
         latest_heart_rate_ = result.heart_rate;
         heart_rate_timestamp_ms_ = result.timestamp_ms;
     }
+    if (result.blood_pressure.available) {
+        latest_blood_pressure_ = result.blood_pressure;
+        blood_pressure_timestamp_ms_ = result.timestamp_ms;
+    }
     if (result.posture.available) {
         // "calibrated" 是标定成功的瞬时状态，不是坐姿状态，不覆盖 LCD 叠加
         if (result.posture.state != "calibrated") {
@@ -811,6 +842,16 @@ HeartRateResult VisionPipeline::GetLatestHeartRate() const {
 uint64_t VisionPipeline::GetHeartRateTimestampMs() const {
     std::lock_guard<std::mutex> lock(sensing_mutex_);
     return heart_rate_timestamp_ms_;
+}
+
+BloodPressureResult VisionPipeline::GetLatestBloodPressure() const {
+    std::lock_guard<std::mutex> lock(sensing_mutex_);
+    return latest_blood_pressure_;
+}
+
+uint64_t VisionPipeline::GetBloodPressureTimestampMs() const {
+    std::lock_guard<std::mutex> lock(sensing_mutex_);
+    return blood_pressure_timestamp_ms_;
 }
 
 PostureResult VisionPipeline::GetLatestPosture() const {
@@ -952,6 +993,18 @@ static cJSON* DetectionsToJson(const DetectionResult& r) {
     } else if (!r.heart_rate.error_message.empty()) {
         cJSON* hr = cJSON_AddObjectToObject(j, "heart_rate");
         cJSON_AddStringToObject(hr, "error", r.heart_rate.error_message.c_str());
+    }
+    if (r.blood_pressure.available) {
+        cJSON* bp = cJSON_AddObjectToObject(j, "blood_pressure");
+        cJSON_AddStringToObject(bp, "status", r.blood_pressure.status.c_str());
+        cJSON_AddStringToObject(bp, "reason", r.blood_pressure.reason.c_str());
+        cJSON_AddNumberToObject(bp, "duration_s", r.blood_pressure.duration_s);
+        cJSON_AddNumberToObject(bp, "required_window_s", r.blood_pressure.required_window_s);
+        cJSON_AddBoolToObject(bp, "experimental_only", true);
+        if (r.blood_pressure.ready) {
+            cJSON_AddNumberToObject(bp, "sbp_mmHg", r.blood_pressure.sbp_mmHg);
+            cJSON_AddNumberToObject(bp, "dbp_mmHg", r.blood_pressure.dbp_mmHg);
+        }
     }
     if (r.decode_ms > 0 || r.infer_ms > 0 || r.total_ms > 0) {
         cJSON* perf = cJSON_AddObjectToObject(j, "performance");
@@ -1116,6 +1169,94 @@ void RegisterVisionMcpTools() {
             return j;
         });
 
+    mcp.AddTool("self.vision.get_blood_pressure",
+        "Get the latest experimental camera blood-pressure status without capturing a frame. "
+        "A number is available only after a stable high-rate rPPG window and a configured "
+        "server-side BP model; never use it for medical decisions.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            BloodPressureResult bp = pipe.GetLatestBloodPressure();
+            cJSON* j = cJSON_CreateObject();
+            cJSON_AddBoolToObject(j, "experimental_only", true);
+            if (bp.available) {
+                cJSON_AddStringToObject(j, "status", bp.status.c_str());
+                cJSON_AddStringToObject(j, "reason", bp.reason.c_str());
+                cJSON_AddNumberToObject(j, "duration_s", bp.duration_s);
+                cJSON_AddNumberToObject(j, "required_window_s", bp.required_window_s);
+                if (bp.ready) {
+                    cJSON_AddNumberToObject(j, "sbp_mmHg", bp.sbp_mmHg);
+                    cJSON_AddNumberToObject(j, "dbp_mmHg", bp.dbp_mmHg);
+                }
+                uint64_t ts = pipe.GetBloodPressureTimestampMs();
+                uint64_t age_ms = (ts == 0) ? 0 : (esp_timer_get_time() / 1000LL - ts);
+                cJSON_AddNumberToObject(j, "age_ms", (double)age_ms);
+            } else {
+                cJSON_AddStringToObject(j, "status", "not_started");
+            }
+            return j;
+        });
+
+    mcp.AddTool("self.vision.start_blood_pressure",
+        "Start automatic experimental camera blood-pressure detection. This starts the online "
+        "continuous detector in blood_pressure mode and collects the server's configured rPPG window. "
+        "It replaces any currently running continuous vision task.",
+        PropertyList({
+            Property("period_ms", kPropertyTypeInteger, 100, 50, 1000)
+        }),
+        [](const PropertyList& p) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            pipe.Initialize();
+            if (pipe.IsContinuousRunning()) pipe.StopContinuous();
+            uint32_t period = (uint32_t)p["period_ms"].value<int>();
+            bool ok = pipe.StartContinuous(period, kTaskBloodPressure);
+            cJSON* j = cJSON_CreateObject();
+            cJSON_AddBoolToObject(j, "enabled", ok);
+            cJSON_AddStringToObject(j, "task", kTaskBloodPressure);
+            cJSON_AddNumberToObject(j, "period_ms", period);
+            cJSON_AddBoolToObject(j, "experimental_only", true);
+            return j;
+        });
+
+    mcp.AddTool("self.vision.stop_blood_pressure",
+        "Stop experimental blood-pressure detection. If auto continuous mode is running, this "
+        "stops that continuous vision session as well.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            bool was_running = pipe.IsContinuousRunning();
+            pipe.StopContinuous();
+            return was_running;
+        });
+
+    mcp.AddTool("self.vision.get_blood_pressure_status",
+        "Return whether blood-pressure detection is enabled/running and the latest experimental result. "
+        "Does not capture a frame or start a measurement.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            BloodPressureResult bp = pipe.GetLatestBloodPressure();
+            bool running = pipe.IsContinuousRunning();
+            const std::string& task = pipe.GetContinuousTask();
+            bool enabled = running && (task == kTaskAutoSchedule || task == kTaskBloodPressure);
+            cJSON* j = cJSON_CreateObject();
+            cJSON_AddBoolToObject(j, "enabled", enabled);
+            cJSON_AddBoolToObject(j, "running", running);
+            cJSON_AddStringToObject(j, "continuous_task", task.c_str());
+            cJSON_AddBoolToObject(j, "experimental_only", true);
+            cJSON_AddStringToObject(j, "status", bp.available ? bp.status.c_str() : "not_started");
+            if (bp.available) {
+                cJSON_AddStringToObject(j, "reason", bp.reason.c_str());
+                cJSON_AddNumberToObject(j, "duration_s", bp.duration_s);
+                cJSON_AddNumberToObject(j, "required_window_s", bp.required_window_s);
+                if (bp.ready) {
+                    cJSON_AddNumberToObject(j, "sbp_mmHg", bp.sbp_mmHg);
+                    cJSON_AddNumberToObject(j, "dbp_mmHg", bp.dbp_mmHg);
+                }
+            }
+            return j;
+        });
+
     mcp.AddTool("self.vision.get_user_emotion",
         "Get the user's current emotion, smoothed over the last 10 detection frames: "
         "a single emotion needs >=7 hits in the window to be reported, otherwise it "
@@ -1145,9 +1286,10 @@ void RegisterVisionMcpTools() {
         "  `period_ms` (optional, default 500): target time between iterations in ms. "
         "Actual rate may be lower if detector is slow.\n"
         "  `task` (optional, default `auto`): for the online detector, one of "
-        "`face_emotion`, `posture`, `heart_rate`, or `auto`.\n"
+        "`face_emotion`, `posture`, `heart_rate`, `blood_pressure`, or `auto`.\n"
         "  `auto` (recommended) schedules: face_emotion every frame, posture every 5s, "
-        "heart_rate every 10s. If `task` is omitted, `auto` is used.",
+        "heart_rate every 10s, and blood_pressure about every 2s while face frames continuously "
+        "feed the rPPG buffer. If `task` is omitted, `auto` is used.",
         PropertyList({
             Property("period_ms", kPropertyTypeInteger, 500, 100, 60000),
             Property("task", kPropertyTypeString, std::string(""))
@@ -1385,7 +1527,7 @@ void RegisterVisionMcpTools() {
         "Set the task for the online detection server (saved to flash, restored after reboot).\n"
         "Args:\n"
         "  `task`: one of `face_emotion` (face + emotion, every frame), `posture` (5s), "
-        "`heart_rate` (10s).",
+        "`heart_rate` (10s), or `blood_pressure` (experimental; sustained high-rate frames required).",
         PropertyList({
             Property("task", kPropertyTypeString)
         }),

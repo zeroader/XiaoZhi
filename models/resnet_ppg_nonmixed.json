@@ -1,0 +1,9 @@
+{
+  "input_length": 875,
+  "input_mean": 0.0,
+  "input_std": 1.0,
+  "source_model": "models\\resnet_ppg_nonmixed.h5",
+  "source_description": "Zenodo 5590603 resnet_ppg_nonmixed.h5",
+  "input_sample_rate_hz": 125,
+  "experimental_only": true
+}

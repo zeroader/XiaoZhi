@@ -12,7 +12,11 @@
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
+#include <driver/sdspi_host.h>
+#include <esp_vfs_fat.h>
+#include <sdmmc_cmd.h>
 #include <wifi_station.h>
+#include <stdio.h>
 
 #define TAG "atk_dnesp32s3"
 
@@ -70,6 +74,7 @@ private:
     XL9555* xl9555_;
     Esp32Camera* camera_;
     Backlight* backlight_ = nullptr;
+    sdmmc_card_t* sd_card_ = nullptr;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -95,12 +100,40 @@ private:
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
         buscfg.mosi_io_num = LCD_MOSI_PIN;
-        buscfg.miso_io_num = GPIO_NUM_NC;
+        // LCD 只写不读，但 TF 卡需要 MISO，因此这里必须配置 GPIO13。
+        buscfg.miso_io_num = LCD_MISO_PIN;
         buscfg.sclk_io_num = LCD_SCLK_PIN;
         buscfg.quadwp_io_num = GPIO_NUM_NC;
         buscfg.quadhd_io_num = GPIO_NUM_NC;
         buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
         ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    }
+
+    void MountSdCard() {
+        sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+        host.slot = SD_SPI_HOST;
+
+        sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+        slot_config.host_id = SD_SPI_HOST;
+        slot_config.gpio_cs = SD_SPI_CS_PIN;
+        slot_config.gpio_cd = GPIO_NUM_NC;
+        slot_config.gpio_wp = GPIO_NUM_NC;
+
+        esp_vfs_fat_mount_config_t mount_config = {};
+        mount_config.format_if_mount_failed = false;
+        mount_config.max_files = 8;
+        mount_config.allocation_unit_size = 16 * 1024;
+
+        esp_err_t err = esp_vfs_fat_sdspi_mount(
+            SD_MOUNT_POINT, &host, &slot_config, &mount_config, &sd_card_);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Micro SD mount failed: %s", esp_err_to_name(err));
+            sd_card_ = nullptr;
+            return;
+        }
+
+        ESP_LOGI(TAG, "Micro SD mounted at %s", SD_MOUNT_POINT);
+        sdmmc_card_print_info(stdout, sd_card_);
     }
 
     void InitializeButtons() {
@@ -219,6 +252,7 @@ public:
         InitializeI2c();
         InitializeSpi();
         InitializeSt7789Display();
+        MountSdCard();
         InitializeButtons();
         InitializeCamera();
         // 背光控制：正点原子 ATK-DNESP32S3 板通过 XL9555 的第8脚控制 LCD 背光使能

@@ -242,6 +242,18 @@ void VisionDisplay::DrawDetections(uint8_t* buf, int w, int h, size_t stride,
         snprintf(line, sizeof(line), "HR:%s", detections.heart_rate.error_message.c_str());
         draw_info_line(line);
     }
+    if (detections.blood_pressure.available) {
+        if (detections.blood_pressure.ready) {
+            snprintf(line, sizeof(line), "BP EXP:%.0f/%.0f", detections.blood_pressure.sbp_mmHg,
+                     detections.blood_pressure.dbp_mmHg);
+        } else if (detections.blood_pressure.status == "collecting") {
+            snprintf(line, sizeof(line), "BP:%.0f/%.0fs", detections.blood_pressure.duration_s,
+                     detections.blood_pressure.required_window_s);
+        } else {
+            snprintf(line, sizeof(line), "BP:%s", detections.blood_pressure.status.c_str());
+        }
+        draw_info_line(line);
+    }
 }
 
 std::unique_ptr<LvglImage> VisionDisplay::ComposePreview(const uint8_t* frame_rgb565,

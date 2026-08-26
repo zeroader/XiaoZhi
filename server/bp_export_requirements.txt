@@ -1,0 +1,7 @@
+# Export-only dependencies for server/convert_resnet_bp.py.
+# TensorFlow 2.4.1 is the version documented by the source project; use a
+# compatible Python version if installing that exact version.
+tensorflow
+tf2onnx
+onnx
+onnxruntime
