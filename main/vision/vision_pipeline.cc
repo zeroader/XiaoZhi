@@ -784,13 +784,19 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
     std::lock_guard<std::mutex> lock(sensing_mutex_);
     if (result.emotion.available && !result.emotion.label.empty()) {
         latest_emotion_ = result.emotion;
+    } else if (result.task == kTaskFaceEmotion) {
+        latest_emotion_ = EmotionResult();
     }
     if (result.heart_rate.available) {
         latest_heart_rate_ = result.heart_rate;
         heart_rate_timestamp_ms_ = result.timestamp_ms;
+    } else if (result.task == kTaskHeartRate) {
+        latest_heart_rate_ = HeartRateResult();
     }
     if (result.blood_pressure.available) {
         latest_blood_pressure_ = result.blood_pressure;
+    } else if (result.task == kTaskHeartRate) {
+        latest_blood_pressure_ = BloodPressureResult();
     }
     if (result.posture.available) {
         // "calibrated" 是标定成功的瞬时状态，不是坐姿状态，不覆盖 LCD 叠加
@@ -863,10 +869,18 @@ uint64_t VisionPipeline::GetUserEmotionTimestampMs() const {
     return user_emotion_timestamp_ms_;
 }
 
-// Two consecutive valid samples activate or clear an alert. In auto mode this
-// means about 10 seconds for posture and 20 seconds for heart rate.
+// Two consecutive abnormal samples activate an alert. One normal sample clears
+// it immediately so the dashboard stops flashing as soon as the value recovers.
 void VisionPipeline::MaybeNotifyPosture(const DetectionResult& result) {
-    if (!result.posture.available) return;
+    if (!result.posture.available) {
+        if (result.task == kTaskPosture) {
+            std::lock_guard<std::mutex> lock(sensing_mutex_);
+            posture_alert_.abnormal_count = 0;
+            posture_alert_.normal_count = 0;
+            posture_alert_.active = false;
+        }
+        return;
+    }
 
     bool bad = (result.posture.state == "bad_posture");
     uint64_t now_ms = esp_timer_get_time() / 1000LL;
@@ -878,11 +892,11 @@ void VisionPipeline::MaybeNotifyPosture(const DetectionResult& result) {
             posture_alert_.normal_count = 0;
             if (posture_alert_.abnormal_count >= 2) posture_alert_.active = true;
         } else {
-            posture_alert_.normal_count++;
+            posture_alert_.normal_count = 1;
             posture_alert_.abnormal_count = 0;
-            if (posture_alert_.normal_count >= 2) posture_alert_.active = false;
+            posture_alert_.active = false;
         }
-        constexpr uint64_t kRemindCooldownMs = 60000;
+        constexpr uint64_t kRemindCooldownMs = 30000;
         if (posture_alert_.active &&
             (posture_alert_.last_remind_ms == 0 ||
              now_ms - posture_alert_.last_remind_ms >= kRemindCooldownMs)) {
@@ -934,11 +948,11 @@ void VisionPipeline::MaybeNotifyHealth(const DetectionResult& result) {
                 tracker.normal_count = 0;
                 if (tracker.abnormal_count >= 2) tracker.active = true;
             } else {
-                tracker.normal_count++;
+                tracker.normal_count = 1;
                 tracker.abnormal_count = 0;
-                if (tracker.normal_count >= 2) tracker.active = false;
+                tracker.active = false;
             }
-            constexpr uint64_t kAlertCooldownMs = 60000;
+            constexpr uint64_t kAlertCooldownMs = 30000;
             if (tracker.active &&
                 (tracker.last_remind_ms == 0 || now_ms - tracker.last_remind_ms >= kAlertCooldownMs)) {
                 tracker.last_remind_ms = now_ms;
@@ -948,6 +962,18 @@ void VisionPipeline::MaybeNotifyHealth(const DetectionResult& result) {
         };
         remind_hr = update(heart_rate_alert_, hr_abnormal, result.heart_rate.available);
         remind_bp = update(blood_pressure_alert_, bp_abnormal, result.blood_pressure.available);
+        if (result.task == kTaskHeartRate) {
+            if (!result.heart_rate.available) {
+                heart_rate_alert_.abnormal_count = 0;
+                heart_rate_alert_.normal_count = 0;
+                heart_rate_alert_.active = false;
+            }
+            if (!result.blood_pressure.available) {
+                blood_pressure_alert_.abnormal_count = 0;
+                blood_pressure_alert_.normal_count = 0;
+                blood_pressure_alert_.active = false;
+            }
+        }
     }
     if (!remind_hr && !remind_bp) return;
 
