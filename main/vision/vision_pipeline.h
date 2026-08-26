@@ -74,6 +74,7 @@ public:
     bool StartContinuous(uint32_t period_ms = 500, const std::string& task = "");
     void StopContinuous();
     bool IsContinuousRunning() const;
+    const std::string& GetContinuousTask() const;
 
     // Preview-only: capture + display, NO detection (for debugging camera pipeline)
     bool StartPreview(uint32_t period_ms = 200);
@@ -90,6 +91,9 @@ public:
     // 最近一次心率结果（跨帧保留，供查询）
     HeartRateResult GetLatestHeartRate() const;
     uint64_t GetHeartRateTimestampMs() const;
+
+    BloodPressureResult GetLatestBloodPressure() const;
+    uint64_t GetBloodPressureTimestampMs() const;
 
     // 最近一次坐姿结果（跨帧保留，供查询）
     PostureResult GetLatestPosture() const;
@@ -122,7 +126,7 @@ private:
     std::thread preview_thread_;
     std::thread detect_thread_;
     uint32_t continuous_period_ms_;
-    std::string continuous_task_;   // 连续检测任务：face_emotion / posture / heart_rate / auto
+    std::string continuous_task_;   // 连续检测任务：face_emotion / posture / heart_rate / blood_pressure / auto
 
     // Preview 线程与 Detection 线程之间的共享帧缓冲
     std::mutex frame_mutex_;            // 保护 shared_frame_ / shared_frame_* / shared_frame_version_
@@ -134,10 +138,12 @@ private:
 
     // 跨帧缓存的感知结果：心率值供查询，坐姿用于 LCD 持续叠加
     HeartRateResult latest_heart_rate_;
+    BloodPressureResult latest_blood_pressure_;
     PostureResult latest_posture_;
-    uint64_t heart_rate_timestamp_ms_;
-    uint64_t posture_timestamp_ms_;
-    mutable std::mutex sensing_mutex_;  // 保护 latest_heart_rate_ / latest_posture_ / 情绪窗口
+    uint64_t heart_rate_timestamp_ms_ = 0;
+    uint64_t blood_pressure_timestamp_ms_ = 0;
+    uint64_t posture_timestamp_ms_ = 0;
+    mutable std::mutex sensing_mutex_;  // 保护跨帧生理结果及情绪窗口
 
     // 用户情绪平滑窗口（最近10帧）
     std::deque<std::string> emotion_window_;

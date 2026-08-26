@@ -32,7 +32,7 @@ private:
     std::string endpoint_url_;
     int timeout_sec_;
     int jpeg_quality_;
-    std::string task_;       // 当前任务：face_emotion / posture / heart_rate
+    std::string task_;       // 当前任务：face_emotion / posture / heart_rate / blood_pressure
     int64_t frame_id_;       // 自增帧号
     bool auto_frame_id_;     // 是否每次请求自动递增 frame_id
     bool calibrate_once_;    // 下一次 posture 请求携带 calibrate=true（坐姿基准标定）

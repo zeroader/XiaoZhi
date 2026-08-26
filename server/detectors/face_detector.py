@@ -7,6 +7,7 @@
 
 import cv2
 import numpy as np
+import threading
 
 # 检测参数
 SCORE_THRESHOLD = 0.6
@@ -21,6 +22,7 @@ class FaceDetector:
         self.detector = cv2.FaceDetectorYN.create(
             model_path, "", (320, 320), SCORE_THRESHOLD, NMS_THRESHOLD, TOP_K
         )
+        self._lock = threading.RLock()
         print(f"[Model] YuNet loaded: {model_path}")
 
     def detect(self, image_rgb: np.ndarray, src_w: int, src_h: int) -> list:
@@ -30,9 +32,10 @@ class FaceDetector:
         """
         img = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         h, w = img.shape[:2]
-        self.detector.setInputSize((w, h))
-
-        _, faces = self.detector.detect(img)
+        # FaceDetectorYN has mutable input-size state, so Flask requests cannot share it unsafely.
+        with self._lock:
+            self.detector.setInputSize((w, h))
+            _, faces = self.detector.detect(img)
         results = []
         if faces is None:
             return results
