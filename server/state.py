@@ -49,6 +49,17 @@ class ServerState:
         self.latest_blood_pressure: Optional[dict] = None
         self._frame_seq = 0
 
+    def _reset_measurement_session_locked(self):
+        """Discard data from a previous ESP32 boot/session."""
+        self.frame_buffer.clear()
+        self.rppg_samples.clear()
+        self.latest_face = None
+        self.latest_emotion = None
+        self.latest_posture = None
+        self.latest_heart_rate = None
+        self.latest_blood_pressure = None
+        self._frame_seq = 0
+
     # ---------- 帧缓存 ----------
 
     def push_frame(self, image, width: int = 0, height: int = 0,
@@ -71,7 +82,16 @@ class ServerState:
         """Record a compact rPPG sample and discard duplicate/out-of-order timestamps."""
         with self._lock:
             if self.rppg_samples and timestamp <= self.rppg_samples[-1].timestamp:
-                return False
+                # capture_timestamp_ms is based on esp_timer_get_time(). It restarts
+                # from a small value after an ESP32 reboot, so the first request of
+                # the new boot must start a fresh measurement session. Equal or
+                # nearly-equal timestamps remain duplicate requests from the same
+                # captured frame and are still discarded.
+                timestamp_rollback = self.rppg_samples[-1].timestamp - float(timestamp)
+                if timestamp_rollback > 1.0:
+                    self._reset_measurement_session_locked()
+                else:
+                    return False
             self.rppg_samples.append(RppgSample(
                 timestamp=float(timestamp), rgb=rgb,
                 face_confidence=float(face_confidence)))

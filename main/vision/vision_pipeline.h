@@ -151,9 +151,11 @@ private:
     int user_emotion_hits_;             // 该情绪的命中次数
     uint64_t user_emotion_timestamp_ms_;
 
-    // 坐姿提醒状态
-    bool posture_reminded_ = false;      // 当前是否已处于"已提醒"的坏坐姿状态
-    uint64_t last_posture_remind_ms_ = 0;  // 上次提醒时间（防刷屏）
+    // 本地语音提醒状态（各类事件独立 60 秒冷却）
+    uint64_t last_heart_alert_ms_ = 0;
+    uint64_t last_blood_alert_ms_ = 0;
+    uint64_t last_posture_alert_ms_ = 0;
+    uint64_t last_emotion_alert_ms_ = 0;
 
     // Preview-only (capture + display, NO detection)：与 start_continuous 共用 preview_thread_
     std::atomic<bool> preview_running_;
@@ -166,7 +168,7 @@ private:
     void DetectionLoop();
 
     void CacheSensingResult(const DetectionResult& result);
-    void MaybeNotifyPosture(const DetectionResult& result);
+    void MaybePlayVoiceAlerts(const DetectionResult& result);
 
     bool CaptureFrame(ImageFrame& out_frame);
     bool ReleaseCurrentFrame();

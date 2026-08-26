@@ -274,7 +274,10 @@ void AudioService::AudioOutputTask() {
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
             codec_->EnableOutput(true);
         }
+        audio_output_busy_.store(true);
         codec_->OutputData(task->pcm);
+        audio_output_busy_.store(false);
+        audio_queue_cv_.notify_all();
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -316,6 +319,7 @@ void AudioService::OpusCodecTask() {
             task->timestamp = packet->timestamp;
 
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
+            audio_codec_busy_.store(true);
             if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
                 // Resample if the sample rate is different
                 if (opus_decoder_->sample_rate() != codec_->output_sample_rate()) {
@@ -325,6 +329,16 @@ void AudioService::OpusCodecTask() {
                     task->pcm = std::move(resampled);
                 }
 
+                // 本地提示音可以使用独立增益，网络语音默认增益为 1.0。
+                if (packet->playback_gain != 1.0f) {
+                    for (auto& sample : task->pcm) {
+                        int32_t amplified = static_cast<int32_t>(sample * packet->playback_gain);
+                        if (amplified > INT16_MAX) amplified = INT16_MAX;
+                        if (amplified < INT16_MIN) amplified = INT16_MIN;
+                        sample = static_cast<int16_t>(amplified);
+                    }
+                }
+
                 lock.lock();
                 audio_playback_queue_.push_back(std::move(task));
                 audio_queue_cv_.notify_all();
@@ -332,6 +346,8 @@ void AudioService::OpusCodecTask() {
                 ESP_LOGE(TAG, "Failed to decode audio");
                 lock.lock();
             }
+            audio_codec_busy_.store(false);
+            audio_queue_cv_.notify_all();
             debug_statistics_.decode_count++;
         }
         
@@ -411,6 +427,11 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
 
 bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    // 网络 TTS 等待本地提示音完全播放，避免两个音频流交错。
+    if (packet->playback_gain == 1.0f && local_sound_playing_.load()) {
+        audio_queue_cv_.wait(lock, [this]() { return !local_sound_playing_.load() || service_stopped_; });
+        if (service_stopped_) return false;
+    }
     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
         if (wait) {
             audio_queue_cv_.wait(lock, [this]() { return audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE; });
@@ -520,7 +541,7 @@ void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) {
     callbacks_ = callbacks;
 }
 
-void AudioService::PlaySound(const std::string_view& ogg) {
+void AudioService::PlaySound(const std::string_view& ogg, float playback_gain) {
     if (!codec_->output_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -610,6 +631,7 @@ void AudioService::PlaySound(const std::string_view& ogg) {
             auto packet = std::make_unique<AudioStreamPacket>();
             packet->sample_rate = sample_rate;
             packet->frame_duration = 60;
+            packet->playback_gain = playback_gain;
             packet->payload.resize(pkt_len);
             std::memcpy(packet->payload.data(), pkt_ptr, pkt_len);
             PushPacketToDecodeQueue(std::move(packet), true);
@@ -621,7 +643,18 @@ void AudioService::PlaySound(const std::string_view& ogg) {
 
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+    return !audio_output_busy_.load() && !audio_codec_busy_.load() && audio_encode_queue_.empty() &&
+        audio_decode_queue_.empty() && audio_playback_queue_.empty() &&
+        audio_testing_queue_.empty();
+}
+
+void AudioService::BeginLocalSound() {
+    local_sound_playing_.store(true);
+}
+
+void AudioService::EndLocalSound() {
+    local_sound_playing_.store(false);
+    audio_queue_cv_.notify_all();
 }
 
 void AudioService::ResetDecoder() {

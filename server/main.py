@@ -78,7 +78,6 @@ blood_pressure_detector: BloodPressureDetector = None
 _last_frame_time = None
 _last_response_time = None
 
-
 # ============================================================
 # 图像解码
 # ============================================================
@@ -158,9 +157,41 @@ def _detect_face_emotion(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
     return result
 
 
-def _detect_posture(rgb: np.ndarray) -> dict:
-    """坐姿检测"""
-    return pose_detector.detect(rgb)
+def _detect_posture(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
+    """基于当前帧人脸位置和面积的简化坐姿检测。"""
+    face = face_detector.detect_primary_face(rgb, src_w, src_h)
+    if face is None:
+        raw_state = "unknown"
+        reason = "no_face"
+        metrics = {}
+    else:
+        bbox = face["bbox"]
+        frame_w = max(1, src_w)
+        frame_h = max(1, src_h)
+        face_center_x = bbox["x"] + bbox["width"] / 2.0
+        face_area_ratio = (bbox["width"] * bbox["height"]) / (frame_w * frame_h)
+        center_ratio = face_center_x / frame_w
+
+        # 画面中间取水平居中的 50%；人脸面积达到四分之一即视为过大。
+        if face_area_ratio >= 0.25:
+            raw_state = "bad_posture"
+            reason = "face_too_large"
+        elif center_ratio < 0.25:
+            raw_state = "bad_posture"
+            reason = "face_too_left"
+        elif center_ratio > 0.75:
+            raw_state = "bad_posture"
+            reason = "face_too_right"
+        else:
+            raw_state = "normal"
+            reason = "ok"
+        metrics = {
+            "face_center_x": round(center_ratio, 4),
+            "face_area_ratio": round(face_area_ratio, 4),
+            "face": face,
+        }
+
+    return {"state": raw_state, "reason": reason, "metrics": metrics}
 
 
 def _detect_heart_rate() -> dict:
@@ -183,20 +214,12 @@ def _dispatch_task(task: str, rgb: np.ndarray, src_w: int, src_h: int,
         state.set_face(result["face"])
         state.set_emotion(result["emotion"])
     elif task == protocol.TASK_POSTURE:
-        # calibrate=true 时，将当前姿态记录为基准坐姿（需先完成一次完整检测）
+        # calibrate 参数为兼容旧客户端保留，但新版人脸规则不需要校准。
         if calibrate:
-            m = pose_detector.detect(rgb).get("metrics", {})
-            if "cva" in m:
-                # 用 EMA 平滑值作基准（比单帧 raw 稳定），躯干角仅在髋可见时校准
-                pose_detector.calibrate(m["cva"], m["trunk_angle"],
-                                        bool(m.get("trunk_valid", False)))
-                reason = "baseline_set" if m.get("trunk_valid") else "baseline_set_cva_only"
-                result = {"state": "calibrated", "reason": reason, "metrics": m}
-            else:
-                result = {"state": "unknown", "reason": "calibrate_failed",
-                          "metrics": m}
+            # 新版坐姿判定不需要姿态模型或人工校准；直接使用人脸规则。
+            result = _detect_posture(rgb, src_w, src_h)
         else:
-            result = _detect_posture(rgb)
+            result = _detect_posture(rgb, src_w, src_h)
         state.set_posture(result)
     elif task == protocol.TASK_HEART_RATE:
         result = _detect_heart_rate()

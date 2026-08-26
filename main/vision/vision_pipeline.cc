@@ -7,6 +7,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
+#include <mutex>
 #include <cJSON.h>
 
 #include "board.h"
@@ -15,6 +17,7 @@
 #include "mcp_server.h"
 #include "system_info.h"
 #include "application.h"
+#include "assets.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -22,6 +25,8 @@
 #include "esp_jpeg_dec.h"
 
 #define TAG "VisionPipeline"
+
+static void StopQueuedVoiceAlert();
 
 PipelineStats::PipelineStats() { Reset(); }
 
@@ -118,6 +123,7 @@ bool VisionPipeline::Initialize() {
 }
 
 void VisionPipeline::Deinitialize() {
+    StopQueuedVoiceAlert();
     if (!initialized_) return;
 
     StopContinuous();
@@ -343,7 +349,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
 
     last_result_ = result;
     CacheSensingResult(result);
-    MaybeNotifyPosture(result);
+    MaybePlayVoiceAlerts(result);
 
     bool displayed = false;
     if (show_on_lcd && display_composer_) {
@@ -567,8 +573,8 @@ void VisionPipeline::DetectionLoop() {
 
         // 缓存跨帧感知结果（心率值供查询、坐姿供 LCD 持续叠加）
         CacheSensingResult(result);
-        // 坏坐姿触发大模型提醒
-        MaybeNotifyPosture(result);
+        // 根据服务器结果触发本地语音提醒
+        MaybePlayVoiceAlerts(result);
 
         // Track connection errors
         if (!result.connection_ok) {
@@ -805,7 +811,7 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
             posture_timestamp_ms_ = result.timestamp_ms;
         }
     }
-    if (result.emotion.available && !result.emotion.label.empty()) {
+    if (result.task == kTaskFaceEmotion && result.emotion.available && !result.emotion.label.empty()) {
         // 10 帧平滑窗口：同一情绪 >=7 次判为特殊情绪，否则 neutral
         emotion_window_.push_back(result.emotion.label);
         if (emotion_window_.size() > 10) {
@@ -830,6 +836,12 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
             user_emotion_ = "neutral";
             user_emotion_hits_ = 0;
         }
+        user_emotion_timestamp_ms_ = result.timestamp_ms;
+    } else if (result.task == kTaskFaceEmotion) {
+        // 服务器未检测到人脸时，立即使上一帧情绪失效，不能继续沿用旧结果。
+        emotion_window_.clear();
+        user_emotion_ = "neutral";
+        user_emotion_hits_ = 0;
         user_emotion_timestamp_ms_ = result.timestamp_ms;
     }
 }
@@ -879,39 +891,122 @@ uint64_t VisionPipeline::GetUserEmotionTimestampMs() const {
     return user_emotion_timestamp_ms_;
 }
 
-// 坏坐姿时通过 MCP Notification 触发大模型提醒（进入坏坐姿立即提醒，之后每 60s 复查仍坏则再提醒）
-void VisionPipeline::MaybeNotifyPosture(const DetectionResult& result) {
-    if (!result.posture.available) return;
+// 播放 assets 分区中的 OGG 语音。PlaySound 同步消费数据，因此这里不保存悬空指针。
+static std::mutex g_voice_alert_mutex;
+static std::thread g_voice_alert_thread;
 
-    bool bad = (result.posture.state == "bad_posture");
-    uint64_t now_ms = esp_timer_get_time() / 1000LL;
+// 在独立线程中播放固定语音，避免阻塞视觉检测线程。
+static void PlayVoiceAssetAsync(std::string filename, DeviceState previous_state) {
+    auto& app = Application::GetInstance();
+    auto& audio = app.GetAudioService();
 
-    if (!bad) {
-        posture_reminded_ = false;  // 恢复坐姿后重置，下次再趴会重新提醒
+    void* data = nullptr;
+    size_t size = 0;
+    if (!Assets::GetInstance().GetAssetData(filename, data, size) || data == nullptr || size == 0) {
+        ESP_LOGW(TAG, "Voice asset not found: %s", filename);
+        audio.EndLocalSound();
+        return;
+    }
+    // 当前转换后的 OGG 振幅比小智 TTS 偏小，提示音使用约 +3.5 dB 增益。
+    // 不关闭网络音频通道、不切换设备状态，避免与音频/SPI任务并发重配置。
+    audio.PlaySound(std::string_view(static_cast<const char*>(data), size), 1.5f);
+
+    // 等待最后一个 PCM 块真正输出后再恢复唤醒检测。
+    while (!audio.IsIdle()) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    audio.EndLocalSound();
+    const bool was_listening = previous_state == kDeviceStateListening;
+    const bool was_idle = previous_state == kDeviceStateIdle;
+    // 播放期间如果服务器已让设备进入说话状态，不覆盖该状态。
+    if (app.GetDeviceState() == kDeviceStateSpeaking) {
+        return;
+    }
+    if (was_listening && app.GetDeviceState() == kDeviceStateListening) {
+        audio.EnableVoiceProcessing(true);
+        audio.EnableWakeWordDetection(false);
+    } else if (was_idle && app.GetDeviceState() == kDeviceStateIdle) {
+        audio.EnableWakeWordDetection(true);
+    }
+}
+
+static bool QueueVoiceAsset(const char* filename) {
+    auto& app = Application::GetInstance();
+    auto& audio = app.GetAudioService();
+    const DeviceState previous_state = app.GetDeviceState();
+    const bool was_listening = previous_state == kDeviceStateListening;
+
+    std::lock_guard<std::mutex> lock(g_voice_alert_mutex);
+    if (previous_state == kDeviceStateSpeaking || audio.IsLocalSoundPlaying() ||
+        (!was_listening && !audio.IsIdle())) {
+        return false;
+    }
+
+    // 回收上一条已经播放完成的线程；正在播放时由 local_sound_playing_ 拦截。
+    if (g_voice_alert_thread.joinable()) {
+        g_voice_alert_thread.join();
+    }
+
+    // 先占用本地语音播放权，防止多个检测结果同时创建播放线程。
+    audio.BeginLocalSound();
+    if (was_listening) {
+        // 视觉检测继续运行，但麦克风不再把固定语音上传给服务器。
+        audio.EnableVoiceProcessing(false);
+    }
+    audio.EnableWakeWordDetection(false);
+
+    g_voice_alert_thread = std::thread([filename = std::string(filename), previous_state]() {
+        PlayVoiceAssetAsync(filename, previous_state);
+    });
+    return true;
+}
+
+static void StopQueuedVoiceAlert() {
+    std::lock_guard<std::mutex> lock(g_voice_alert_mutex);
+    if (g_voice_alert_thread.joinable()) {
+        g_voice_alert_thread.join();
+    }
+}
+
+// 四类本地语音提醒：心率/血压/坐姿/情绪各自独立冷却 60 秒。
+void VisionPipeline::MaybePlayVoiceAlerts(const DetectionResult& result) {
+    constexpr uint64_t kAlertCooldownMs = 60000;
+    constexpr float kHighHeartRateBpm = 120.0f;
+    constexpr float kHighSystolicMmHg = 140.0f;
+    constexpr float kHighDiastolicMmHg = 90.0f;
+
+    const uint64_t now_ms = esp_timer_get_time() / 1000LL;
+
+    // 健康报警优先于坐姿和情绪；每次检测最多播放一种语音。
+    if (result.heart_rate.available && result.heart_rate.bpm > kHighHeartRateBpm &&
+        (last_heart_alert_ms_ == 0 || now_ms - last_heart_alert_ms_ >= kAlertCooldownMs)) {
+        if (QueueVoiceAsset("heart_alarm.ogg")) last_heart_alert_ms_ = now_ms;
         return;
     }
 
-    constexpr uint64_t kRemindCooldownMs = 60000;
-    if (posture_reminded_ && (now_ms - last_posture_remind_ms_) < kRemindCooldownMs) {
-        return;  // 冷却期内不重复提醒
+    if (result.blood_pressure.ready &&
+        (result.blood_pressure.sbp_mmHg >= kHighSystolicMmHg ||
+         result.blood_pressure.dbp_mmHg >= kHighDiastolicMmHg) &&
+        (last_blood_alert_ms_ == 0 || now_ms - last_blood_alert_ms_ >= kAlertCooldownMs)) {
+        if (QueueVoiceAsset("blood_alarm.ogg")) last_blood_alert_ms_ = now_ms;
+        return;
     }
-    last_posture_remind_ms_ = now_ms;
-    posture_reminded_ = true;
 
-    cJSON* note = cJSON_CreateObject();
-    cJSON_AddStringToObject(note, "jsonrpc", "2.0");
-    cJSON_AddStringToObject(note, "method", "notifications/posture");
-    cJSON* params = cJSON_AddObjectToObject(note, "params");
-    cJSON_AddStringToObject(params, "state", result.posture.state.c_str());
-    cJSON_AddStringToObject(params, "reason", result.posture.reason.c_str());
-    char* json_str = cJSON_PrintUnformatted(note);
-    if (json_str != nullptr) {
-        Application::GetInstance().SendMcpMessage(std::string(json_str));
-        cJSON_free(json_str);
-        ESP_LOGW(TAG, "Posture reminder sent: %s (%s)",
-                 result.posture.state.c_str(), result.posture.reason.c_str());
+    if (result.posture.available && result.posture.state == "bad_posture" &&
+        (last_posture_alert_ms_ == 0 || now_ms - last_posture_alert_ms_ >= kAlertCooldownMs)) {
+        if (QueueVoiceAsset("pose_alarm.ogg")) last_posture_alert_ms_ = now_ms;
+        return;
     }
-    cJSON_Delete(note);
+
+    const std::string stable_emotion = GetUserEmotion();
+    if (result.task == kTaskFaceEmotion && stable_emotion != "" &&
+        stable_emotion != "neutral" && stable_emotion != "contempt" &&
+        (last_emotion_alert_ms_ == 0 || now_ms - last_emotion_alert_ms_ >= kAlertCooldownMs)) {
+        const std::string filename = stable_emotion + ".ogg";
+        if (QueueVoiceAsset(filename.c_str())) {
+            last_emotion_alert_ms_ = now_ms;
+        }
+    }
 }
 
 
