@@ -138,10 +138,13 @@ bool VisionPipeline::Initialize() {
     {
         Settings settings("vision");
         const auto saved = settings.GetString("active_detector");
+#ifndef VISION_DISABLE_LOCAL_FACE
         if (saved == "face" && face_detector_ != nullptr) {
             active_detector_type_ = DetectorType::kFace;
             active_detector_ = face_detector_.get();
-        } else if (saved == "remote" && remote_detector_ != nullptr) {
+        } else
+#endif
+        if (saved == "remote" && remote_detector_ != nullptr) {
             active_detector_type_ = DetectorType::kRemote;
             active_detector_ = remote_detector_.get();
         }
