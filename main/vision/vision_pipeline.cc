@@ -410,10 +410,10 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
 // ---------- Two-thread architecture: Preview (15 FPS) + Detect (async) ----------
 
 void VisionPipeline::PreviewLoop() {
-    ESP_LOGI(TAG, "Preview loop started (15 FPS capture, 15 FPS LCD)");
+    ESP_LOGI(TAG, "Preview loop started (15 FPS capture, 12 FPS LCD)");
 
     constexpr uint32_t kPreviewPeriodMs = 67;  // ~15 FPS
-    constexpr uint32_t kDisplayPeriodMs = 100;  // 10 FPS keeps audio responsive while remaining smooth.
+    constexpr uint32_t kDisplayPeriodMs = 83;  // 12 FPS target; audio remains higher priority.
     uint64_t last_iter = 0;
     uint64_t last_display_ms = 0;
 
@@ -681,7 +681,7 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
     // stack (3072B) is too small and caused a printf crash. Use a larger stack.
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
     cfg.stack_size = 8192;
-    cfg.prio = 3;
+    cfg.prio = 2;
     esp_pthread_set_cfg(&cfg);
     try {
         preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
