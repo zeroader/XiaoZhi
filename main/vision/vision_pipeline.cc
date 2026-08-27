@@ -1217,7 +1217,8 @@ void RegisterVisionMcpTools() {
         "Note: `online` is the default after initialization.\n"
         "Args:\n"
         "  `detector`: One of `face` (local, low-latency, ESP-SR based, NO upload), "
-        "`remote` (HTTP server based, UPLOADS the frame to the configured server).",
+        "`remote` (legacy HTTP server based, uploads the frame to its configured endpoint), "
+        "or `online` (the unified LAN vision server used for face, posture, heart rate, and blood pressure).",
         PropertyList({
             Property("detector", kPropertyTypeString)
         }),
