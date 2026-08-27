@@ -184,63 +184,6 @@ void VisionDisplay::DrawDetections(uint8_t* buf, int w, int h, size_t stride,
         DrawRect(buf, w, h, stride, b.x, b.y, b.width, b.height,
                  style->border_color_rgb565, style->border_thickness);
 
-        if (style->draw_label) {
-            char label_buf[64];
-            if (!d.class_name.empty()) {
-                snprintf(label_buf, sizeof(label_buf), "%s %.2f",
-                         d.class_name.c_str(), d.confidence);
-            } else {
-                snprintf(label_buf, sizeof(label_buf), "#%d %.2f",
-                         d.class_id, d.confidence);
-            }
-            int scale = (h >= 480) ? 4 : 3;
-            int label_h = 8 * scale;
-            int text_w = MeasureText5x7(label_buf, scale);
-            int lx = b.x;
-            int ly = b.y - label_h - 2;
-            if (ly < 0) ly = b.y + b.height - label_h - 2;
-            if (ly < 0) ly = 0;
-            if (lx < 0) lx = 0;
-            if (lx + text_w > w) lx = w - text_w;
-            FillRect(buf, w, h, stride, lx, ly, text_w, label_h, style->label_bg_rgb565);
-            DrawText5x7(buf, w, h, stride, lx, ly + scale, label_buf,
-                        style->label_text_rgb565, style->label_bg_rgb565, scale);
-        }
-    }
-
-    // 左上角叠加状态信息：情绪 / 坐姿 / 心率（放大字号，超出屏幕宽度时截断）
-    int scale = (h >= 480) ? 5 : (h >= 320) ? 4 : 3;
-    int info_y = 2;
-    char line[96];
-    const uint16_t kTextFg = 0xFFFF;   // 白
-    const uint16_t kTextBg = 0x0000;   // 黑
-
-    auto draw_info_line = [&](const char* text) {
-        char tmp[96];
-        size_t max_len = (size_t)((w - 4) / (6 * scale));
-        snprintf(tmp, sizeof(tmp), "%s", text);
-        if (strlen(tmp) > max_len) tmp[max_len] = '\0';
-        int tw = MeasureText5x7(tmp, scale);
-        FillRect(buf, w, h, stride, 2, info_y, tw, 8 * scale, kTextBg);
-        DrawText5x7(buf, w, h, stride, 2, info_y + scale, tmp, kTextFg, kTextBg, scale);
-        info_y += 10 * scale;
-    };
-
-    if (detections.emotion.available && !detections.emotion.label.empty()) {
-        snprintf(line, sizeof(line), "EMO:%s %.2f", detections.emotion.label.c_str(),
-                 detections.emotion.confidence);
-        draw_info_line(line);
-    }
-    if (detections.posture.available && !detections.posture.state.empty()) {
-        snprintf(line, sizeof(line), "POSE:%s", detections.posture.state.c_str());
-        draw_info_line(line);
-    }
-    if (detections.heart_rate.available) {
-        snprintf(line, sizeof(line), "HR:%.0fbpm", detections.heart_rate.bpm);
-        draw_info_line(line);
-    } else if (!detections.heart_rate.error_message.empty()) {
-        snprintf(line, sizeof(line), "HR:%s", detections.heart_rate.error_message.c_str());
-        draw_info_line(line);
     }
 }
 

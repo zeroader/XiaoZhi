@@ -726,6 +726,8 @@ void Application::SetDeviceState(DeviceState state) {
 
 void Application::Reboot() {
     ESP_LOGI(TAG, "Rebooting...");
+    // 先停止视觉检测及固定语音后台线程，避免复位时仍有任务访问音频/摄像头外设。
+    VisionPipeline::GetInstance().Deinitialize();
     // Disconnect the audio channel
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         protocol_->CloseAudioChannel();

@@ -4,7 +4,8 @@ ESP32 生物特征感知服务器 - 通信协议定义
 Request (POST /detect):
   {
     "frame_id": 12345,
-    "task": "face_emotion",          # face_emotion | posture | heart_rate
+    "task": "face_emotion",          # face_emotion | posture | heart_rate | blood_pressure
+    "capture_timestamp_ms": 123456,   # optional client monotonic capture time
     "image": {
       "data": "base64 jpeg",
       "width": 320,
@@ -44,8 +45,9 @@ from typing import Any, Dict, List, Optional
 TASK_FACE_EMOTION = "face_emotion"   # 人脸 + 情绪（每帧）
 TASK_POSTURE = "posture"             # 坐姿（5s 一次）
 TASK_HEART_RATE = "heart_rate"       # 心率（10s 一次）
+TASK_BLOOD_PRESSURE = "blood_pressure"  # 血压（完成 rPPG 窗口后触发）
 
-VALID_TASKS = {TASK_FACE_EMOTION, TASK_POSTURE, TASK_HEART_RATE}
+VALID_TASKS = {TASK_FACE_EMOTION, TASK_POSTURE, TASK_HEART_RATE, TASK_BLOOD_PRESSURE}
 
 # 情绪类别（AffectNet 8 分类，与 enet_b0_8_best_afew 模型对应）
 EMOTION_LABELS = ["angry", "contempt", "disgust", "fear",
@@ -72,6 +74,7 @@ class DetectRequest:
     task: str
     image: ImageRequest
     calibrate: bool = False   # posture 任务: 是否将当前姿态记录为基准坐姿
+    capture_timestamp_ms: Optional[int] = None
 
 
 class ProtocolError(ValueError):
@@ -111,11 +114,21 @@ def parse_detect_request(payload: Dict[str, Any]) -> DetectRequest:
 
     calibrate = bool(payload.get("calibrate", False))
 
+    capture_timestamp_ms = payload.get("capture_timestamp_ms")
+    if capture_timestamp_ms is not None:
+        try:
+            capture_timestamp_ms = int(capture_timestamp_ms)
+        except (TypeError, ValueError):
+            raise ProtocolError("`capture_timestamp_ms` must be an integer")
+        if capture_timestamp_ms < 0:
+            raise ProtocolError("`capture_timestamp_ms` must be non-negative")
+
     return DetectRequest(
         frame_id=frame_id,
         task=task,
         image=ImageRequest(data=data, width=width, height=height, format=fmt),
         calibrate=calibrate,
+        capture_timestamp_ms=capture_timestamp_ms,
     )
 
 

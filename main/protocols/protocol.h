@@ -12,6 +12,7 @@ struct AudioStreamPacket {
     int frame_duration = 0;
     uint32_t timestamp = 0;
     std::vector<uint8_t> payload;
+    float playback_gain = 1.0f;  // 本地提示音增益；网络语音保持 1.0
 };
 
 struct BinaryProtocol2 {
@@ -95,4 +96,3 @@ protected:
 };
 
 #endif // PROTOCOL_H
-

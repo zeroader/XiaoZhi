@@ -9,6 +9,7 @@
 const char kTaskFaceEmotion[] = "face_emotion";  // 人脸 + 情绪（每帧）
 const char kTaskPosture[] = "posture";           // 坐姿（5s 一次）
 const char kTaskHeartRate[] = "heart_rate";      // 心率（10s 一次）
+const char kTaskBloodPressure[] = "blood_pressure";  // 实验性血压（持续采样窗口）
 const char kTaskAutoSchedule[] = "auto";         // 连续模式下按 每帧/5s/10s 自动调度
 
 struct BoundingBox {
@@ -62,6 +63,22 @@ struct HeartRateResult {
     HeartRateResult() : bpm(0.0f), confidence(0.0f), fs(0.0f), frames_used(0), available(false) {}
 };
 
+// 实验性血压结果。只有 server 明确返回 status=ready 时才填充 SBP/DBP。
+struct BloodPressureResult {
+    float sbp_mmHg;
+    float dbp_mmHg;
+    std::string status;        // collecting / rejected / waveform_ready / model_error / ready
+    std::string reason;        // quality.reason or model error
+    float duration_s;
+    float required_window_s;
+    bool available;            // server returned a blood_pressure response
+    bool ready;                // true only when SBP/DBP are present
+
+    BloodPressureResult()
+        : sbp_mmHg(0.0f), dbp_mmHg(0.0f), duration_s(0.0f),
+          required_window_s(0.0f), available(false), ready(false) {}
+};
+
 struct DetectionResult {
     std::vector<Detection> detections;
     int source_width;
@@ -76,6 +93,7 @@ struct DetectionResult {
     EmotionResult emotion;
     PostureResult posture;
     HeartRateResult heart_rate;
+    BloodPressureResult blood_pressure;
     float decode_ms;          // 服务器解码耗时
     float infer_ms;           // 服务器推理耗时
     float total_ms;           // 服务器总耗时

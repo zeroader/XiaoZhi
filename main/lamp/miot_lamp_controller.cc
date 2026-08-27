@@ -21,7 +21,7 @@
 namespace {
 
 // 台灯服务器默认端口（与视觉服务器同一个 Flask 进程）
-constexpr int kLampServerTimeoutSec = 5;
+constexpr int kLampServerTimeoutMs = 3000;
 
 // 归一化服务器地址：裸 "ip:port" 自动补 http://，去掉末尾斜杠
 std::string NormalizeServerUrl(const std::string& raw) {
@@ -50,7 +50,8 @@ std::string LoadServerUrl() {
 }
 
 // 向台灯服务器 POST 一个 JSON 请求体，返回响应原文（JSON 字符串）。
-// 服务器统一返回 HTTP 200，成功/失败用 body 里的 ok 字段区分。
+// Server errors and timeouts are returned as JSON; the ESP32 client itself
+// also has a strict three-second network timeout to avoid blocking the device.
 std::string LampHttpPost(const std::string& base_url, const std::string& json_body) {
     auto network = Board::GetInstance().GetNetwork();
     if (network == nullptr) {
@@ -58,10 +59,12 @@ std::string LampHttpPost(const std::string& base_url, const std::string& json_bo
     }
 
     std::string url = base_url + "/lamp";
-    auto http = network->CreateHttp(kLampServerTimeoutSec);
+    // CreateHttp's argument is a modem connection ID, not a timeout.
+    auto http = network->CreateHttp();
     if (http == nullptr) {
         throw std::runtime_error("failed to create HTTP client");
     }
+    http->SetTimeout(kLampServerTimeoutMs);
 
     http->SetHeader("Content-Type", "application/json");
     if (!http->Open("POST", url)) {

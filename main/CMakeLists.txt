@@ -68,6 +68,9 @@ set(BUILTIN_TEXT_FONT font_puhui_14_1)
 set(BUILTIN_ICON_FONT font_awesome_14_1)
 
 # Add board files according to BOARD_TYPE
+# Voice alert assets are packed into the Flash assets partition.
+set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/voice")
+
 # Set default assets if the board uses partition table V2
 if(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
     set(BOARD_TYPE "bread-compact-wifi")
@@ -213,7 +216,7 @@ elseif(CONFIG_BOARD_TYPE_ESP_SPOT_S3)
 elseif(CONFIG_BOARD_TYPE_ESP_HI)
     set(BOARD_TYPE "esp-hi")
     # Set ESP_HI emoji directory for DEFAULT_ASSETS_EXTRA_FILES
-    set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_BINARY_DIR}/emoji")
+    list(APPEND DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_BINARY_DIR}/emoji")
 elseif(CONFIG_BOARD_TYPE_ECHOEAR)
     set(BOARD_TYPE "echoear")
     set(BUILTIN_TEXT_FONT font_puhui_20_4)
@@ -338,6 +341,7 @@ elseif(CONFIG_BOARD_TYPE_ATK_DNESP32S3)
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
     set(BUILTIN_ICON_FONT font_awesome_20_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+    list(APPEND DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/vision/runtime")
 elseif(CONFIG_BOARD_TYPE_ATK_DNESP32S3_BOX)
     set(BOARD_TYPE "atk-dnesp32s3-box")
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
@@ -693,9 +697,9 @@ function(build_default_assets_bin)
     endif()
     
     # Add default assets extra files if defined
-    if(DEFAULT_ASSETS_EXTRA_FILES)
-        list(APPEND BUILD_ARGS "--extra_files" "${DEFAULT_ASSETS_EXTRA_FILES}")
-    endif()
+    foreach(EXTRA_FILES_DIR IN LISTS DEFAULT_ASSETS_EXTRA_FILES)
+        list(APPEND BUILD_ARGS "--extra_files" "${EXTRA_FILES_DIR}")
+    endforeach()
     
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
     list(APPEND BUILD_ARGS "--xiaozhi_fonts_path" "${XIAOZHI_FONTS_PATH}")

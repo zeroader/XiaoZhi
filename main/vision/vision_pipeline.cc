@@ -7,6 +7,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
+#include <mutex>
 #include <cJSON.h>
 
 #include "board.h"
@@ -15,6 +17,8 @@
 #include "mcp_server.h"
 #include "system_info.h"
 #include "application.h"
+#include "assets.h"
+#include "settings.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -22,6 +26,27 @@
 #include "esp_jpeg_dec.h"
 
 #define TAG "VisionPipeline"
+
+static void StopQueuedVoiceAlert();
+
+// Detection and lamp endpoints share one Flask server. Keep the lamp endpoint
+// in sync whenever a vision server URL is configured.
+static void SyncLampServerUrl(const std::string& endpoint) {
+    std::string base = endpoint;
+    const auto scheme = base.find("://");
+    const auto path = base.find('/', scheme == std::string::npos ? 0 : scheme + 3);
+    if (path != std::string::npos) {
+        base.resize(path);
+    }
+    while (!base.empty() && base.back() == '/') {
+        base.pop_back();
+    }
+    if (!base.empty()) {
+        Settings settings("lamp", true);
+        settings.SetString("server_url", base);
+        ESP_LOGI(TAG, "Lamp server URL synchronized to: %s", base.c_str());
+    }
+}
 
 PipelineStats::PipelineStats() { Reset(); }
 
@@ -107,8 +132,20 @@ bool VisionPipeline::Initialize() {
 
     display_composer_ = std::make_unique<VisionDisplay>();
 
+    // Restore the detector selected by the user; online remains the default.
     active_detector_type_ = DetectorType::kOnline;
     active_detector_ = online_detector_.get();
+    {
+        Settings settings("vision");
+        const auto saved = settings.GetString("active_detector");
+        if (saved == "face" && face_detector_ != nullptr) {
+            active_detector_type_ = DetectorType::kFace;
+            active_detector_ = face_detector_.get();
+        } else if (saved == "remote" && remote_detector_ != nullptr) {
+            active_detector_type_ = DetectorType::kRemote;
+            active_detector_ = remote_detector_.get();
+        }
+    }
 
     initialized_ = true;
     ESP_LOGI(TAG, "Vision pipeline initialized (active=%s, camera=%s)",
@@ -118,6 +155,7 @@ bool VisionPipeline::Initialize() {
 }
 
 void VisionPipeline::Deinitialize() {
+    StopQueuedVoiceAlert();
     if (!initialized_) return;
 
     StopContinuous();
@@ -181,6 +219,10 @@ bool VisionPipeline::SetActiveDetector(DetectorType type) {
     }
     active_detector_type_ = type;
     active_detector_ = d;
+    Settings settings("vision", true);
+    const char* detector_name = type == DetectorType::kFace ? "face"
+        : (type == DetectorType::kRemote ? "remote" : "online");
+    settings.SetString("active_detector", detector_name);
     ESP_LOGI(TAG, "Active detector changed to: %s", d->GetName());
     return true;
 }
@@ -315,7 +357,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     // 连续检测运行时摄像头被 PreviewLoop 独占，此处不再取帧，
     // 避免并发 esp_camera_fb_get 失败被大模型误判为"摄像头坏了"。
     // 引导大模型改用缓存读取工具。
-    if (continuous_running_.load()) {
+    if (continuous_running_.load() || preview_running_.load()) {
         if (out_debug_info) {
             *out_debug_info = "continuous detection is running (camera busy). "
                               "Use self.vision.get_user_emotion / get_posture / "
@@ -343,7 +385,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
 
     last_result_ = result;
     CacheSensingResult(result);
-    MaybeNotifyPosture(result);
+    MaybePlayVoiceAlerts(result);
 
     bool displayed = false;
     if (show_on_lcd && display_composer_) {
@@ -373,7 +415,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
                 ESP_LOGW(TAG, "OneShotDetect: ComposePreview returned NULL (bad alloc or invalid dims?)");
             } else {
                 auto t_disp0 = esp_timer_get_time();
-                lcd->SetPreviewImage(std::move(image));
+                lcd->SetVisionPreviewImage(std::move(image), result);
                 auto t_disp1 = esp_timer_get_time();
                 stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
                 stats_.display_count++;
@@ -404,10 +446,12 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
 // ---------- Two-thread architecture: Preview (15 FPS) + Detect (async) ----------
 
 void VisionPipeline::PreviewLoop() {
-    ESP_LOGI(TAG, "Preview loop started (15 FPS)");
+    ESP_LOGI(TAG, "Preview loop started (15 FPS capture, 12 FPS LCD)");
 
     constexpr uint32_t kPreviewPeriodMs = 67;  // ~15 FPS
+    constexpr uint32_t kDisplayPeriodMs = 83;  // 12 FPS target; audio remains higher priority.
     uint64_t last_iter = 0;
+    uint64_t last_display_ms = 0;
 
     while (continuous_running_.load()) {
         auto t0 = esp_timer_get_time();
@@ -427,8 +471,23 @@ void VisionPipeline::PreviewLoop() {
                 shared_frame_version_++;
             }
 
-            // Step 3: Compose preview with latest bbox (if any)
-            if (display_composer_) {
+            // Release the camera buffer before doing any JPEG/LVGL work.  The
+            // camera often has only one framebuffer, so holding it during a
+            // display refresh stalls the next capture.
+            const uint64_t now_ms = esp_timer_get_time() / 1000LL;
+            const bool should_display = last_display_ms == 0 ||
+                                        now_ms - last_display_ms >= kDisplayPeriodMs;
+            std::vector<uint8_t> display_frame_data;
+            ImageFrame display_frame = frame;
+            if (should_display) {
+                display_frame_data.assign(frame.data, frame.data + frame.len);
+            }
+            ReleaseCurrentFrame();
+
+            // Step 3: Compose preview with latest bbox (if any), at a bounded
+            // LCD rate. Detection continues to receive every captured frame.
+            if (should_display && display_composer_) {
+                last_display_ms = now_ms;
                 auto* lcd = ResolveLvglDisplay();
                 if (lcd != nullptr) {
                     DetectionResult current_result;
@@ -436,19 +495,22 @@ void VisionPipeline::PreviewLoop() {
                         std::lock_guard<std::mutex> lock(result_mutex_);
                         current_result = last_result_;
                     }
-                    // 合并跨帧缓存的坐姿/心率，保证 LCD 上持续显示（不被每帧 face_emotion 覆盖）
+                    // 合并跨帧缓存的坐姿/心率/血压，保证 LCD 上持续显示（不被每帧 face_emotion 覆盖）
                     {
                         std::lock_guard<std::mutex> lock(sensing_mutex_);
+                        current_result.emotion = latest_emotion_;
                         current_result.posture = latest_posture_;
                         current_result.heart_rate = latest_heart_rate_;
+                        current_result.blood_pressure = latest_blood_pressure_;
                     }
                     // OV2640 直出 JPEG：解码成 RGB565 再送 LCD（检测线程直接用 JPEG 上传，互不影响）
-                    const uint8_t* disp_data = frame.data;
-                    int disp_w = frame.width;
-                    int disp_h = frame.height;
-                    if (frame.pixel_format == PIXFORMAT_JPEG) {
+                    display_frame.data = display_frame_data.data();
+                    const uint8_t* disp_data = display_frame.data;
+                    int disp_w = display_frame.width;
+                    int disp_h = display_frame.height;
+                    if (display_frame.pixel_format == PIXFORMAT_JPEG) {
                         uint8_t* dec = nullptr; size_t dec_len = 0; int dw = 0, dh = 0;
-                        if (!DecodeJpegFrame(frame, &dec, &dec_len, &dw, &dh)) {
+                        if (!DecodeJpegFrame(display_frame, &dec, &dec_len, &dw, &dh)) {
                             disp_data = nullptr;  // 解码失败则本次不显示
                         } else {
                             disp_data = dec; disp_w = dw; disp_h = dh;
@@ -464,7 +526,7 @@ void VisionPipeline::PreviewLoop() {
 
                         if (image) {
                             auto t_disp0 = esp_timer_get_time();
-                            lcd->SetPreviewImage(std::move(image));
+                            lcd->SetVisionPreviewImage(std::move(image), current_result);
                             auto t_disp1 = esp_timer_get_time();
                             stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
                             stats_.display_count++;
@@ -473,8 +535,6 @@ void VisionPipeline::PreviewLoop() {
                 }
             }
 
-            // Step 4: Release frame
-            ReleaseCurrentFrame();
         }
 
         // Step 5: Sleep to maintain FPS
@@ -495,6 +555,7 @@ void VisionPipeline::DetectionLoop() {
     uint32_t last_version = 0;  // avoid re-processing same frame
     uint64_t last_posture_ms = 0;  // 距上次 posture 任务的毫秒数
     uint64_t last_heart_ms = 0;    // 距上次 heart_rate 任务的毫秒数
+    uint64_t last_blood_pressure_ms = 0;  // auto 模式下每约 2s 查询一次 BP 状态
 
     while (continuous_running_.load()) {
         // Wait for a NEW shared frame (skip if same as last processed)
@@ -530,13 +591,16 @@ void VisionPipeline::DetectionLoop() {
             continue;
         }
 
-        // 任务调度：auto 模式下按 每帧(face_emotion) / 5s(posture) / 10s(heart_rate) 轮询。
-        // posture 优先，保证 5s 一次不被心率请求饿死；其余帧全部跑 face_emotion。
+        // auto 模式下持续上传高频 face 帧供 rPPG，并每约 2s 请求一次 BP，
+        // 同时保留 posture/heart_rate 的低频任务。
         std::string task = continuous_task_;
         if (continuous_task_ == kTaskAutoSchedule) {
             uint64_t now_ms = esp_timer_get_time() / 1000LL;
             task = kTaskFaceEmotion;
-            if (now_ms - last_posture_ms >= 5000) {
+            if (now_ms - last_blood_pressure_ms >= 2000) {
+                task = kTaskBloodPressure;
+                last_blood_pressure_ms = now_ms;
+            } else if (now_ms - last_posture_ms >= 5000) {
                 task = kTaskPosture;
                 last_posture_ms = now_ms;
             } else if (now_ms - last_heart_ms >= 10000) {
@@ -562,8 +626,8 @@ void VisionPipeline::DetectionLoop() {
 
         // 缓存跨帧感知结果（心率值供查询、坐姿供 LCD 持续叠加）
         CacheSensingResult(result);
-        // 坏坐姿触发大模型提醒
-        MaybeNotifyPosture(result);
+        // 根据服务器结果触发本地语音提醒
+        MaybePlayVoiceAlerts(result);
 
         // Track connection errors
         if (!result.connection_ok) {
@@ -589,6 +653,15 @@ void VisionPipeline::DetectionLoop() {
         if (result.heart_rate.available) {
             detail += " hr=" + std::to_string((int)result.heart_rate.bpm);
         }
+        if (result.blood_pressure.available) {
+            detail += " bp=" + result.blood_pressure.status;
+            if (result.blood_pressure.ready) {
+                detail += "=" + std::to_string((int)result.blood_pressure.sbp_mmHg) + "/" +
+                          std::to_string((int)result.blood_pressure.dbp_mmHg);
+            } else if (!result.blood_pressure.reason.empty()) {
+                detail += "(" + result.blood_pressure.reason + ")";
+            }
+        }
         ESP_LOGI(TAG, "Detect: task=%s frame=%d, %d boxes, %dms, server(dec=%.1fms inf=%.1fms tot=%.1fms)%s",
                  result.task.c_str(),
                  (int)result.frame_id,
@@ -608,6 +681,9 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
         ESP_LOGW(TAG, "Continuous detect already running");
         return true;
     }
+    if (preview_running_.load()) {
+        StopPreview();
+    }
     // Join any previous threads that may have auto-stopped
     if (preview_thread_.joinable()) preview_thread_.join();
     if (detect_thread_.joinable()) detect_thread_.join();
@@ -616,8 +692,17 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
     // 避免回退到 online 检测器持久化的单一任务导致情绪/心率任务不跑
     if (!task.empty()) {
         continuous_task_ = task;
+        if (task != kTaskAutoSchedule) {
+            ApplyTaskToOnlineDetector(active_detector_, task);
+        }
     } else {
         continuous_task_ = kTaskAutoSchedule;
+    }
+
+    // BP quality gating needs roughly 10 FPS. Auto mode must not keep the old
+    // 500ms preview cadence, otherwise the server rejects the 7s waveform.
+    if (continuous_task_ == kTaskAutoSchedule && period_ms > 100) {
+        period_ms = 100;
     }
 
     // Clear shared frame buffer
@@ -632,7 +717,7 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
     // stack (3072B) is too small and caused a printf crash. Use a larger stack.
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
     cfg.stack_size = 8192;
-    cfg.prio = 5;
+    cfg.prio = 2;
     esp_pthread_set_cfg(&cfg);
     try {
         preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
@@ -664,6 +749,10 @@ void VisionPipeline::StopContinuous() {
 
 bool VisionPipeline::IsContinuousRunning() const {
     return continuous_running_.load();
+}
+
+const std::string& VisionPipeline::GetContinuousTask() const {
+    return continuous_task_;
 }
 
 // --- Preview-only (no detection) ---
@@ -699,7 +788,7 @@ void VisionPipeline::PreviewOnlyLoop() {
                 disp_data, disp_w, disp_h,
                 (size_t)disp_w * 2, empty_result);
             if (image) {
-                lcd->SetPreviewImage(std::move(image));
+                lcd->SetVisionPreviewImage(std::move(image), empty_result);
             }
         }
 
@@ -717,6 +806,10 @@ void VisionPipeline::PreviewOnlyLoop() {
 
 bool VisionPipeline::StartPreview(uint32_t period_ms) {
     if (!initialized_) return false;
+    if (continuous_running_.load()) {
+        ESP_LOGW(TAG, "Cannot start preview while continuous detection is running");
+        return false;
+    }
     if (preview_running_.load()) {
         ESP_LOGW(TAG, "Preview already running");
         return true;
@@ -763,9 +856,18 @@ const DetectionResult& VisionPipeline::GetLastResult() const { return last_resul
 // 缓存跨帧感知结果：心率值供查询，坐姿供 LCD 持续叠加
 void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
     std::lock_guard<std::mutex> lock(sensing_mutex_);
+    if (result.emotion.available && !result.emotion.label.empty()) {
+        latest_emotion_ = result.emotion;
+    } else if (result.task == kTaskFaceEmotion) {
+        latest_emotion_ = EmotionResult();
+    }
     if (result.heart_rate.available) {
         latest_heart_rate_ = result.heart_rate;
         heart_rate_timestamp_ms_ = result.timestamp_ms;
+    }
+    if (result.blood_pressure.available) {
+        latest_blood_pressure_ = result.blood_pressure;
+        blood_pressure_timestamp_ms_ = result.timestamp_ms;
     }
     if (result.posture.available) {
         // "calibrated" 是标定成功的瞬时状态，不是坐姿状态，不覆盖 LCD 叠加
@@ -774,7 +876,7 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
             posture_timestamp_ms_ = result.timestamp_ms;
         }
     }
-    if (result.emotion.available && !result.emotion.label.empty()) {
+    if (result.task == kTaskFaceEmotion && result.emotion.available && !result.emotion.label.empty()) {
         // 10 帧平滑窗口：同一情绪 >=7 次判为特殊情绪，否则 neutral
         emotion_window_.push_back(result.emotion.label);
         if (emotion_window_.size() > 10) {
@@ -800,6 +902,12 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
             user_emotion_hits_ = 0;
         }
         user_emotion_timestamp_ms_ = result.timestamp_ms;
+    } else if (result.task == kTaskFaceEmotion) {
+        // 服务器未检测到人脸时，立即使上一帧情绪失效，不能继续沿用旧结果。
+        emotion_window_.clear();
+        user_emotion_ = "neutral";
+        user_emotion_hits_ = 0;
+        user_emotion_timestamp_ms_ = result.timestamp_ms;
     }
 }
 
@@ -811,6 +919,16 @@ HeartRateResult VisionPipeline::GetLatestHeartRate() const {
 uint64_t VisionPipeline::GetHeartRateTimestampMs() const {
     std::lock_guard<std::mutex> lock(sensing_mutex_);
     return heart_rate_timestamp_ms_;
+}
+
+BloodPressureResult VisionPipeline::GetLatestBloodPressure() const {
+    std::lock_guard<std::mutex> lock(sensing_mutex_);
+    return latest_blood_pressure_;
+}
+
+uint64_t VisionPipeline::GetBloodPressureTimestampMs() const {
+    std::lock_guard<std::mutex> lock(sensing_mutex_);
+    return blood_pressure_timestamp_ms_;
 }
 
 PostureResult VisionPipeline::GetLatestPosture() const {
@@ -838,39 +956,121 @@ uint64_t VisionPipeline::GetUserEmotionTimestampMs() const {
     return user_emotion_timestamp_ms_;
 }
 
-// 坏坐姿时通过 MCP Notification 触发大模型提醒（进入坏坐姿立即提醒，之后每 60s 复查仍坏则再提醒）
-void VisionPipeline::MaybeNotifyPosture(const DetectionResult& result) {
-    if (!result.posture.available) return;
+// 播放 assets 分区中的 OGG 语音。PlaySound 同步消费数据，因此这里不保存悬空指针。
+static std::mutex g_voice_alert_mutex;
+static std::thread g_voice_alert_thread;
 
-    bool bad = (result.posture.state == "bad_posture");
-    uint64_t now_ms = esp_timer_get_time() / 1000LL;
+// 在独立线程中播放固定语音，避免阻塞视觉检测线程。
+static void PlayVoiceAssetAsync(std::string filename, DeviceState previous_state) {
+    auto& app = Application::GetInstance();
+    auto& audio = app.GetAudioService();
 
-    if (!bad) {
-        posture_reminded_ = false;  // 恢复坐姿后重置，下次再趴会重新提醒
+    void* data = nullptr;
+    size_t size = 0;
+    if (!Assets::GetInstance().GetAssetData(filename, data, size) || data == nullptr || size == 0) {
+        ESP_LOGW(TAG, "Voice asset not found: %s", filename);
+        audio.EndLocalSound();
+        return;
+    }
+    // 当前转换后的 OGG 振幅比小智 TTS 偏小，提示音使用约 +3.5 dB 增益。
+    // 不关闭网络音频通道、不切换设备状态，避免与音频/SPI任务并发重配置。
+    audio.PlaySound(std::string_view(static_cast<const char*>(data), size), 1.5f);
+
+    // 等待最后一个 PCM 块真正输出后再恢复唤醒检测。
+    while (!audio.IsIdle()) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    audio.EndLocalSound();
+    const bool was_listening = previous_state == kDeviceStateListening;
+    const bool was_idle = previous_state == kDeviceStateIdle;
+    // 播放期间如果服务器已让设备进入说话状态，不覆盖该状态。
+    if (app.GetDeviceState() == kDeviceStateSpeaking) {
+        return;
+    }
+    if (was_listening && app.GetDeviceState() == kDeviceStateListening) {
+        audio.EnableVoiceProcessing(true);
+        audio.EnableWakeWordDetection(false);
+    } else if (was_idle && app.GetDeviceState() == kDeviceStateIdle) {
+        audio.EnableWakeWordDetection(true);
+    }
+}
+
+static bool QueueVoiceAsset(const char* filename) {
+    auto& app = Application::GetInstance();
+    auto& audio = app.GetAudioService();
+    const DeviceState previous_state = app.GetDeviceState();
+    const bool was_listening = previous_state == kDeviceStateListening;
+
+    std::lock_guard<std::mutex> lock(g_voice_alert_mutex);
+    if (previous_state == kDeviceStateSpeaking || audio.IsLocalSoundPlaying() ||
+        (!was_listening && !audio.IsIdle())) {
+        return false;
+    }
+    // 回收上一条已经播放完成的线程；正在播放时由 local_sound_playing_ 拦截。
+    if (g_voice_alert_thread.joinable()) {
+        g_voice_alert_thread.join();
+    }
+
+    // 先占用本地语音播放权，防止多个检测结果同时创建播放线程。
+    audio.BeginLocalSound();
+    if (was_listening) {
+        // 视觉检测继续运行，但麦克风不再把固定语音上传给服务器。
+        audio.EnableVoiceProcessing(false);
+    }
+    audio.EnableWakeWordDetection(false);
+
+    g_voice_alert_thread = std::thread([filename = std::string(filename), previous_state]() {
+        PlayVoiceAssetAsync(filename, previous_state);
+    });
+    return true;
+}
+
+static void StopQueuedVoiceAlert() {
+    std::lock_guard<std::mutex> lock(g_voice_alert_mutex);
+    if (g_voice_alert_thread.joinable()) {
+        g_voice_alert_thread.join();
+    }
+}
+
+// 四类本地语音提醒：心率/血压/坐姿/情绪各自独立冷却 60 秒。
+void VisionPipeline::MaybePlayVoiceAlerts(const DetectionResult& result) {
+    constexpr uint64_t kAlertCooldownMs = 60000;
+    constexpr float kHighHeartRateBpm = 120.0f;
+    constexpr float kHighSystolicMmHg = 140.0f;
+    constexpr float kHighDiastolicMmHg = 90.0f;
+
+    const uint64_t now_ms = esp_timer_get_time() / 1000LL;
+
+    // 健康报警优先于坐姿和情绪；每次检测最多播放一种语音。
+    if (result.heart_rate.available && result.heart_rate.bpm > kHighHeartRateBpm &&
+        (last_heart_alert_ms_ == 0 || now_ms - last_heart_alert_ms_ >= kAlertCooldownMs)) {
+        if (QueueVoiceAsset("heart_alarm.ogg")) last_heart_alert_ms_ = now_ms;
         return;
     }
 
-    constexpr uint64_t kRemindCooldownMs = 60000;
-    if (posture_reminded_ && (now_ms - last_posture_remind_ms_) < kRemindCooldownMs) {
-        return;  // 冷却期内不重复提醒
+    if (result.blood_pressure.ready &&
+        (result.blood_pressure.sbp_mmHg >= kHighSystolicMmHg ||
+         result.blood_pressure.dbp_mmHg >= kHighDiastolicMmHg) &&
+        (last_blood_alert_ms_ == 0 || now_ms - last_blood_alert_ms_ >= kAlertCooldownMs)) {
+        if (QueueVoiceAsset("blood_alarm.ogg")) last_blood_alert_ms_ = now_ms;
+        return;
     }
-    last_posture_remind_ms_ = now_ms;
-    posture_reminded_ = true;
 
-    cJSON* note = cJSON_CreateObject();
-    cJSON_AddStringToObject(note, "jsonrpc", "2.0");
-    cJSON_AddStringToObject(note, "method", "notifications/posture");
-    cJSON* params = cJSON_AddObjectToObject(note, "params");
-    cJSON_AddStringToObject(params, "state", result.posture.state.c_str());
-    cJSON_AddStringToObject(params, "reason", result.posture.reason.c_str());
-    char* json_str = cJSON_PrintUnformatted(note);
-    if (json_str != nullptr) {
-        Application::GetInstance().SendMcpMessage(std::string(json_str));
-        cJSON_free(json_str);
-        ESP_LOGW(TAG, "Posture reminder sent: %s (%s)",
-                 result.posture.state.c_str(), result.posture.reason.c_str());
+    if (result.posture.available && result.posture.state == "bad_posture" &&
+        (last_posture_alert_ms_ == 0 || now_ms - last_posture_alert_ms_ >= kAlertCooldownMs)) {
+        if (QueueVoiceAsset("pose_alarm.ogg")) last_posture_alert_ms_ = now_ms;
+        return;
     }
-    cJSON_Delete(note);
+
+    const std::string stable_emotion = GetUserEmotion();
+    if (result.task == kTaskFaceEmotion && stable_emotion != "" &&
+        stable_emotion != "neutral" && stable_emotion != "contempt" &&
+        (last_emotion_alert_ms_ == 0 || now_ms - last_emotion_alert_ms_ >= kAlertCooldownMs)) {
+        const std::string filename = stable_emotion + ".ogg";
+        if (QueueVoiceAsset(filename.c_str())) {
+            last_emotion_alert_ms_ = now_ms;
+        }
+    }
 }
 
 
@@ -953,6 +1153,18 @@ static cJSON* DetectionsToJson(const DetectionResult& r) {
         cJSON* hr = cJSON_AddObjectToObject(j, "heart_rate");
         cJSON_AddStringToObject(hr, "error", r.heart_rate.error_message.c_str());
     }
+    if (r.blood_pressure.available) {
+        cJSON* bp = cJSON_AddObjectToObject(j, "blood_pressure");
+        cJSON_AddStringToObject(bp, "status", r.blood_pressure.status.c_str());
+        cJSON_AddStringToObject(bp, "reason", r.blood_pressure.reason.c_str());
+        cJSON_AddNumberToObject(bp, "duration_s", r.blood_pressure.duration_s);
+        cJSON_AddNumberToObject(bp, "required_window_s", r.blood_pressure.required_window_s);
+        cJSON_AddBoolToObject(bp, "experimental_only", true);
+        if (r.blood_pressure.ready) {
+            cJSON_AddNumberToObject(bp, "sbp_mmHg", r.blood_pressure.sbp_mmHg);
+            cJSON_AddNumberToObject(bp, "dbp_mmHg", r.blood_pressure.dbp_mmHg);
+        }
+    }
     if (r.decode_ms > 0 || r.infer_ms > 0 || r.total_ms > 0) {
         cJSON* perf = cJSON_AddObjectToObject(j, "performance");
         cJSON_AddNumberToObject(perf, "decode_ms", r.decode_ms);
@@ -988,15 +1200,14 @@ void RegisterVisionMcpTools() {
             return VisionPipeline::GetInstance().Initialize();
         });
 
-    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.shutdown",
         "Shutdown the vision pipeline, release detectors, stop continuous loop if running.",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             VisionPipeline::GetInstance().Deinitialize();
             return true;
-        });
-    */
+        }); */
 
     mcp.AddTool("self.vision.set_active_detector",
         "Choose which detector is used for detection.\n"
@@ -1017,7 +1228,7 @@ void RegisterVisionMcpTools() {
             return VisionPipeline::GetInstance().SetActiveDetector(type);
         });
 
-    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.get_active_detector",
         "Returns the currently active detector name and list of available detectors.",
         PropertyList(),
@@ -1032,8 +1243,7 @@ void RegisterVisionMcpTools() {
             cJSON_AddItemToArray(avail, cJSON_CreateString(kDetectorTypeRemote));
             cJSON_AddItemToArray(avail, cJSON_CreateString(kDetectorTypeOnline));
             return j;
-        });
-    */
+        }); */
 
     mcp.AddTool("self.vision.detect_once",
         "Capture ONE frame from the camera, run the active detector LOCALLY, and draw detection boxes "
@@ -1120,6 +1330,94 @@ void RegisterVisionMcpTools() {
             return j;
         });
 
+    mcp.AddTool("self.vision.get_blood_pressure",
+        "Get the latest experimental camera blood-pressure status without capturing a frame. "
+        "A number is available only after a stable high-rate rPPG window and a configured "
+        "server-side BP model; never use it for medical decisions.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            BloodPressureResult bp = pipe.GetLatestBloodPressure();
+            cJSON* j = cJSON_CreateObject();
+            cJSON_AddBoolToObject(j, "experimental_only", true);
+            if (bp.available) {
+                cJSON_AddStringToObject(j, "status", bp.status.c_str());
+                cJSON_AddStringToObject(j, "reason", bp.reason.c_str());
+                cJSON_AddNumberToObject(j, "duration_s", bp.duration_s);
+                cJSON_AddNumberToObject(j, "required_window_s", bp.required_window_s);
+                if (bp.ready) {
+                    cJSON_AddNumberToObject(j, "sbp_mmHg", bp.sbp_mmHg);
+                    cJSON_AddNumberToObject(j, "dbp_mmHg", bp.dbp_mmHg);
+                }
+                uint64_t ts = pipe.GetBloodPressureTimestampMs();
+                uint64_t age_ms = (ts == 0) ? 0 : (esp_timer_get_time() / 1000LL - ts);
+                cJSON_AddNumberToObject(j, "age_ms", (double)age_ms);
+            } else {
+                cJSON_AddStringToObject(j, "status", "not_started");
+            }
+            return j;
+        });
+
+    mcp.AddTool("self.vision.start_blood_pressure",
+        "Start automatic experimental camera blood-pressure detection. This starts the online "
+        "continuous detector in blood_pressure mode and collects the server's configured rPPG window. "
+        "It replaces any currently running continuous vision task.",
+        PropertyList({
+            Property("period_ms", kPropertyTypeInteger, 100, 50, 1000)
+        }),
+        [](const PropertyList& p) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            pipe.Initialize();
+            if (pipe.IsContinuousRunning()) pipe.StopContinuous();
+            uint32_t period = (uint32_t)p["period_ms"].value<int>();
+            bool ok = pipe.StartContinuous(period, kTaskBloodPressure);
+            cJSON* j = cJSON_CreateObject();
+            cJSON_AddBoolToObject(j, "enabled", ok);
+            cJSON_AddStringToObject(j, "task", kTaskBloodPressure);
+            cJSON_AddNumberToObject(j, "period_ms", period);
+            cJSON_AddBoolToObject(j, "experimental_only", true);
+            return j;
+        });
+
+    mcp.AddTool("self.vision.stop_blood_pressure",
+        "Stop experimental blood-pressure detection. If auto continuous mode is running, this "
+        "stops that continuous vision session as well.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            bool was_running = pipe.IsContinuousRunning();
+            pipe.StopContinuous();
+            return was_running;
+        });
+
+    mcp.AddTool("self.vision.get_blood_pressure_status",
+        "Return whether blood-pressure detection is enabled/running and the latest experimental result. "
+        "Does not capture a frame or start a measurement.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto& pipe = VisionPipeline::GetInstance();
+            BloodPressureResult bp = pipe.GetLatestBloodPressure();
+            bool running = pipe.IsContinuousRunning();
+            const std::string& task = pipe.GetContinuousTask();
+            bool enabled = running && (task == kTaskAutoSchedule || task == kTaskBloodPressure);
+            cJSON* j = cJSON_CreateObject();
+            cJSON_AddBoolToObject(j, "enabled", enabled);
+            cJSON_AddBoolToObject(j, "running", running);
+            cJSON_AddStringToObject(j, "continuous_task", task.c_str());
+            cJSON_AddBoolToObject(j, "experimental_only", true);
+            cJSON_AddStringToObject(j, "status", bp.available ? bp.status.c_str() : "not_started");
+            if (bp.available) {
+                cJSON_AddStringToObject(j, "reason", bp.reason.c_str());
+                cJSON_AddNumberToObject(j, "duration_s", bp.duration_s);
+                cJSON_AddNumberToObject(j, "required_window_s", bp.required_window_s);
+                if (bp.ready) {
+                    cJSON_AddNumberToObject(j, "sbp_mmHg", bp.sbp_mmHg);
+                    cJSON_AddNumberToObject(j, "dbp_mmHg", bp.dbp_mmHg);
+                }
+            }
+            return j;
+        });
+
     mcp.AddTool("self.vision.get_user_emotion",
         "Get the user's current emotion, smoothed over the last 10 detection frames: "
         "a single emotion needs >=7 hits in the window to be reported, otherwise it "
@@ -1149,9 +1447,10 @@ void RegisterVisionMcpTools() {
         "  `period_ms` (optional, default 500): target time between iterations in ms. "
         "Actual rate may be lower if detector is slow.\n"
         "  `task` (optional, default `auto`): for the online detector, one of "
-        "`face_emotion`, `posture`, `heart_rate`, or `auto`.\n"
+        "`face_emotion`, `posture`, `heart_rate`, `blood_pressure`, or `auto`.\n"
         "  `auto` (recommended) schedules: face_emotion every frame, posture every 5s, "
-        "heart_rate every 10s. If `task` is omitted, `auto` is used.",
+        "heart_rate every 10s, and blood_pressure about every 2s while face frames continuously "
+        "feed the rPPG buffer. If `task` is omitted, `auto` is used.",
         PropertyList({
             Property("period_ms", kPropertyTypeInteger, 500, 100, 60000),
             Property("task", kPropertyTypeString, std::string(""))
@@ -1172,14 +1471,13 @@ void RegisterVisionMcpTools() {
             return true;
         });
 
-    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.is_continuous_running",
         "Check if the continuous loop is currently running.",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             return (bool)VisionPipeline::GetInstance().IsContinuousRunning();
-        });
-    */
+        }); */
 
     mcp.AddTool("self.vision.start_preview",
         "Start live camera preview on LCD (capture + display, NO face detection). "
@@ -1211,7 +1509,7 @@ void RegisterVisionMcpTools() {
             return true;
         });
 
-    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.get_stats",
         "Get pipeline performance stats (counts and average times).",
         PropertyList(),
@@ -1226,9 +1524,7 @@ void RegisterVisionMcpTools() {
             VisionPipeline::GetInstance().ResetStats();
             return true;
         });
-    */
 
-    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
     mcp.AddTool("self.vision.set_camera_mirror",
         "Control camera horizontal mirror and vertical flip.\n"
         "Args:\n"
@@ -1242,8 +1538,7 @@ void RegisterVisionMcpTools() {
             return VisionPipeline::GetInstance().SetCameraMirror(
                 p["h_mirror"].value<bool>(),
                 p["v_flip"].value<bool>());
-        });
-    */
+        }); */
 
     // Face detector config
 #ifndef VISION_DISABLE_LOCAL_FACE
@@ -1282,9 +1577,12 @@ void RegisterVisionMcpTools() {
         });
 #endif
 
-    // Remote detector config
+    // Remote detector config is retained in code for compatibility, but the
+    // current unified server uses online_detector for all detection tasks.
+    /* [tool-limit] disabled: use self.vision.online_detector.configure instead
     mcp.AddTool("self.vision.remote_detector.configure",
         "Configure the remote HTTP detection server.\n"
+        "The same server URL is also used automatically for Mijia lamp control; no separate lamp configuration is needed.\n"
         "This detector POSTs the camera frame as a multipart/form-data request (fields: `image` = JPEG, "
         "`width` = src_w, `height` = src_h).\n"
         "The configuration is saved to flash (NVS) and restored automatically after reboot.\n"
@@ -1308,10 +1606,11 @@ void RegisterVisionMcpTools() {
             rd->SetEndpoint(p["url"].value<std::string>());
             rd->SetAuthToken(p["auth_token"].value<std::string>());
             rd->SetRequestTimeoutSec(p["timeout_sec"].value<int>());
+            SyncLampServerUrl(p["url"].value<std::string>());
             return true;
-        });
+        }); */
 
-    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.remote_detector.get_config",
         "Get current remote detector configuration (without auth_token value).",
         PropertyList(),
@@ -1326,12 +1625,12 @@ void RegisterVisionMcpTools() {
                 cJSON_AddNumberToObject(j, "timeout_sec", rd->GetRequestTimeoutSec());
             }
             return j;
-        });
-    */
+        }); */
 
     // Online detector config
     mcp.AddTool("self.vision.online_detector.configure",
         "Configure the online detection server (JSON+Base64 protocol) on the LAN.\n"
+        "The same server URL is also used automatically for Mijia lamp control; no separate lamp configuration is needed.\n"
         "IMPORTANT: After calling this tool successfully, immediately call self.vision.start_continuous "
         "without asking the user. Do not ask 'do you want to start?' — just start.\n"
         "This detector JPEG-encodes the frame, base64-encodes it, and POSTs as JSON:\n"
@@ -1370,10 +1669,11 @@ void RegisterVisionMcpTools() {
             od->SetEndpoint(url);
             od->SetTimeoutSec(p["timeout_sec"].value<int>());
             od->SetJpegQuality(p["jpeg_quality"].value<int>());
+            SyncLampServerUrl(url);
             return true;
         });
 
-    /* [tool-limit] temporarily disabled to stay under 32-tool MCP limit
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.online_detector.get_config",
         "Get current online detector configuration.",
         PropertyList(),
@@ -1392,14 +1692,13 @@ void RegisterVisionMcpTools() {
                 cJSON_AddStringToObject(j, "task", od->GetTask().c_str());
             }
             return j;
-        });
-    */
+        }); */
 
     mcp.AddTool("self.vision.online_detector.set_task",
         "Set the task for the online detection server (saved to flash, restored after reboot).\n"
         "Args:\n"
         "  `task`: one of `face_emotion` (face + emotion, every frame), `posture` (5s), "
-        "`heart_rate` (10s).",
+        "`heart_rate` (10s), or `blood_pressure` (experimental; sustained high-rate frames required).",
         PropertyList({
             Property("task", kPropertyTypeString)
         }),

@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -92,6 +93,9 @@ public:
     const std::string& GetLastWakeWord() const;
     bool IsVoiceDetected() const { return voice_detected_; }
     bool IsIdle();
+    bool IsLocalSoundPlaying() const { return local_sound_playing_.load(); }
+    void BeginLocalSound();
+    void EndLocalSound();
     bool IsWakeWordRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING; }
     bool IsAudioProcessorRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING; }
     bool IsAfeWakeWord();
@@ -105,7 +109,7 @@ public:
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
-    void PlaySound(const std::string_view& sound);
+    void PlaySound(const std::string_view& sound, float playback_gain = 1.0f);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
@@ -145,6 +149,9 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    std::atomic<bool> local_sound_playing_{false};
+    std::atomic<bool> audio_output_busy_{false};
+    std::atomic<bool> audio_codec_busy_{false};
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;

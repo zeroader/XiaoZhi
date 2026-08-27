@@ -10,6 +10,8 @@
 
 #include <atomic>
 #include <memory>
+#include <deque>
+#include <string>
 
 #define PREVIEW_IMAGE_DURATION_MS 30000
 
@@ -30,8 +32,36 @@ protected:
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
+    lv_obj_t* vision_dashboard_ = nullptr;
+    lv_obj_t* vision_background_view_ = nullptr;
+    lv_obj_t* vision_heart_label_ = nullptr;
+    lv_obj_t* vision_pressure_label_ = nullptr;
+    lv_obj_t* vision_posture_label_ = nullptr;
+    lv_obj_t* vision_emotion_label_ = nullptr;
+    lv_obj_t* vision_heart_icon_ = nullptr;
+    lv_obj_t* vision_pressure_icon_ = nullptr;
+    lv_obj_t* vision_posture_icon_ = nullptr;
+    lv_obj_t* vision_emotion_image_ = nullptr;
+    lv_obj_t* vision_posture_image_ = nullptr;
+    lv_obj_t* vision_posture_cartoon_ = nullptr;
+    lv_obj_t* vision_heart_panel_ = nullptr;
+    lv_obj_t* vision_pressure_panel_ = nullptr;
+    lv_obj_t* vision_posture_panel_ = nullptr;
+    lv_obj_t* vision_emotion_panel_ = nullptr;
+    bool vision_hr_alert_active_ = false;
+    bool vision_bp_alert_active_ = false;
+    bool vision_posture_alert_active_ = false;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+    // LVGL/SPI may still reference a previous image after lv_image_set_src().
+    // Retain a short history so its PSRAM buffer is not freed during DMA.
+    std::deque<std::unique_ptr<LvglImage>> vision_frame_history_;
+    std::deque<std::unique_ptr<LvglImage>> vision_asset_history_;
+    std::unique_ptr<LvglImage> vision_background_image_ = nullptr;
+    std::unique_ptr<LvglImage> vision_posture_asset_image_ = nullptr;
+    std::unique_ptr<LvglImage> vision_emotion_asset_image_ = nullptr;
+    std::string vision_posture_asset_name_;
+    std::string vision_emotion_asset_name_;
 
     void InitializeLcdThemes();
     void SetupUI();
@@ -47,6 +77,8 @@ public:
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetChatMessage(const char* role, const char* content) override; 
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
+    virtual void SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
+                                       const DetectionResult& result) override;
 
     // Add theme switching function
     virtual void SetTheme(Theme* theme) override;

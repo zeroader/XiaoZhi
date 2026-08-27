@@ -14,12 +14,199 @@
 #include <cstring>
 
 #include "board.h"
+#include "assets.h"
+#include "vision/detector.h"
 
 #define TAG "LcdDisplay"
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_awesome_30_4);
+
+static void StartVisionAlertAnimation(lv_obj_t* object) {
+    lv_obj_set_style_bg_opa(object, LV_OPA_COVER, 0);
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, object);
+    lv_anim_set_values(&animation, LV_OPA_30, LV_OPA_COVER);
+    lv_anim_set_duration(&animation, 650);
+    lv_anim_set_playback_duration(&animation, 650);
+    lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_exec_cb(&animation, [](void* var, int32_t value) {
+        lv_obj_set_style_opa(static_cast<lv_obj_t*>(var), static_cast<lv_opa_t>(value), 0);
+    });
+    lv_anim_start(&animation);
+}
+
+static const char* EmotionLabelZh(const std::string& label) {
+    if (label == "happy") return "开心";
+    if (label == "sad") return "悲伤";
+    if (label == "angry") return "生气";
+    if (label == "fear") return "害怕";
+    if (label == "surprise") return "惊讶";
+    if (label == "disgust") return "厌恶";
+    if (label == "contempt") return "轻蔑";
+    if (label == "neutral") return "平静";
+    return label.empty() ? "等待检测" : label.c_str();
+}
+
+static const char* EmotionEmojiKey(const std::string& label) {
+    if (label == "happy") return "happy";
+    if (label == "sad") return "sad";
+    if (label == "angry") return "angry";
+    if (label == "surprise" || label == "fear") return "surprised";
+    if (label == "disgust") return "confused";
+    return "neutral";
+}
+
+static const char* EmotionAssetKey(const std::string& label) {
+    if (label == "angry" || label == "contempt" || label == "disgust" ||
+        label == "fear" || label == "happy" || label == "neutral" ||
+        label == "sad" || label == "surprise") return label.c_str();
+    return "neutral";
+}
+
+static void StopVisionAlertAnimation(lv_obj_t* object) {
+    lv_anim_delete(object, nullptr);
+    // Dashboard cards are transparent over the supplied artwork when normal.
+    lv_obj_set_style_opa(object, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(object, LV_OPA_TRANSP, 0);
+}
+
+static const lv_point_precise_t kVisionGoodPosturePoints[] = {
+    {26, 4}, {22, 8}, {26, 12}, {30, 8}, {26, 4},
+    {26, 12}, {26, 29}, {14, 48}, {26, 29}, {38, 48},
+    {26, 29}, {12, 22}, {40, 22}
+};
+
+static const lv_point_precise_t kVisionBadPosturePoints[] = {
+    {32, 4}, {28, 8}, {32, 12}, {36, 8}, {32, 4},
+    {32, 12}, {27, 29}, {13, 43}, {27, 29}, {37, 49},
+    {27, 29}, {12, 20}, {41, 25}
+};
+
+static void SetVisionPostureGraphic(lv_obj_t* object, bool bad) {
+    const auto* points = bad ? kVisionBadPosturePoints : kVisionGoodPosturePoints;
+    const uint32_t point_count = bad
+        ? sizeof(kVisionBadPosturePoints) / sizeof(kVisionBadPosturePoints[0])
+        : sizeof(kVisionGoodPosturePoints) / sizeof(kVisionGoodPosturePoints[0]);
+    lv_line_set_points(object, points, point_count);
+    lv_obj_set_style_line_color(object, bad ? lv_color_hex(0xE05663) : lv_color_hex(0x27A66A), 0);
+    lv_obj_set_style_line_width(object, 3, 0);
+    lv_obj_set_style_line_rounded(object, true, 0);
+}
+
+static void SetVisionEmojiImage(lv_obj_t* object, const LvglImage* image) {
+    if (image == nullptr || image->image_dsc() == nullptr) {
+        lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    const auto* dsc = image->image_dsc();
+    lv_image_set_src(object, dsc);
+    // Fit either the 32px or 64px built-in Twemoji into the narrow right tile.
+    const lv_coord_t max_size = 52;
+    if (dsc->header.w > 0 && dsc->header.h > 0) {
+        const lv_coord_t scale_w = max_size * 256 / dsc->header.w;
+        const lv_coord_t scale_h = max_size * 256 / dsc->header.h;
+        lv_image_set_scale(object, scale_w < scale_h ? scale_w : scale_h);
+    }
+    lv_obj_set_size(object, max_size, max_size);
+    lv_obj_align(object, LV_ALIGN_TOP_MID, 0, 5);
+    lv_obj_remove_flag(object, LV_OBJ_FLAG_HIDDEN);
+}
+
+static std::unique_ptr<LvglImage> LoadVisionAsset(const char* name) {
+    void* data = nullptr;
+    size_t size = 0;
+    if (!Assets::GetInstance().GetAssetData(name, data, size)) return nullptr;
+    return std::make_unique<LvglRawImage>(data, size);
+}
+
+static void SetLabelTextIfChanged(lv_obj_t* label, const char* text) {
+    if (label != nullptr && std::strcmp(lv_label_get_text(label), text) != 0) {
+        lv_label_set_text(label, text);
+    }
+}
+
+static bool LoadVisionDashboard(void*& data, size_t& size) {
+    const char* names[] = {"vision_dashboard_2.png", "vision_dashboard_1.png", "vision_dashboard.png"};
+    for (const char* name : names) {
+        if (Assets::GetInstance().GetAssetData(name, data, size)) {
+            ESP_LOGI(TAG, "Loaded vision dashboard asset: %s (%u bytes)", name, (unsigned)size);
+            return true;
+        }
+    }
+    ESP_LOGE(TAG, "No vision dashboard asset found in assets index");
+    return false;
+}
+
+static void StyleVisionCard(lv_obj_t* object, lv_color_t background, lv_color_t border,
+                            lv_coord_t radius = 10) {
+    lv_obj_set_style_bg_color(object, background, 0);
+    lv_obj_set_style_bg_opa(object, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(object, border, 0);
+    lv_obj_set_style_border_width(object, 2, 0);
+    lv_obj_set_style_radius(object, radius, 0);
+    lv_obj_set_style_pad_all(object, 2, 0);
+    lv_obj_set_style_shadow_width(object, 0, 0);
+}
+
+static lv_obj_t* CreateVisionPart(lv_obj_t* parent, lv_coord_t x, lv_coord_t y,
+                                  lv_coord_t width, lv_coord_t height,
+                                  lv_color_t color, lv_coord_t radius) {
+    lv_obj_t* part = lv_obj_create(parent);
+    lv_obj_set_size(part, width, height);
+    lv_obj_set_pos(part, x, y);
+    lv_obj_set_style_bg_color(part, color, 0);
+    lv_obj_set_style_bg_opa(part, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(part, 0, 0);
+    lv_obj_set_style_radius(part, radius, 0);
+    lv_obj_set_style_pad_all(part, 0, 0);
+    return part;
+}
+
+static void CreateVisionBear(lv_obj_t* parent) {
+    lv_obj_t* bear = lv_obj_create(parent);
+    lv_obj_set_size(bear, 25, 24);
+    lv_obj_set_pos(bear, 2, 0);
+    lv_obj_set_style_bg_opa(bear, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bear, 0, 0);
+    lv_obj_set_style_pad_all(bear, 0, 0);
+    const lv_color_t brown = lv_color_hex(0xB86B35);
+    const lv_color_t face = lv_color_hex(0xFFE1AF);
+    CreateVisionPart(bear, 2, 1, 8, 8, brown, LV_RADIUS_CIRCLE);
+    CreateVisionPart(bear, 15, 1, 8, 8, brown, LV_RADIUS_CIRCLE);
+    CreateVisionPart(bear, 4, 4, 18, 18, brown, LV_RADIUS_CIRCLE);
+    CreateVisionPart(bear, 8, 10, 10, 7, face, LV_RADIUS_CIRCLE);
+    CreateVisionPart(bear, 8, 8, 3, 3, lv_color_hex(0x3A251C), LV_RADIUS_CIRCLE);
+    CreateVisionPart(bear, 15, 8, 3, 3, lv_color_hex(0x3A251C), LV_RADIUS_CIRCLE);
+}
+
+static lv_obj_t* CreateVisionPostureCartoon(lv_obj_t* parent) {
+    lv_obj_t* art = lv_obj_create(parent);
+    lv_obj_set_size(art, 68, 70);
+    lv_obj_align(art, LV_ALIGN_TOP_MID, 0, 3);
+    lv_obj_set_style_bg_opa(art, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(art, 0, 0);
+    lv_obj_set_style_pad_all(art, 0, 0);
+
+    // A small seated character behind the live posture skeleton.
+    const lv_color_t skin = lv_color_hex(0xFFD09C);
+    const lv_color_t hair = lv_color_hex(0x6C351D);
+    const lv_color_t shirt = lv_color_hex(0xFFC34D);
+    const lv_color_t chair = lv_color_hex(0x76A9D6);
+    CreateVisionPart(art, 5, 30, 5, 30, chair, 3);
+    CreateVisionPart(art, 9, 53, 43, 6, chair, 3);
+    CreateVisionPart(art, 26, 4, 16, 16, hair, LV_RADIUS_CIRCLE);
+    CreateVisionPart(art, 29, 7, 10, 10, skin, LV_RADIUS_CIRCLE);
+    CreateVisionPart(art, 25, 20, 18, 21, shirt, 6);
+    CreateVisionPart(art, 39, 28, 19, 5, skin, 3);
+    CreateVisionPart(art, 28, 40, 24, 7, lv_color_hex(0x315B9A), 3);
+    CreateVisionPart(art, 47, 44, 6, 21, skin, 3);
+    CreateVisionPart(art, 44, 62, 14, 5, lv_color_hex(0x25466F), 3);
+    return art;
+}
 
 void LcdDisplay::InitializeLcdThemes() {
     auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
@@ -130,7 +317,9 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
         .io_handle = panel_io_,
         .panel_handle = panel_,
         .control_handle = nullptr,
-        .buffer_size = static_cast<uint32_t>(width_ * 20),
+        // A 40-line DMA block halves the number of visible SPI refresh bands
+        // without consuming the internal RAM required by a full double buffer.
+        .buffer_size = static_cast<uint32_t>(width_ * 40),
         .double_buffer = false,
         .trans_size = 0,
         .hres = static_cast<uint32_t>(width_),
@@ -668,7 +857,24 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
         return;
     }
 
+    // Leave the vision dashboard before showing a normal chat image.  The
+    // preview object is temporarily parented to the video tile while sensing.
+    if (vision_dashboard_ != nullptr) {
+        lv_obj_add_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
+        if (preview_image_ != nullptr) {
+            lv_obj_set_parent(preview_image_, content_);
+            lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (status_bar_ != nullptr) {
+            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_grow(content_, 1);
+        lv_obj_set_size(content_, LV_HOR_RES, LV_SIZE_CONTENT);
+    }
+
     if (image == nullptr) {
+        preview_image_cached_.reset();
         return;
     }
     
@@ -745,7 +951,566 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     // Auto-scroll to the image bubble
     lv_obj_scroll_to_view_recursive(img_bubble, LV_ANIM_ON);
 }
+
+void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
+                                       const DetectionResult& result) {
+    // Conversation updates share this lock. Never let a busy UI stall camera
+    // capture: dropping one LCD frame is preferable to blocking the pipeline.
+    DisplayLockGuard lock(this, 1);
+    if (!lock) return;
+    if (content_ == nullptr || preview_image_ == nullptr || image == nullptr) return;
+
+    // Reset transient artwork before applying this frame.  The image objects
+    // are reused, so leaving one visible causes stale cards to flash over the
+    // next frame.
+
+    // The detection dashboard is a full-screen mode. Hide the normal status
+    // bar so Wi-Fi, battery and clock do not consume layout height.
+    if (status_bar_ != nullptr) {
+        lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    auto theme = static_cast<LvglTheme*>(current_theme_);
+    const lv_coord_t w = LV_HOR_RES;
+    const lv_coord_t h = LV_VER_RES;
+    const lv_coord_t left_w = std::max<lv_coord_t>(52, w / 6);
+    const lv_coord_t center_w = w - left_w * 2;
+    const lv_coord_t preview_w = (center_w - 8) * 9 / 10;
+    const lv_coord_t side_w = left_w + (center_w - preview_w) / 2;
+    const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
+    const lv_coord_t bottom_h = 30;
+    // The target panel is 320x240; keep the header compact.
+        const lv_coord_t title_h = 20;
+
+    lv_obj_set_layout(content_, LV_LAYOUT_NONE);
+    lv_obj_set_size(content_, w, h);
+
+    if (vision_dashboard_ == nullptr) {
+        vision_dashboard_ = lv_obj_create(content_);
+        lv_obj_set_scrollbar_mode(vision_dashboard_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_clear_flag(vision_dashboard_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(vision_dashboard_, w, h);
+        lv_obj_set_pos(vision_dashboard_, 0, 0);
+        lv_obj_set_style_pad_all(vision_dashboard_, 0, 0);
+        lv_obj_set_style_border_width(vision_dashboard_, 0, 0);
+        // Cartoon dashboard palette adapted from the reference image.
+        lv_obj_set_style_bg_color(vision_dashboard_, lv_color_white(), 0);
+        void* dashboard_data = nullptr;
+        size_t dashboard_size = 0;
+        if (LoadVisionDashboard(dashboard_data, dashboard_size)) {
+            vision_background_image_ = std::make_unique<LvglRawImage>(dashboard_data, dashboard_size);
+            vision_background_view_ = lv_image_create(vision_dashboard_);
+            lv_obj_clear_flag(vision_background_view_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_image_set_src(vision_background_view_, vision_background_image_->image_dsc());
+            lv_obj_set_size(vision_background_view_, w, h);
+            lv_obj_set_pos(vision_background_view_, 0, 0);
+        }
+        lv_obj_t* bottom_mask = lv_obj_create(vision_dashboard_);
+        lv_obj_set_size(bottom_mask, w, bottom_h);
+        lv_obj_set_pos(bottom_mask, 0, h - bottom_h);
+        lv_obj_set_style_bg_color(bottom_mask, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(bottom_mask, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(bottom_mask, 0, 0);
+        lv_obj_set_style_pad_all(bottom_mask, 0, 0);
+
+        auto panel = [&](lv_coord_t x, lv_coord_t y, lv_coord_t pw, lv_coord_t ph) {
+            lv_obj_t* p = lv_obj_create(vision_dashboard_);
+            lv_obj_set_size(p, pw, ph); lv_obj_set_pos(p, x, y);
+            lv_obj_set_scrollbar_mode(p, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_style_pad_all(p, 0, 0);
+            lv_obj_set_style_bg_color(p, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_border_width(p, 0, 0);
+            return p;
+        };
+        // Expand side cards into the existing preview margins.
+        const lv_coord_t video_w = (center_w - 8) * 9 / 10;
+        const lv_coord_t side_w = left_w + (center_w - video_w) / 2;
+        const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
+        vision_heart_panel_ = panel(0, 0, side_w, h / 2);
+        vision_pressure_panel_ = panel(0, h / 2, side_w, h - h / 2);
+        vision_posture_panel_ = panel(w - side_w, 0, side_w, h / 2);
+        vision_emotion_panel_ = panel(w - side_w, h / 2, side_w, h - h / 2);
+        StyleVisionCard(vision_heart_panel_, lv_color_hex(0xFFF5F7), lv_color_hex(0xFF8FA3));
+        StyleVisionCard(vision_pressure_panel_, lv_color_hex(0xF1F7FF), lv_color_hex(0x6EA7FF));
+        StyleVisionCard(vision_posture_panel_, lv_color_hex(0xF2FFF3), lv_color_hex(0x80D780));
+        StyleVisionCard(vision_emotion_panel_, lv_color_hex(0xFFF9E9), lv_color_hex(0xFFD16A));
+        for (auto* panel : {vision_heart_panel_, vision_pressure_panel_, vision_posture_panel_, vision_emotion_panel_}) {
+            lv_obj_set_style_bg_opa(panel, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(panel, 0, 0);
+            lv_obj_set_style_radius(panel, 0, 0);
+        }
+        vision_heart_icon_ = lv_label_create(vision_heart_panel_);
+        vision_pressure_icon_ = lv_label_create(vision_pressure_panel_);
+        vision_posture_cartoon_ = CreateVisionPostureCartoon(vision_posture_panel_);
+        vision_posture_icon_ = lv_line_create(vision_posture_panel_);
+        vision_posture_image_ = lv_image_create(vision_posture_panel_);
+        vision_emotion_image_ = lv_image_create(vision_emotion_panel_);
+        vision_heart_label_ = lv_label_create(vision_heart_panel_);
+        vision_pressure_label_ = lv_label_create(vision_pressure_panel_);
+        vision_posture_label_ = lv_label_create(vision_posture_panel_);
+        vision_emotion_label_ = lv_label_create(vision_emotion_panel_);
+        lv_obj_add_flag(vision_heart_icon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_pressure_icon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        for (auto* label : {vision_heart_label_, vision_pressure_label_, vision_posture_label_, vision_emotion_label_}) {
+            lv_obj_set_width(label, side_w - 4);
+            lv_obj_set_height(label, LV_SIZE_CONTENT);
+            lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -5);
+            lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_font(label, theme->text_font()->font(), 0);
+            lv_obj_set_style_text_color(label, lv_color_hex(0x243447), 0);
+            lv_obj_set_style_transform_zoom(label, 220, 0);
+            lv_obj_set_style_text_line_space(label, 2, 0);
+        }
+        // The common label setup above aligns labels to the bottom. Restore
+        // the intended fixed positions for the two numeric cards afterwards.
+        lv_obj_set_align(vision_heart_label_, LV_ALIGN_DEFAULT);
+        lv_obj_set_pos(vision_heart_label_, 14, 47);
+        lv_obj_set_width(vision_heart_label_, 44);
+        lv_obj_set_align(vision_pressure_label_, LV_ALIGN_DEFAULT);
+        lv_obj_set_pos(vision_pressure_label_, 2, 31);
+        lv_obj_set_width(vision_pressure_label_, 64);
+        lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
+        auto setup_icon = [&](lv_obj_t* icon, const char* glyph, lv_color_t color) {
+            lv_obj_set_width(icon, side_w);
+            lv_obj_set_height(icon, LV_SIZE_CONTENT);
+            lv_obj_set_style_text_font(icon, theme->large_icon_font()->font(), 0);
+            lv_obj_set_style_text_color(icon, color, 0);
+            lv_label_set_text(icon, glyph);
+            lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 8);
+        };
+        setup_icon(vision_heart_icon_, FONT_AWESOME_HEART, lv_color_hex(0xE53935));
+        // A static monitor pictogram keeps the blood-pressure card aligned
+        // with the reference design without competing with its value.
+        setup_icon(vision_pressure_icon_, FONT_AWESOME_CALCULATOR, lv_color_hex(0x4C8DFF));
+        lv_obj_set_style_text_font(vision_pressure_icon_, theme->large_icon_font()->font(), 0);
+        lv_obj_set_size(vision_posture_icon_, 52, 56);
+        lv_obj_align(vision_posture_icon_, LV_ALIGN_TOP_MID, 0, 5);
+        SetVisionPostureGraphic(vision_posture_icon_, false);
+        lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_size(vision_emotion_image_, 52, 52);
+        lv_obj_align(vision_emotion_image_, LV_ALIGN_TOP_MID, 0, 5);
+        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t* title_panel = panel(left_w, 0, center_w, title_h);
+        StyleVisionCard(title_panel, lv_color_hex(0xEAF4FF), lv_color_hex(0x3F8FE8), 7);
+        CreateVisionBear(title_panel);
+        lv_obj_t* title_label = lv_label_create(title_panel);
+        // Leave a clear gap after the bear so the title never overlaps it.
+        lv_obj_set_width(title_label, center_w - 36);
+        lv_label_set_long_mode(title_label, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_align(title_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(title_label, lv_color_hex(0x24507A), 0);
+        lv_obj_set_style_transform_zoom(title_label, 180, 0);
+        lv_label_set_text(title_label, "坐姿健康检测系统");
+        lv_obj_align(title_label, LV_ALIGN_RIGHT_MID, -3, 0);
+        // The supplied background already contains the final bear and title.
+        lv_obj_add_flag(title_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t* video_area = panel(left_w, title_h, center_w, h - title_h - bottom_h);
+        lv_obj_set_style_bg_opa(video_area, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(video_area, 0, 0);
+        lv_obj_set_parent(preview_image_, vision_dashboard_);
+        // Exact inner video window of the 320x240 artwork.
+        const lv_coord_t video_w = (center_w - 8) * 9 / 10;
+        const lv_coord_t video_h = std::min<lv_coord_t>(h - title_h - bottom_h - 8, video_w * 3 / 4);
+        lv_obj_set_size(preview_image_, video_w, video_h);
+        lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
+        lv_obj_set_pos(preview_image_, left_w + (center_w - video_w) / 2,
+                       title_h + (h - title_h - bottom_h - video_h) / 2);
+        lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_COVER);
+        lv_obj_set_style_radius(preview_image_, 0, 0);
+        if (chat_message_label_ != nullptr) {
+            lv_obj_set_parent(chat_message_label_, vision_dashboard_);
+            lv_obj_set_size(chat_message_label_, w - 8, bottom_h - 4);
+            lv_obj_set_pos(chat_message_label_, 4, h - bottom_h + 2);
+            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_color(chat_message_label_, lv_color_hex(0x24507A), 0);
+            lv_obj_set_style_bg_color(chat_message_label_, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(chat_message_label_, LV_OPA_COVER, 0);
+            lv_obj_set_style_pad_all(chat_message_label_, 2, 0);
+            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    char text[128];
+    // This label is refreshed on every preview frame; only the heart glyph
+    // is static.  Keep the live value inside the red heart as in the mockup.
+    if (result.heart_rate.available) {
+        snprintf(text, sizeof(text), "%.0f", result.heart_rate.bpm);
+        lv_label_set_text(vision_heart_label_, text);
+    } else {
+        lv_label_set_text(vision_heart_label_, "");
+    }
+    if (result.blood_pressure.available) {
+        snprintf(text, sizeof(text), "%.0f\n%.0f",
+                 result.blood_pressure.sbp_mmHg, result.blood_pressure.dbp_mmHg);
+        lv_label_set_text(vision_pressure_label_, text);
+    } else {
+        lv_label_set_text(vision_pressure_label_, "");
+    }
+    if (result.posture.available) {
+        bool posture_bad = result.posture.state == "bad_posture";
+        lv_obj_remove_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_align(vision_posture_label_, LV_ALIGN_TOP_MID, 0, 101);
+        lv_label_set_text(vision_posture_label_, posture_bad ? "\xE5\x9D\x90\xE5\xA7\xbf\xE4\xB8\x8D\xE6\xAD\xA3" : "\xE5\x9D\x90\xE5\xA7\xbf\xE7\AB\AF\xE6\xAD\xA3");
+        const char* posture_asset = posture_bad ? "vision_posture_incorrect.png" : "vision_posture_correct.png";
+        if (vision_posture_asset_name_ != posture_asset) {
+            auto posture_image = LoadVisionAsset(posture_asset);
+            if (posture_image != nullptr) {
+                lv_image_set_src(vision_posture_image_, posture_image->image_dsc());
+                if (vision_posture_asset_image_) {
+                    vision_asset_history_.push_back(std::move(vision_posture_asset_image_));
+                }
+                vision_posture_asset_image_ = std::move(posture_image);
+                vision_posture_asset_name_ = posture_asset;
+        lv_obj_set_size(vision_posture_image_, card_icon_w, 60);
+        lv_obj_set_align(vision_posture_image_, LV_ALIGN_TOP_MID);
+        lv_obj_set_pos(vision_posture_image_, 0, 25);
+                lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
+                lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (result.emotion.available) {
+        std::string emotion_asset_name = "vision_emotion_";
+        emotion_asset_name += EmotionAssetKey(result.emotion.label);
+        emotion_asset_name += ".png";
+        if (vision_emotion_asset_name_ != emotion_asset_name) {
+            auto emotion_image = LoadVisionAsset(emotion_asset_name.c_str());
+            if (emotion_image != nullptr) {
+                lv_image_set_src(vision_emotion_image_, emotion_image->image_dsc());
+                if (vision_emotion_asset_image_) {
+                    vision_asset_history_.push_back(std::move(vision_emotion_asset_image_));
+                }
+                vision_emotion_asset_image_ = std::move(emotion_image);
+                vision_emotion_asset_name_ = emotion_asset_name;
+        lv_obj_set_size(vision_emotion_image_, card_icon_w, 60);
+        lv_obj_set_align(vision_emotion_image_, LV_ALIGN_TOP_MID);
+        lv_obj_set_pos(vision_emotion_image_, 0, 25);
+                lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
+                lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(vision_emotion_label_, "");
+    }
+    lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
+    bool hr_alert = result.heart_rate.available && result.heart_rate.bpm > 120.0f;
+    bool bp_alert = result.blood_pressure.ready &&
+                    (result.blood_pressure.sbp_mmHg >= 140.0f ||
+                     result.blood_pressure.dbp_mmHg >= 90.0f);
+    bool posture_alert = result.posture.available && result.posture.state == "bad_posture";
+    if (false && hr_alert != vision_hr_alert_active_) {
+        vision_hr_alert_active_ = hr_alert;
+        lv_obj_set_style_bg_color(vision_heart_panel_, hr_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xFFF5F7), 0);
+        if (hr_alert) StartVisionAlertAnimation(vision_heart_panel_);
+        else StopVisionAlertAnimation(vision_heart_panel_);
+    }
+    if (false && bp_alert != vision_bp_alert_active_) {
+        vision_bp_alert_active_ = bp_alert;
+        lv_obj_set_style_bg_color(vision_pressure_panel_, bp_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xF1F7FF), 0);
+        if (bp_alert) StartVisionAlertAnimation(vision_pressure_panel_);
+        else StopVisionAlertAnimation(vision_pressure_panel_);
+    }
+    if (false && posture_alert != vision_posture_alert_active_) {
+        vision_posture_alert_active_ = posture_alert;
+        lv_obj_set_style_bg_color(vision_posture_panel_, posture_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xF2FFF3), 0);
+        if (posture_alert) StartVisionAlertAnimation(vision_posture_panel_);
+        else StopVisionAlertAnimation(vision_posture_panel_);
+    }
+    lv_color_t emotion_color = lv_color_hex(0x808080);
+    if (result.emotion.label == "happy") emotion_color = lv_color_hex(0x22AA55);
+    else if (result.emotion.label == "sad") emotion_color = lv_color_hex(0x3388CC);
+    else if (result.emotion.label == "angry") emotion_color = lv_color_hex(0xDD3333);
+    else if (result.emotion.label == "fear") emotion_color = lv_color_hex(0x9944CC);
+    else if (result.emotion.label == "surprise") emotion_color = lv_color_hex(0xEE9922);
+    lv_obj_set_style_text_color(vision_emotion_label_, emotion_color, 0);
+    // Re-assert the full-screen dashboard viewport on every camera frame.
+    lv_obj_set_parent(preview_image_, vision_dashboard_);
+    lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
+    const lv_coord_t video_w = preview_w;
+    const lv_coord_t video_h = std::min<lv_coord_t>(h - title_h - bottom_h - 8, video_w * 3 / 4);
+    lv_obj_set_size(preview_image_, video_w, video_h);
+    lv_obj_set_pos(preview_image_, side_w,
+                   title_h + (h - title_h - bottom_h - video_h) / 2);
+    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_src(preview_image_, image->image_dsc());
+    if (preview_image_cached_) {
+        vision_frame_history_.push_back(std::move(preview_image_cached_));
+        while (vision_frame_history_.size() > 8) vision_frame_history_.pop_front();
+    }
+    preview_image_cached_ = std::move(image);
+    // Keep the preview below the four information cards, but above the
+    // dashboard background image.
+    lv_obj_move_to_index(preview_image_, 1);
+    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    if (chat_message_label_ != nullptr) lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+}
 #else
+void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
+                                       const DetectionResult& result) {
+    // Conversation updates share this lock. Never let a busy UI stall camera
+    // capture: dropping one LCD frame is preferable to blocking the pipeline.
+    DisplayLockGuard lock(this, 1);
+    if (!lock) return;
+    if (!image || !content_ || !preview_image_) return;
+    if (status_bar_ != nullptr) {
+        lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+    }
+    const lv_coord_t w = LV_HOR_RES, h = LV_VER_RES;
+    const lv_coord_t th = 20;
+    const lv_coord_t bottom_h = 30;
+    const lv_coord_t lw = std::max<lv_coord_t>(52, w / 6);
+    const lv_coord_t cw = w - lw * 2;
+    const lv_coord_t preview_w = (cw - 8) * 9 / 10;
+    const lv_coord_t side_w = lw + (cw - preview_w) / 2;
+    const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
+    const bool entering_vision = vision_dashboard_ == nullptr ||
+                                 lv_obj_get_parent(preview_image_) != vision_dashboard_;
+    if (entering_vision) {
+        lv_obj_set_layout(content_, LV_LAYOUT_NONE);
+        lv_obj_set_size(content_, w, h);
+    }
+    if (!vision_dashboard_) {
+        vision_dashboard_ = lv_obj_create(content_);
+        lv_obj_set_scrollbar_mode(vision_dashboard_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_clear_flag(vision_dashboard_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(vision_dashboard_, w, h); lv_obj_set_style_pad_all(vision_dashboard_, 0, 0);
+        lv_obj_set_style_bg_color(vision_dashboard_, lv_color_white(), 0);
+        void* dashboard_data = nullptr;
+        size_t dashboard_size = 0;
+        if (LoadVisionDashboard(dashboard_data, dashboard_size)) {
+            vision_background_image_ = std::make_unique<LvglRawImage>(dashboard_data, dashboard_size);
+            vision_background_view_ = lv_image_create(vision_dashboard_);
+            lv_obj_clear_flag(vision_background_view_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_image_set_src(vision_background_view_, vision_background_image_->image_dsc());
+            lv_obj_set_size(vision_background_view_, w, h);
+            lv_obj_set_pos(vision_background_view_, 0, 0);
+        }
+        lv_obj_t* bottom_mask = lv_obj_create(vision_dashboard_);
+        lv_obj_set_size(bottom_mask, w, bottom_h);
+        lv_obj_set_pos(bottom_mask, 0, h - bottom_h);
+        lv_obj_set_style_bg_color(bottom_mask, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(bottom_mask, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(bottom_mask, 0, 0);
+        lv_obj_set_style_pad_all(bottom_mask, 0, 0);
+        auto p = [&](lv_coord_t x, lv_coord_t y, lv_coord_t pw, lv_coord_t ph) { lv_obj_t* o = lv_obj_create(vision_dashboard_); lv_obj_set_size(o, pw, ph); lv_obj_set_pos(o, x, y); lv_obj_set_scrollbar_mode(o, LV_SCROLLBAR_MODE_OFF); lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_style_pad_all(o, 0, 0); lv_obj_set_style_bg_color(o, lv_color_hex(0xFFFFFF), 0); lv_obj_set_style_border_width(o, 0, 0); return o; };
+        auto l = [&](lv_obj_t* o) { lv_obj_t* x = lv_label_create(o); lv_obj_center(x); lv_obj_set_style_text_align(x, LV_TEXT_ALIGN_CENTER, 0); return x; };
+        const lv_coord_t video_w = cw - 8;
+        const lv_coord_t side_w = lw + (cw - video_w) / 2;
+        const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
+        vision_heart_panel_ = p(0, 0, side_w, h / 2); vision_pressure_panel_ = p(0, h / 2, side_w, h - h / 2);
+        vision_heart_label_ = l(vision_heart_panel_); vision_pressure_label_ = l(vision_pressure_panel_);
+        vision_posture_panel_ = p(w - side_w, 0, side_w, h / 2); vision_posture_label_ = l(vision_posture_panel_);
+        vision_emotion_panel_ = p(w - side_w, h / 2, side_w, h - h / 2); vision_emotion_label_ = l(vision_emotion_panel_);
+        lv_obj_set_align(vision_heart_label_, LV_ALIGN_DEFAULT);
+        lv_obj_set_pos(vision_heart_label_, 14, 47);
+        lv_obj_set_width(vision_heart_label_, 44);
+        lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
+        lv_obj_set_align(vision_pressure_label_, LV_ALIGN_DEFAULT);
+        lv_obj_set_pos(vision_pressure_label_, 2, 31);
+        lv_obj_set_width(vision_pressure_label_, 64);
+        lv_obj_set_style_text_color(vision_pressure_label_, lv_color_hex(0x1267D6), 0);
+        vision_heart_icon_ = lv_label_create(vision_heart_panel_);
+        vision_pressure_icon_ = lv_label_create(vision_pressure_panel_);
+        vision_posture_cartoon_ = CreateVisionPostureCartoon(vision_posture_panel_);
+        vision_posture_icon_ = lv_line_create(vision_posture_panel_);
+        vision_posture_image_ = lv_image_create(vision_posture_panel_);
+        vision_emotion_image_ = lv_image_create(vision_emotion_panel_);
+        StyleVisionCard(vision_heart_panel_, lv_color_hex(0xFFF5F7), lv_color_hex(0xFF8FA3));
+        StyleVisionCard(vision_pressure_panel_, lv_color_hex(0xF1F7FF), lv_color_hex(0x6EA7FF));
+        StyleVisionCard(vision_posture_panel_, lv_color_hex(0xF2FFF3), lv_color_hex(0x80D780));
+        StyleVisionCard(vision_emotion_panel_, lv_color_hex(0xFFF9E9), lv_color_hex(0xFFD16A));
+        for (auto* panel : {vision_heart_panel_, vision_pressure_panel_, vision_posture_panel_, vision_emotion_panel_}) {
+            lv_obj_set_style_bg_opa(panel, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(panel, 0, 0);
+            lv_obj_set_style_radius(panel, 0, 0);
+        }
+        lv_obj_add_flag(vision_heart_icon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_pressure_icon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        for (auto* label : {vision_heart_label_, vision_pressure_label_, vision_posture_label_, vision_emotion_label_}) {
+            lv_obj_set_width(label, side_w - 4);
+            lv_obj_set_height(label, LV_SIZE_CONTENT);
+            lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -5);
+            lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_font(label, static_cast<LvglTheme*>(current_theme_)->text_font()->font(), 0);
+            lv_obj_set_style_text_color(label, lv_color_hex(0x243447), 0);
+            lv_obj_set_style_transform_zoom(label, 220, 0);
+            lv_obj_set_style_text_line_space(label, 2, 0);
+        }
+        // The common label setup above aligns labels to the bottom. Restore
+        // the intended fixed positions for the two numeric cards afterwards.
+        lv_obj_set_align(vision_heart_label_, LV_ALIGN_DEFAULT);
+        lv_obj_set_pos(vision_heart_label_, 14, 47);
+        lv_obj_set_width(vision_heart_label_, 44);
+        lv_obj_set_align(vision_pressure_label_, LV_ALIGN_DEFAULT);
+        lv_obj_set_pos(vision_pressure_label_, 2, 31);
+        lv_obj_set_width(vision_pressure_label_, 64);
+        lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
+        auto setup_icon = [&](lv_obj_t* icon, const char* glyph, lv_color_t color) {
+            lv_obj_set_width(icon, side_w);
+            lv_obj_set_height(icon, LV_SIZE_CONTENT);
+            lv_obj_set_style_text_font(icon, static_cast<LvglTheme*>(current_theme_)->large_icon_font()->font(), 0);
+            lv_obj_set_style_text_color(icon, color, 0);
+            lv_label_set_text(icon, glyph);
+            lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 8);
+        };
+        setup_icon(vision_heart_icon_, FONT_AWESOME_HEART, lv_color_hex(0xE53935));
+        setup_icon(vision_pressure_icon_, FONT_AWESOME_CALCULATOR, lv_color_hex(0x4C8DFF));
+        lv_obj_set_style_text_font(vision_pressure_icon_, static_cast<LvglTheme*>(current_theme_)->large_icon_font()->font(), 0);
+        lv_obj_set_size(vision_posture_icon_, 52, 56);
+        lv_obj_align(vision_posture_icon_, LV_ALIGN_TOP_MID, 0, 5);
+        SetVisionPostureGraphic(vision_posture_icon_, false);
+        lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_size(vision_emotion_image_, 52, 52);
+        lv_obj_align(vision_emotion_image_, LV_ALIGN_TOP_MID, 0, 5);
+        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t* title = l(p(lw, 0, cw, th));
+        StyleVisionCard(lv_obj_get_parent(title), lv_color_hex(0xEAF4FF), lv_color_hex(0x3F8FE8), 7);
+        CreateVisionBear(lv_obj_get_parent(title));
+        // Leave a clear gap after the bear so the title never overlaps it.
+        lv_obj_set_width(title, cw - 36);
+        lv_label_set_long_mode(title, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_color(title, lv_color_hex(0x24507A), 0);
+        lv_obj_set_style_transform_zoom(title, 180, 0);
+        lv_label_set_text(title, "坐姿健康检测系统");
+        lv_obj_align(title, LV_ALIGN_RIGHT_MID, -3, 0);
+        lv_obj_add_flag(lv_obj_get_parent(title), LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t* video = p(lw, th, cw, h - th - bottom_h);
+        lv_obj_set_style_bg_opa(video, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(video, 0, 0);
+        lv_obj_set_parent(preview_image_, vision_dashboard_);
+        const lv_coord_t video_h = std::min<lv_coord_t>(h - th - bottom_h - 8, video_w * 3 / 4);
+        lv_obj_set_size(preview_image_, video_w, video_h);
+        lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
+        lv_obj_set_pos(preview_image_, side_w, th + (h - th - bottom_h - video_h) / 2);
+        lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_COVER);
+        if (chat_message_label_ != nullptr) {
+            lv_obj_set_parent(chat_message_label_, vision_dashboard_);
+            lv_obj_set_size(chat_message_label_, w - 8, bottom_h - 4);
+            lv_obj_set_pos(chat_message_label_, 4, h - bottom_h + 2);
+            lv_obj_set_style_bg_color(chat_message_label_, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(chat_message_label_, LV_OPA_COVER, 0);
+            lv_obj_set_style_pad_all(chat_message_label_, 2, 0);
+            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_color(chat_message_label_, lv_color_hex(0x24507A), 0);
+            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    char buf[96];
+    if (result.heart_rate.available) {
+        snprintf(buf, sizeof(buf), "%.0f", result.heart_rate.bpm);
+        SetLabelTextIfChanged(vision_heart_label_, buf);
+    } else {
+        SetLabelTextIfChanged(vision_heart_label_, "");
+    }
+    if (result.blood_pressure.available) {
+        snprintf(buf, sizeof(buf), "%.0f\n%.0f",
+                 result.blood_pressure.sbp_mmHg, result.blood_pressure.dbp_mmHg);
+        SetLabelTextIfChanged(vision_pressure_label_, buf);
+    } else {
+        SetLabelTextIfChanged(vision_pressure_label_, "");
+    }
+    if (result.posture.available) {
+        bool posture_bad = result.posture.state == "bad_posture";
+        const char* posture_asset = posture_bad ? "vision_posture_incorrect.png" : "vision_posture_correct.png";
+        if (vision_posture_asset_name_ != posture_asset) {
+            auto posture_image = LoadVisionAsset(posture_asset);
+            if (posture_image != nullptr) {
+                lv_image_set_src(vision_posture_image_, posture_image->image_dsc());
+                if (vision_posture_asset_image_) {
+                    vision_asset_history_.push_back(std::move(vision_posture_asset_image_));
+                }
+                vision_posture_asset_image_ = std::move(posture_image);
+                vision_posture_asset_name_ = posture_asset;
+                lv_obj_set_size(vision_posture_image_, card_icon_w, 60);
+                lv_obj_set_align(vision_posture_image_, LV_ALIGN_TOP_MID);
+                lv_obj_set_pos(vision_posture_image_, 0, 25);
+                lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
+                lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (result.emotion.available) {
+        std::string emotion_asset_name = "vision_emotion_";
+        emotion_asset_name += EmotionAssetKey(result.emotion.label);
+        emotion_asset_name += ".png";
+        if (vision_emotion_asset_name_ != emotion_asset_name) {
+            auto emotion_image = LoadVisionAsset(emotion_asset_name.c_str());
+            if (emotion_image != nullptr) {
+                lv_image_set_src(vision_emotion_image_, emotion_image->image_dsc());
+                if (vision_emotion_asset_image_) {
+                    vision_asset_history_.push_back(std::move(vision_emotion_asset_image_));
+                }
+                vision_emotion_asset_image_ = std::move(emotion_image);
+                vision_emotion_asset_name_ = emotion_asset_name;
+                lv_obj_set_size(vision_emotion_image_, card_icon_w, 60);
+                lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
+                lv_obj_set_pos(vision_emotion_image_, 0, 25);
+                lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
+                lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(vision_emotion_label_, "");
+    }
+    // Keep visual cards stable. Health warnings are spoken by main's fixed
+    // voice-alert path; the dashboard must not flash or change layers.
+    lv_color_t emotion_color = lv_color_hex(0x808080);
+    if (result.emotion.label == "happy") emotion_color = lv_color_hex(0x22AA55);
+    else if (result.emotion.label == "sad") emotion_color = lv_color_hex(0x3388CC);
+    else if (result.emotion.label == "angry") emotion_color = lv_color_hex(0xDD3333);
+    else if (result.emotion.label == "fear") emotion_color = lv_color_hex(0x9944CC);
+    else if (result.emotion.label == "surprise") emotion_color = lv_color_hex(0xEE9922);
+    lv_obj_set_style_text_color(vision_emotion_label_, emotion_color, 0);
+    const lv_coord_t video_w = preview_w;
+    const lv_coord_t video_h = std::min<lv_coord_t>(h - th - bottom_h - 8, video_w * 3 / 4);
+    if (lv_obj_get_parent(preview_image_) != vision_dashboard_) {
+        lv_obj_set_parent(preview_image_, vision_dashboard_);
+        lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
+        lv_obj_set_size(preview_image_, video_w, video_h);
+        lv_obj_set_pos(preview_image_, side_w, th + (h - th - bottom_h - video_h) / 2);
+        lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_COVER);
+        lv_obj_move_to_index(preview_image_, 1);
+    }
+    lv_image_set_src(preview_image_, image->image_dsc());
+    if (preview_image_cached_) {
+        vision_frame_history_.push_back(std::move(preview_image_cached_));
+        while (vision_frame_history_.size() > 8) vision_frame_history_.pop_front();
+    }
+    preview_image_cached_ = std::move(image);
+    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+}
+
 void LcdDisplay::SetupUI() {
     DisplayLockGuard lock(this);
     LvglTheme* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
@@ -876,7 +1641,24 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 
     if (image == nullptr) {
         esp_timer_stop(preview_timer_);
+        if (status_bar_ != nullptr) {
+            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (vision_dashboard_ != nullptr) {
+            lv_obj_add_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_set_parent(preview_image_, content_);
+        if (chat_message_label_ != nullptr) {
+            lv_obj_set_parent(chat_message_label_, content_);
+            lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_set_size(preview_image_, width_ / 2, height_ / 2);
+        lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_grow(content_, 1);
+        lv_obj_set_size(content_, LV_HOR_RES, LV_SIZE_CONTENT);
         lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
         preview_image_cached_.reset();
         if (gif_controller_) {
@@ -886,6 +1668,16 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     }
 
     preview_image_cached_ = std::move(image);
+    if (vision_dashboard_ != nullptr) {
+        lv_obj_add_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_parent(preview_image_, content_);
+        if (status_bar_ != nullptr) {
+            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_grow(content_, 1);
+        lv_obj_set_size(content_, LV_HOR_RES, LV_SIZE_CONTENT);
+    }
     auto img_dsc = preview_image_cached_->image_dsc();
     // 设置图片源并显示预览图片
     lv_image_set_src(preview_image_, img_dsc);

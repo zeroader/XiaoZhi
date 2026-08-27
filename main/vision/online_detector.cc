@@ -265,7 +265,7 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
         return result;
     }
 
-    // 表单字段：frame_id / task / calibrate / width / height
+    // 表单字段：frame_id / task / capture_timestamp_ms / calibrate / width / height
     std::string meta_header;
     meta_header += "--" + boundary + "\r\n";
     meta_header += "Content-Disposition: form-data; name=\"frame_id\"\r\n\r\n";
@@ -273,6 +273,9 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
     meta_header += "--" + boundary + "\r\n";
     meta_header += "Content-Disposition: form-data; name=\"task\"\r\n\r\n";
     meta_header += task_ + "\r\n";
+    meta_header += "--" + boundary + "\r\n";
+    meta_header += "Content-Disposition: form-data; name=\"capture_timestamp_ms\"\r\n\r\n";
+    meta_header += std::to_string((uint64_t)(total_start / 1000LL)) + "\r\n";
     if (calibrate_once_ && task_ == kTaskPosture) {
         meta_header += "--" + boundary + "\r\n";
         meta_header += "Content-Disposition: form-data; name=\"calibrate\"\r\n\r\n";
@@ -413,7 +416,7 @@ bool OnlineDetector::ParseResponse(const std::string& json_str, DetectionResult&
 
         // heart_rate: {bpm, confidence, fs, frames_used} 或 {error}
         cJSON* bpm = cJSON_GetObjectItem(result_obj, "bpm");
-        if (bpm != nullptr && cJSON_IsNumber(bpm)) {
+        if (result.task == kTaskHeartRate && bpm != nullptr && cJSON_IsNumber(bpm)) {
             result.heart_rate.available = true;
             result.heart_rate.bpm = (float)bpm->valuedouble;
             cJSON* hconf = cJSON_GetObjectItem(result_obj, "confidence");
@@ -422,9 +425,35 @@ bool OnlineDetector::ParseResponse(const std::string& json_str, DetectionResult&
             if (fs) result.heart_rate.fs = (float)fs->valuedouble;
             cJSON* fu = cJSON_GetObjectItem(result_obj, "frames_used");
             if (fu) result.heart_rate.frames_used = fu->valueint;
-        } else {
+        } else if (result.task == kTaskHeartRate) {
             cJSON* herr = cJSON_GetObjectItem(result_obj, "error");
             if (herr && cJSON_IsString(herr)) result.heart_rate.error_message = herr->valuestring;
+        }
+
+        if (result.task == kTaskBloodPressure) {
+            result.blood_pressure.available = true;
+            cJSON* status = cJSON_GetObjectItem(result_obj, "status");
+            if (status && cJSON_IsString(status)) result.blood_pressure.status = status->valuestring;
+            cJSON* quality = cJSON_GetObjectItem(result_obj, "quality");
+            if (quality && cJSON_IsObject(quality)) {
+                cJSON* value = cJSON_GetObjectItem(quality, "duration_s");
+                if (value && cJSON_IsNumber(value)) result.blood_pressure.duration_s = (float)value->valuedouble;
+                value = cJSON_GetObjectItem(quality, "required_window_s");
+                if (value && cJSON_IsNumber(value)) result.blood_pressure.required_window_s = (float)value->valuedouble;
+                value = cJSON_GetObjectItem(quality, "reason");
+                if (value && cJSON_IsString(value)) result.blood_pressure.reason = value->valuestring;
+            }
+            cJSON* sbp = cJSON_GetObjectItem(result_obj, "sbp_mmHg");
+            cJSON* dbp = cJSON_GetObjectItem(result_obj, "dbp_mmHg");
+            if (sbp && dbp && cJSON_IsNumber(sbp) && cJSON_IsNumber(dbp)) {
+                result.blood_pressure.sbp_mmHg = (float)sbp->valuedouble;
+                result.blood_pressure.dbp_mmHg = (float)dbp->valuedouble;
+                result.blood_pressure.ready = true;
+            }
+            if (result.blood_pressure.reason.empty()) {
+                cJSON* error = cJSON_GetObjectItem(result_obj, "error");
+                if (error && cJSON_IsString(error)) result.blood_pressure.reason = error->valuestring;
+            }
         }
 
         cJSON_Delete(json);
@@ -494,7 +523,8 @@ void OnlineDetector::SetJpegQuality(int quality) {
 }
 
 void OnlineDetector::SetTask(const std::string& task) {
-    if (task != kTaskFaceEmotion && task != kTaskPosture && task != kTaskHeartRate) {
+    if (task != kTaskFaceEmotion && task != kTaskPosture && task != kTaskHeartRate &&
+        task != kTaskBloodPressure) {
         ESP_LOGW(TAG, "Unknown task '%s', ignoring", task.c_str());
         return;
     }

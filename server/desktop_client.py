@@ -4,12 +4,13 @@ PC 桌面端测试客户端（模拟 ESP32 的调度行为）
 功能:
   - 调用本机摄像头 (默认 index 0)
   - 按协议把 JPEG 发给生物感知服务器 (POST /detect)
-  - cv2.imshow 叠加显示: 人脸框 + 情绪标签 / pose 关键点骨架 / 心率数值 / 姿态状态
+  - cv2.imshow 叠加显示: 人脸框 + 情绪标签 / pose 关键点骨架 / 心率 / 姿态 / 实验性血压状态
 
 调度（由本客户端控制频率，服务器不做任何定时任务）:
   - face_emotion  每帧
   - posture       每 5 秒
   - heart_rate    每 10 秒
+  - blood_pressure 每 2 秒查询一次；服务器从连续上传的帧累积 7 秒 rPPG 窗口
 
 用法:
   python desktop_client.py --url http://127.0.0.1:8291/detect --camera 0
@@ -40,6 +41,7 @@ POSE_SKELETON = [
 
 POSTURE_INTERVAL = 5.0    # 坐姿请求间隔（秒）
 HEART_INTERVAL = 10.0     # 心率请求间隔（秒）
+BP_INTERVAL = 2.0         # 血压状态查询间隔（秒）；不改变视频上传频率
 WORK_WIDTH = 640          # 发送/显示的工作宽度（等比缩放，控制带宽）
 JPEG_QUALITY = 80
 
@@ -49,6 +51,7 @@ COLOR_EMOTION = (0, 255, 255) # 情绪文字黄
 COLOR_POSE = (0, 255, 0)      # pose 骨架绿
 COLOR_HR = (255, 0, 0)        # 心率文字蓝
 COLOR_POSTURE = (255, 255, 0) # 姿态状态青
+COLOR_BP = (0, 165, 255)      # 血压状态橙
 
 
 # ============================================================
@@ -64,11 +67,12 @@ def encode_jpeg(frame: np.ndarray) -> str:
 
 
 def post_detect(url: str, frame_id: int, task: str, b64: str, w: int, h: int,
-                calibrate: bool = False) -> dict:
+                capture_timestamp_ms: int, calibrate: bool = False) -> dict:
     """POST /detect，返回解析后的 JSON"""
     payload = {
         "frame_id": frame_id,
         "task": task,
+        "capture_timestamp_ms": capture_timestamp_ms,
         "image": {"data": b64, "width": w, "height": h, "format": "jpeg"},
     }
     if calibrate:
@@ -151,6 +155,26 @@ def draw_posture_state(img: np.ndarray, posture: dict):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_POSTURE, 2, cv2.LINE_AA)
 
 
+def draw_blood_pressure(img: np.ndarray, bp: dict):
+    """Experimental BP result or measurement progress; never presents it as a medical value."""
+    if not bp:
+        text = "BP: --"
+    elif bp.get("status") == "ready":
+        text = f"BP experimental: {bp['sbp_mmHg']:.0f}/{bp['dbp_mmHg']:.0f} mmHg"
+    else:
+        quality = bp.get("quality") or {}
+        status = bp.get("status", "--")
+        if status == "collecting":
+            text = (f"BP collecting: {quality.get('duration_s', 0):.0f}/"
+                    f"{quality.get('required_window_s', 30):.0f}s")
+        elif status == "waveform_ready":
+            text = "BP waveform ready: model not loaded"
+        else:
+            text = f"BP {status}: {quality.get('reason', bp.get('error', '--'))}"
+    cv2.putText(img, text, (10, 78),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_BP, 2, cv2.LINE_AA)
+
+
 # ============================================================
 # 主循环
 # ============================================================
@@ -162,6 +186,8 @@ def main():
     parser.add_argument("--camera", type=int, default=0, help="摄像头 index (default: 0)")
     parser.add_argument("--width", type=int, default=WORK_WIDTH, help="发送宽度 (default: 640)")
     parser.add_argument("--fps", type=float, default=15.0, help="face_emotion 目标频率 (default: 15)")
+    parser.add_argument("--bp-interval", type=float, default=BP_INTERVAL,
+                        help="blood_pressure 查询间隔秒数 (default: 2)")
     args = parser.parse_args()
 
     cap = cv2.VideoCapture(args.camera)
@@ -172,12 +198,14 @@ def main():
     frame_id = 0
     last_posture_t = 0.0
     last_heart_t = 0.0
+    last_bp_t = 0.0
     last_posture = None
     last_hr = None
+    last_bp = None
     min_interval = 1.0 / args.fps
 
     print(f"[Init] 连接服务器: {args.url}")
-    print("[Init] 按 q 退出 | C 校准坐姿 | face_emotion 每帧 / posture 每5s / heart_rate 每10s\n")
+    print("[Init] 按 q 退出 | C 校准坐姿 | 血压先连续采样 7 秒，再加载 BP 模型推理\n")
 
     # 记录待校准标志（按 C 后在下一次 posture 请求中触发）
     pending_calibrate = False
@@ -197,10 +225,12 @@ def main():
 
         b64 = encode_jpeg(frame)
         frame_id += 1
+        capture_timestamp_ms = int(time.monotonic() * 1000)
 
         # 1) face_emotion: 每帧
         try:
-            res = post_detect(args.url, frame_id, "face_emotion", b64, w, h)
+            res = post_detect(args.url, frame_id, "face_emotion", b64, w, h,
+                              capture_timestamp_ms)
             draw_face_emotion(frame, res.get("result") or {})
         except (urllib.error.URLError, OSError) as e:
             print(f"[ERROR] face_emotion 请求失败: {e}")
@@ -211,7 +241,7 @@ def main():
         if pending_calibrate or now - last_posture_t >= POSTURE_INTERVAL:
             try:
                 res = post_detect(args.url, frame_id, "posture", b64, w, h,
-                                  calibrate=pending_calibrate)
+                                  capture_timestamp_ms, calibrate=pending_calibrate)
                 last_posture = res.get("result") or {}
                 last_posture_t = now
                 if pending_calibrate:
@@ -224,16 +254,28 @@ def main():
         # 3) heart_rate: 每 10s
         if now - last_heart_t >= HEART_INTERVAL:
             try:
-                res = post_detect(args.url, frame_id, "heart_rate", b64, w, h)
+                res = post_detect(args.url, frame_id, "heart_rate", b64, w, h,
+                                  capture_timestamp_ms)
                 last_hr = res.get("result") or {}
                 last_heart_t = now
             except (urllib.error.URLError, OSError) as e:
                 print(f"[ERROR] heart_rate 请求失败: {e}")
 
+        # 4) blood_pressure: 每 2s 查询一次进度或结果，视频帧已由 face_emotion 持续上传。
+        if now - last_bp_t >= args.bp_interval:
+            try:
+                res = post_detect(args.url, frame_id, "blood_pressure", b64, w, h,
+                                  capture_timestamp_ms)
+                last_bp = res.get("result") or {}
+                last_bp_t = now
+            except (urllib.error.URLError, OSError) as e:
+                print(f"[ERROR] blood_pressure 请求失败: {e}")
+
         # 叠加绘制
         draw_pose(frame, last_posture or {})
         draw_heart_rate(frame, last_hr)
         draw_posture_state(frame, last_posture)
+        draw_blood_pressure(frame, last_bp)
 
         cv2.imshow("Bio-Perception Client", frame)
         key = cv2.waitKey(1) & 0xFF

@@ -290,3 +290,53 @@ class HeartRateDetector:
         return {"bpm": round(float(bpm), 1), "confidence": round(float(conf), 4),
                 "method": self.method,
                 "fs": round(float(fs), 2), "frames_used": int(n_used)}
+
+
+def extract_rppg_waveform(rgb: np.ndarray, times: np.ndarray, method: str = "pos",
+                          band_low: float = BANDPASS_LOW,
+                          band_high: float = BANDPASS_HIGH) -> dict:
+    """Generate a normalized, band-passed BVP waveform from forehead RGB samples.
+
+    This is the shared signal stage used by the experimental blood-pressure path.
+    It deliberately returns the full waveform instead of reducing it to BPM.
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    if rgb.ndim != 2 or rgb.shape[1] != 3 or len(rgb) != len(times):
+        raise ValueError("rgb must have shape (N, 3) and match times")
+    if len(rgb) < MIN_FRAMES:
+        raise ValueError(f"insufficient_samples ({len(rgb)}/{MIN_FRAMES})")
+
+    dts = np.diff(times)
+    dts = dts[dts > 0]
+    if dts.size == 0:
+        raise ValueError("invalid_timestamps")
+    fs = 1.0 / float(np.median(dts))
+    if not np.isfinite(fs) or fs <= 0:
+        raise ValueError("invalid_sampling_rate")
+
+    processor = HeartRateDetector(None, method=method, band_low=band_low,
+                                  band_high=band_high)
+    rgb_uniform = processor._resample_uniform(rgb, times)
+    bvp = processor._generate_bvp(rgb_uniform, fs)
+    bvp = detrend(bvp)
+    bvp = (bvp - bvp.mean()) / (bvp.std() + 1e-9)
+    bvp = processor._bandpass(bvp, fs)
+    bvp = (bvp - bvp.mean()) / (bvp.std() + 1e-9)
+
+    nfft = max(len(bvp), len(bvp) * FFT_PADDING)
+    freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
+    spectrum = np.abs(np.fft.rfft(bvp, nfft))
+    in_band = (freqs >= band_low) & (freqs <= band_high)
+    band_power = spectrum[in_band]
+    peak_power = float(np.max(band_power)) if band_power.size else 0.0
+    mean_power = float(np.mean(band_power)) if band_power.size else 0.0
+    snr = peak_power / (mean_power + 1e-9)
+
+    return {
+        "waveform": bvp.astype(np.float32),
+        "fs": float(fs),
+        "frames_used": int(len(rgb)),
+        "snr": float(snr),
+        "method": method,
+    }

@@ -4,6 +4,7 @@
 
 
 #include <driver/gpio.h>
+#include <driver/spi_common.h>
 
 #define AUDIO_INPUT_SAMPLE_RATE      24000
 #define AUDIO_OUTPUT_SAMPLE_RATE     24000
@@ -27,6 +28,11 @@
 #define LCD_MISO_PIN GPIO_NUM_13
 #define LCD_DC_PIN GPIO_NUM_40
 #define LCD_CS_PIN GPIO_NUM_21
+
+// Micro SD/TF 卡使用 SPI2，与 LCD 共用 SCLK/MOSI/MISO，总线通过不同 CS 区分设备
+#define SD_SPI_HOST SPI2_HOST
+#define SD_SPI_CS_PIN GPIO_NUM_2
+#define SD_MOUNT_POINT "/sdcard"
 
 #define DISPLAY_WIDTH    320
 #define DISPLAY_HEIGHT   240
@@ -61,4 +67,3 @@
 #define OV_RESET_IO     5
 
 #endif // _BOARD_CONFIG_H_
-

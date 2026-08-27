@@ -3,7 +3,7 @@ ESP32 生物特征感知服务器 - Flask 入口
 
 职责:
   1. 接收图片（HTTP POST JPEG / Base64）
-  2. 根据 task 执行推理（face_emotion / posture / heart_rate）
+  2. 根据 task 执行推理（face_emotion / posture / heart_rate / blood_pressure）
   3. 保存最近 N 帧到 frame_buffer（供 rPPG 时序分析）
   4. 返回结果
 
@@ -19,6 +19,7 @@ ESP32 生物特征感知服务器 - Flask 入口
 
 import argparse
 import base64
+import concurrent.futures
 import io
 import json
 import sys
@@ -33,8 +34,8 @@ import protocol
 import state as state_mod
 from detectors.face_detector import FaceDetector
 from detectors.emotion_detector import EmotionDetector
-from detectors.pose_detector import PoseDetector
 from detectors.heart_detector import HeartRateDetector, METHODS as HEART_METHODS
+from detectors.blood_pressure_detector import BloodPressureDetector
 
 app = Flask(__name__)
 
@@ -56,6 +57,8 @@ MODEL_EMOTION_URL = "https://github.com/sb-ai-lab/EmotiEffLib/raw/main/models/af
 
 # 帧缓存大小（30 帧 ≈ 2s@15fps）
 BUFFER_MAXLEN = 30
+# 长时 rPPG 仅缓存前额 RGB 均值，不缓存完整视频帧。
+RPPG_MAXLEN = 1800  # 60s @ 30fps
 # 缓存帧降采样宽度，节省内存
 CACHE_MAX_WIDTH = 320
 
@@ -67,13 +70,12 @@ CACHE_MAX_WIDTH = 320
 state: state_mod.ServerState = None
 face_detector: FaceDetector = None
 emotion_detector: EmotionDetector = None
-pose_detector: PoseDetector = None
 heart_detector: HeartRateDetector = None
+blood_pressure_detector: BloodPressureDetector = None
 
 # 旧协议专用：上一帧/响应时间（FPS 统计）
 _last_frame_time = None
 _last_response_time = None
-
 
 # ============================================================
 # 图像解码
@@ -103,6 +105,30 @@ def cache_resized(rgb: np.ndarray) -> np.ndarray:
     return cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
 
 
+def _capture_timestamp_seconds(value) -> float:
+    """Convert an optional client monotonic capture timestamp from ms to seconds."""
+    if value is None or value == "":
+        return time.time()
+    try:
+        timestamp_ms = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("`capture_timestamp_ms` must be an integer")
+    if timestamp_ms < 0:
+        raise ValueError("`capture_timestamp_ms` must be non-negative")
+    return timestamp_ms / 1000.0
+
+
+def _cache_and_sample(rgb: np.ndarray, timestamp: float) -> int:
+    """Update the short frame cache and the compact long-window rPPG sample buffer."""
+    sample_rgb, face_confidence = blood_pressure_detector.sample_frame(rgb)
+    # A desktop/ESP32 scheduler can issue multiple task requests for one captured
+    # frame. Keep each capture only once so heart-rate timing stays well-defined.
+    if not state.push_rppg_sample(timestamp, sample_rgb, face_confidence):
+        return -1
+    cached = cache_resized(rgb)
+    return state.push_frame(cached, cached.shape[1], cached.shape[0], timestamp)
+
+
 # ============================================================
 # 任务分发
 # ============================================================
@@ -130,15 +156,54 @@ def _detect_face_emotion(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
     return result
 
 
-def _detect_posture(rgb: np.ndarray) -> dict:
-    """坐姿检测"""
-    return pose_detector.detect(rgb)
+def _detect_posture(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
+    """基于当前帧人脸位置和面积的简化坐姿检测。"""
+    face = face_detector.detect_primary_face(rgb, src_w, src_h)
+    if face is None:
+        return {"state": "unknown", "reason": "no_face", "metrics": {}}
+
+    bbox = face["bbox"]
+    frame_w = max(1, src_w)
+    frame_h = max(1, src_h)
+    face_center_x = bbox["x"] + bbox["width"] / 2.0
+    face_area_ratio = (bbox["width"] * bbox["height"]) / (frame_w * frame_h)
+    center_ratio = face_center_x / frame_w
+
+    # 画面中间水平居中的 50%；人脸面积达到四分之一即视为过大。
+    if face_area_ratio >= 0.25:
+        raw_state = "bad_posture"
+        reason = "face_too_large"
+    elif center_ratio < 0.25:
+        raw_state = "bad_posture"
+        reason = "face_too_left"
+    elif center_ratio > 0.75:
+        raw_state = "bad_posture"
+        reason = "face_too_right"
+    else:
+        raw_state = "normal"
+        reason = "ok"
+
+    return {
+        "state": raw_state,
+        "reason": reason,
+        "metrics": {
+            "face_center_x": round(center_ratio, 4),
+            "face_area_ratio": round(face_area_ratio, 4),
+            "face": face,
+        },
+    }
 
 
 def _detect_heart_rate() -> dict:
     """rPPG 心率：使用缓存帧，不重新采集"""
     frames = state.get_recent_frames()
     return heart_detector.detect(frames)
+
+
+def _detect_blood_pressure() -> dict:
+    """Evaluate the latest long rPPG window without recording another video sequence."""
+    samples = state.get_recent_rppg_samples(blood_pressure_detector.window_seconds)
+    return blood_pressure_detector.detect(samples)
 
 
 def _dispatch_task(task: str, rgb: np.ndarray, src_w: int, src_h: int,
@@ -149,24 +214,15 @@ def _dispatch_task(task: str, rgb: np.ndarray, src_w: int, src_h: int,
         state.set_face(result["face"])
         state.set_emotion(result["emotion"])
     elif task == protocol.TASK_POSTURE:
-        # calibrate=true 时，将当前姿态记录为基准坐姿（需先完成一次完整检测）
-        if calibrate:
-            m = pose_detector.detect(rgb).get("metrics", {})
-            if "cva" in m:
-                # 用 EMA 平滑值作基准（比单帧 raw 稳定），躯干角仅在髋可见时校准
-                pose_detector.calibrate(m["cva"], m["trunk_angle"],
-                                        bool(m.get("trunk_valid", False)))
-                reason = "baseline_set" if m.get("trunk_valid") else "baseline_set_cva_only"
-                result = {"state": "calibrated", "reason": reason, "metrics": m}
-            else:
-                result = {"state": "unknown", "reason": "calibrate_failed",
-                          "metrics": m}
-        else:
-            result = _detect_posture(rgb)
+        # calibrate 参数保留兼容性；简化规则不需要校准。
+        result = _detect_posture(rgb, src_w, src_h)
         state.set_posture(result)
     elif task == protocol.TASK_HEART_RATE:
         result = _detect_heart_rate()
         state.set_heart_rate(result)
+    elif task == protocol.TASK_BLOOD_PRESSURE:
+        result = _detect_blood_pressure()
+        state.set_blood_pressure(result)
     else:
         result = {"error": f"unsupported task: {task}"}
     return result
@@ -180,7 +236,7 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
     """multipart/form-data 协议：二进制 JPEG 上传（免 base64）。
 
     请求字段:
-      frame_id / task / calibrate(可选 "true") 为 form 字段
+      frame_id / task / calibrate(可选 "true") / capture_timestamp_ms(可选) 为 form 字段
       image 为文件字段（JPEG 二进制）
     响应: 与 JSON 协议相同的统一格式 {frame_id, task, result, performance}
     """
@@ -197,6 +253,10 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
         return jsonify({"error": f"`task` must be one of {sorted(protocol.VALID_TASKS)}"}), 400
 
     calibrate = request.form.get("calibrate", "false") in ("true", "1", "True")
+    try:
+        capture_timestamp = _capture_timestamp_seconds(request.form.get("capture_timestamp_ms"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
     # 读取 JPEG 文件字段
     f = request.files.get("image")
@@ -221,8 +281,8 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
     except (TypeError, ValueError):
         src_w, src_h = rgb.shape[1], rgb.shape[0]
 
-    # 保存当前帧（所有 task 均缓存，供 rPPG 时序分析）
-    cache_id = state.push_frame(cache_resized(rgb), src_w, src_h)
+    # 保存当前帧，并提取一个紧凑的前额 RGB 采样供长期 rPPG 使用。
+    cache_id = _cache_and_sample(rgb, capture_timestamp)
 
     t1 = time.time()
     result = _dispatch_task(task, rgb, src_w, src_h, calibrate=calibrate)
@@ -306,8 +366,8 @@ def detect():
                     "bbox": d["bbox"],
                 })
 
-            # 旧协议也缓存帧（保证心率任务可用）
-            state.push_frame(cache_resized(rgb), src_w, src_h)
+            # 旧协议也更新 rPPG 缓存；旧客户端没有采集时间戳，回退服务器时间。
+            _cache_and_sample(rgb, time.time())
 
         _last_frame_time = t_start
         _last_response_time = t_start
@@ -330,8 +390,9 @@ def detect():
     src_w = req.image.width or rgb.shape[1]
     src_h = req.image.height or rgb.shape[0]
 
-    # 保存当前帧（所有 task 均缓存，供 rPPG 时序分析）
-    frame_id = state.push_frame(cache_resized(rgb), src_w, src_h)
+    capture_timestamp = _capture_timestamp_seconds(req.capture_timestamp_ms)
+    # 保存当前帧，并提取一个紧凑的前额 RGB 采样供长期 rPPG 使用。
+    frame_id = _cache_and_sample(rgb, capture_timestamp)
 
     t1 = time.time()
     # 按 task 分发（JSON 与 multipart 共用）
@@ -373,8 +434,10 @@ def health():
         "models": {
             "face": MODEL_FACE.name,
             "emotion": MODEL_EMOTION.name if emotion_detector else None,
-            "pose": MODEL_POSE.name if pose_detector else None,
+            "pose": "face_geometry",
             "heart_rate": "rppg (cached frames)" if heart_detector else None,
+            "blood_pressure": blood_pressure_detector.model.describe()
+            if blood_pressure_detector else None,
         },
         "buffer_maxlen": BUFFER_MAXLEN,
     })
@@ -386,6 +449,9 @@ def health():
 
 _lamp_controller = None
 _lamp_error = None
+_lamp_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_lamp_future = None
+LAMP_REQUEST_TIMEOUT_SEC = 3
 
 
 def _get_lamp_controller():
@@ -406,6 +472,20 @@ def _get_lamp_controller():
         _lamp_error = e
         raise
     return _lamp_controller
+
+
+def _run_lamp_action(action, value):
+    """Run one lamp action on the dedicated worker thread."""
+    ctrl = _get_lamp_controller()
+    if action == "get_status":
+        return ctrl.get_status()
+    if action == "set_power":
+        return ctrl.set_power(value)
+    if action == "set_brightness":
+        return ctrl.set_brightness(value)
+    if action == "set_color_temp":
+        return ctrl.set_color_temp(value)
+    raise ValueError(f"unknown action: {action}")
 
 
 @app.route("/lamp", methods=["POST"])
@@ -436,17 +516,22 @@ def lamp():
     action = data.get("action", "")
     value = data.get("value")
 
-    try:
-        ctrl = _get_lamp_controller()
-        if action == "get_status":
-            return jsonify({"ok": True, **ctrl.get_status()})
-        if action == "set_power":
-            return jsonify({"ok": True, **ctrl.set_power(value)})
-        if action == "set_brightness":
-            return jsonify({"ok": True, **ctrl.set_brightness(value)})
-        if action == "set_color_temp":
-            return jsonify({"ok": True, **ctrl.set_color_temp(value)})
+    if action not in {"get_status", "set_power", "set_brightness", "set_color_temp"}:
         return jsonify({"ok": False, "error": f"unknown action: {action}"})
+
+    global _lamp_future
+    if _lamp_future is not None and not _lamp_future.done():
+        return jsonify({"ok": False, "error": "lamp request is still in progress"})
+
+    _lamp_future = _lamp_executor.submit(_run_lamp_action, action, value)
+    try:
+        result = _lamp_future.result(timeout=LAMP_REQUEST_TIMEOUT_SEC)
+        return jsonify({"ok": True, **result})
+    except concurrent.futures.TimeoutError:
+        return jsonify({
+            "ok": False,
+            "error": f"lamp request timed out after {LAMP_REQUEST_TIMEOUT_SEC} seconds",
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
@@ -484,7 +569,7 @@ def download_models():
 # ============================================================
 
 def main():
-    global face_detector, emotion_detector, pose_detector, heart_detector, state
+    global face_detector, emotion_detector, heart_detector, blood_pressure_detector, state
 
     parser = argparse.ArgumentParser(description="ESP32 Bio-Perception Server")
     parser.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
@@ -496,6 +581,17 @@ def main():
                         help=f"frame_buffer maxlen (default: {BUFFER_MAXLEN})")
     parser.add_argument("--heart-method", default="pos", choices=list(HEART_METHODS),
                         help=f"rPPG 心率信号提取方法 (default: pos, 可选: {', '.join(HEART_METHODS)})")
+    parser.add_argument("--bp-method", default="pos", choices=list(HEART_METHODS),
+                        help="血压 rPPG 波形提取方法 (default: pos)")
+    parser.add_argument("--bp-model", default="", help="rPPG-BP 导出的 ONNX 模型路径（可选）")
+    parser.add_argument("--bp-model-config", default="",
+                        help="BP 模型 JSON 配置路径（input_length/normalization，可选）")
+    parser.add_argument("--bp-window-seconds", type=float, default=7.0,
+                        help="血压测量所需连续 rPPG 窗口秒数 (default: 7)")
+    parser.add_argument("--bp-strict-quality", action="store_true",
+                        help="启用人脸可见率、采样率和 SNR 的严格血压质量门控")
+    parser.add_argument("--rppg-max-samples", type=int, default=RPPG_MAXLEN,
+                        help=f"紧凑 rPPG 缓冲样本数 (default: {RPPG_MAXLEN})")
     parser.add_argument("--download-model", action="store_true",
                         help="Download ONNX models and exit")
     args = parser.parse_args()
@@ -504,7 +600,8 @@ def main():
         download_models()
         return
 
-    state = state_mod.ServerState(buffer_maxlen=args.buffer_size)
+    state = state_mod.ServerState(buffer_maxlen=args.buffer_size,
+                                  rppg_maxlen=args.rppg_max_samples)
 
     # 初始化模型
     print(f"[Init] Loading models...")
@@ -519,22 +616,20 @@ def main():
         emotion_detector = None
         print(f"[WARN] Emotion model not found: {args.emotion_model} (face_emotion 将仅返回人脸)")
 
-    # 坐姿模型可选
-    if Path(args.pose_model).exists():
-        pose_detector = PoseDetector(args.pose_model)
-    else:
-        pose_detector = None
-        print(f"[WARN] Pose model not found: {args.pose_model} (posture 任务将不可用)")
-
     heart_detector = HeartRateDetector(face_detector, method=args.heart_method)
+    blood_pressure_detector = BloodPressureDetector(
+        face_detector, method=args.bp_method, model_path=args.bp_model or None,
+        config_path=args.bp_model_config or None, window_seconds=args.bp_window_seconds,
+        relaxed_quality=not args.bp_strict_quality)
     print(f"[Init] Models loaded in {(time.time() - t0) * 1000:.0f}ms")
 
     print(f"\n{'='*54}")
     print(f"  ESP32 Bio-Perception Server")
     print(f"  Listen: http://{args.host}:{args.port}")
-    print(f"  Tasks : face_emotion / posture / heart_rate")
+    print(f"  Tasks : face_emotion / posture / heart_rate / blood_pressure")
     print(f"  rPPG  : {args.heart_method} (可选: {', '.join(HEART_METHODS)})")
-    print(f"  Buffer: {args.buffer_size} frames (server keeps NO timing)")
+    print(f"  Buffer: {args.buffer_size} frames + {args.rppg_max_samples} rPPG samples")
+    print(f"  BP    : {args.bp_window_seconds:.0f}s window, quality={'strict' if args.bp_strict_quality else 'relaxed'}, model={'ready' if blood_pressure_detector.model.ready else blood_pressure_detector.model.error}")
     print(f"{'='*54}\n")
 
     # threaded=True: 每个 HTTP 请求独立线程，避免单个慢任务阻塞其他请求

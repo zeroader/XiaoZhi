@@ -7,12 +7,15 @@
 #include "i2c_device.h"
 #include "led/single_led.h"
 #include "esp32_camera.h"
+#include "vision/vision_pipeline.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <wifi_station.h>
+#include <stdio.h>
+#include <esp_timer.h>
 
 #define TAG "atk_dnesp32s3"
 
@@ -42,6 +45,14 @@ public:
             WriteReg(0x03, data);
         }
     }
+
+    // XL9555 input port 1 is register 0x01; P1.7 is the KEY0 input.
+    uint16_t ReadInputState() {
+        uint8_t ports[2] = {0, 0};
+        ReadRegs(0x00, ports, sizeof(ports));
+        return static_cast<uint16_t>(ports[0]) |
+               (static_cast<uint16_t>(ports[1]) << 8);
+    }
 };
 
 class Xl9555Backlight : public Backlight {
@@ -70,6 +81,8 @@ private:
     XL9555* xl9555_;
     Esp32Camera* camera_;
     Backlight* backlight_ = nullptr;
+    esp_timer_handle_t key_scan_timer_ = nullptr;
+    bool key0_down_ = false;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -111,6 +124,31 @@ private:
             }
             app.ToggleChatState();
         });
+
+        // KEY0 is XL9555 P1.7 (0x8000), active low. Scan it periodically and
+        // trigger detection on the press edge; the BOOT key remains chat toggle.
+        esp_timer_create_args_t key_timer_args = {
+            .callback = [](void* arg) {
+                auto* board = static_cast<atk_dnesp32s3*>(arg);
+                const bool down = (board->xl9555_->ReadInputState() & 0x8000) == 0;
+                if (down && !board->key0_down_) {
+                    auto& vision = VisionPipeline::GetInstance();
+                    if (!vision.IsContinuousRunning()) {
+                        if (!vision.StartContinuous(100)) {
+                            ESP_LOGW(TAG, "KEY0: failed to start continuous camera detection");
+                        } else {
+                            ESP_LOGI(TAG, "KEY0: continuous camera detection started");
+                        }
+                    }
+                }
+                board->key0_down_ = down;
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "key0_scan",
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&key_timer_args, &key_scan_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(key_scan_timer_, 20000));
     }
 
     void InitializeSt7789Display() {
@@ -122,7 +160,9 @@ private:
         io_config.cs_gpio_num = LCD_CS_PIN;
         io_config.dc_gpio_num = LCD_DC_PIN;
         io_config.spi_mode = 0;
-        io_config.pclk_hz = 20 * 1000 * 1000;
+        // ST7789 supports this rate on the short on-board SPI traces. It
+        // shortens each preview-window flush and leaves more CPU time for I2S.
+        io_config.pclk_hz = 40 * 1000 * 1000;
         io_config.trans_queue_depth = 7;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;

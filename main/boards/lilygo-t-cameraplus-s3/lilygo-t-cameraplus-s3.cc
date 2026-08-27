@@ -10,6 +10,7 @@
 #include "pin_config.h"
 #include "esp32_camera.h"
 #include "ir_filter_controller.h"
+#include "vision/vision_pipeline.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -214,7 +215,19 @@ private:
                 ResetWifiConfiguration();
             }
             power_save_timer_->WakeUp();
-            app.ToggleChatState();
+            auto& vision = VisionPipeline::GetInstance();
+            if (vision.IsContinuousRunning()) {
+                vision.StopContinuous();
+                ESP_LOGI(TAG, "Boot key: continuous camera detection stopped");
+            } else {
+                // Keep the existing automatic schedule: emotion is sampled
+                // continuously while posture/heart/BP run at their own cadence.
+                if (!vision.StartContinuous(100)) {
+                    ESP_LOGW(TAG, "Boot key: failed to start continuous camera detection");
+                } else {
+                    ESP_LOGI(TAG, "Boot key: continuous camera detection started");
+                }
+            }
         });
         key1_button_.OnClick([this]() {
             if (camera_) {
