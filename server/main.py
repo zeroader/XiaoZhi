@@ -33,6 +33,7 @@ import protocol
 import state as state_mod
 from detectors.face_detector import FaceDetector
 from detectors.emotion_detector import EmotionDetector
+from detectors.face_posture_detector import FacePostureDetector
 from detectors.pose_detector import PoseDetector
 from detectors.heart_detector import HeartRateDetector, METHODS as HEART_METHODS
 from detectors.blood_pressure_detector import BloodPressureDetector
@@ -70,7 +71,8 @@ CACHE_MAX_WIDTH = 320
 state: state_mod.ServerState = None
 face_detector: FaceDetector = None
 emotion_detector: EmotionDetector = None
-pose_detector: PoseDetector = None
+pose_detector: FacePostureDetector = None
+pose_keypoint_detector: PoseDetector = None
 heart_detector: HeartRateDetector = None
 blood_pressure_detector: BloodPressureDetector = None
 
@@ -158,40 +160,10 @@ def _detect_face_emotion(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
 
 
 def _detect_posture(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
-    """基于当前帧人脸位置和面积的简化坐姿检测。"""
-    face = face_detector.detect_primary_face(rgb, src_w, src_h)
-    if face is None:
-        raw_state = "unknown"
-        reason = "no_face"
-        metrics = {}
-    else:
-        bbox = face["bbox"]
-        frame_w = max(1, src_w)
-        frame_h = max(1, src_h)
-        face_center_x = bbox["x"] + bbox["width"] / 2.0
-        face_area_ratio = (bbox["width"] * bbox["height"]) / (frame_w * frame_h)
-        center_ratio = face_center_x / frame_w
-
-        # 画面中间取水平居中的 50%；人脸面积达到四分之一即视为过大。
-        if face_area_ratio >= 0.25:
-            raw_state = "bad_posture"
-            reason = "face_too_large"
-        elif center_ratio < 0.25:
-            raw_state = "bad_posture"
-            reason = "face_too_left"
-        elif center_ratio > 0.75:
-            raw_state = "bad_posture"
-            reason = "face_too_right"
-        else:
-            raw_state = "normal"
-            reason = "ok"
-        metrics = {
-            "face_center_x": round(center_ratio, 4),
-            "face_area_ratio": round(face_area_ratio, 4),
-            "face": face,
-        }
-
-    return {"state": raw_state, "reason": reason, "metrics": metrics}
+    """稳定的人脸几何坐姿检测，供 LCD 仪表盘显示。"""
+    if pose_detector is None:
+        return {"state": "unknown", "reason": "posture_detector_missing", "metrics": {}}
+    return pose_detector.detect(rgb)
 
 
 def _detect_heart_rate() -> dict:
@@ -215,11 +187,11 @@ def _dispatch_task(task: str, rgb: np.ndarray, src_w: int, src_h: int,
         state.set_emotion(result["emotion"])
     elif task == protocol.TASK_POSTURE:
         # calibrate 参数为兼容旧客户端保留，但新版人脸规则不需要校准。
-        if calibrate:
-            # 新版坐姿判定不需要姿态模型或人工校准；直接使用人脸规则。
-            result = _detect_posture(rgb, src_w, src_h)
-        else:
-            result = _detect_posture(rgb, src_w, src_h)
+        result = _detect_posture(rgb, src_w, src_h)
+        if calibrate and pose_detector is not None:
+            if pose_detector.calibrate(result.get("metrics")):
+                result["state"] = "normal"
+                result["reason"] = "baseline_set"
         state.set_posture(result)
     elif task == protocol.TASK_HEART_RATE:
         result = _detect_heart_rate()
@@ -480,7 +452,7 @@ def download_models():
 # ============================================================
 
 def main():
-    global face_detector, emotion_detector, pose_detector, heart_detector, blood_pressure_detector, state
+    global face_detector, emotion_detector, pose_detector, pose_keypoint_detector, heart_detector, blood_pressure_detector, state
 
     parser = argparse.ArgumentParser(description="ESP32 Bio-Perception Server")
     parser.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
@@ -529,10 +501,11 @@ def main():
 
     # 坐姿模型可选
     if Path(args.pose_model).exists():
-        pose_detector = PoseDetector(args.pose_model)
+        pose_keypoint_detector = PoseDetector(args.pose_model)
     else:
-        pose_detector = None
-        print(f"[WARN] Pose model not found: {args.pose_model} (posture 任务将不可用)")
+        pose_keypoint_detector = None
+        print(f"[WARN] Pose model not found: {args.pose_model}; using face geometry posture detection")
+    pose_detector = FacePostureDetector(face_detector, pose_keypoint_detector)
 
     heart_detector = HeartRateDetector(face_detector, method=args.heart_method)
     blood_pressure_detector = BloodPressureDetector(

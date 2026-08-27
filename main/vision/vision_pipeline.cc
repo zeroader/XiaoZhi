@@ -321,7 +321,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     // 连续检测运行时摄像头被 PreviewLoop 独占，此处不再取帧，
     // 避免并发 esp_camera_fb_get 失败被大模型误判为"摄像头坏了"。
     // 引导大模型改用缓存读取工具。
-    if (continuous_running_.load()) {
+    if (continuous_running_.load() || preview_running_.load()) {
         if (out_debug_info) {
             *out_debug_info = "continuous detection is running (camera busy). "
                               "Use self.vision.get_user_emotion / get_posture / "
@@ -379,7 +379,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
                 ESP_LOGW(TAG, "OneShotDetect: ComposePreview returned NULL (bad alloc or invalid dims?)");
             } else {
                 auto t_disp0 = esp_timer_get_time();
-                lcd->SetPreviewImage(std::move(image));
+                lcd->SetVisionPreviewImage(std::move(image), result);
                 auto t_disp1 = esp_timer_get_time();
                 stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
                 stats_.display_count++;
@@ -410,10 +410,12 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
 // ---------- Two-thread architecture: Preview (15 FPS) + Detect (async) ----------
 
 void VisionPipeline::PreviewLoop() {
-    ESP_LOGI(TAG, "Preview loop started (15 FPS)");
+    ESP_LOGI(TAG, "Preview loop started (15 FPS capture, 15 FPS LCD)");
 
     constexpr uint32_t kPreviewPeriodMs = 67;  // ~15 FPS
+    constexpr uint32_t kDisplayPeriodMs = 100;  // 10 FPS keeps audio responsive while remaining smooth.
     uint64_t last_iter = 0;
+    uint64_t last_display_ms = 0;
 
     while (continuous_running_.load()) {
         auto t0 = esp_timer_get_time();
@@ -433,8 +435,23 @@ void VisionPipeline::PreviewLoop() {
                 shared_frame_version_++;
             }
 
-            // Step 3: Compose preview with latest bbox (if any)
-            if (display_composer_) {
+            // Release the camera buffer before doing any JPEG/LVGL work.  The
+            // camera often has only one framebuffer, so holding it during a
+            // display refresh stalls the next capture.
+            const uint64_t now_ms = esp_timer_get_time() / 1000LL;
+            const bool should_display = last_display_ms == 0 ||
+                                        now_ms - last_display_ms >= kDisplayPeriodMs;
+            std::vector<uint8_t> display_frame_data;
+            ImageFrame display_frame = frame;
+            if (should_display) {
+                display_frame_data.assign(frame.data, frame.data + frame.len);
+            }
+            ReleaseCurrentFrame();
+
+            // Step 3: Compose preview with latest bbox (if any), at a bounded
+            // LCD rate. Detection continues to receive every captured frame.
+            if (should_display && display_composer_) {
+                last_display_ms = now_ms;
                 auto* lcd = ResolveLvglDisplay();
                 if (lcd != nullptr) {
                     DetectionResult current_result;
@@ -445,17 +462,19 @@ void VisionPipeline::PreviewLoop() {
                     // 合并跨帧缓存的坐姿/心率/血压，保证 LCD 上持续显示（不被每帧 face_emotion 覆盖）
                     {
                         std::lock_guard<std::mutex> lock(sensing_mutex_);
+                        current_result.emotion = latest_emotion_;
                         current_result.posture = latest_posture_;
                         current_result.heart_rate = latest_heart_rate_;
                         current_result.blood_pressure = latest_blood_pressure_;
                     }
                     // OV2640 直出 JPEG：解码成 RGB565 再送 LCD（检测线程直接用 JPEG 上传，互不影响）
-                    const uint8_t* disp_data = frame.data;
-                    int disp_w = frame.width;
-                    int disp_h = frame.height;
-                    if (frame.pixel_format == PIXFORMAT_JPEG) {
+                    display_frame.data = display_frame_data.data();
+                    const uint8_t* disp_data = display_frame.data;
+                    int disp_w = display_frame.width;
+                    int disp_h = display_frame.height;
+                    if (display_frame.pixel_format == PIXFORMAT_JPEG) {
                         uint8_t* dec = nullptr; size_t dec_len = 0; int dw = 0, dh = 0;
-                        if (!DecodeJpegFrame(frame, &dec, &dec_len, &dw, &dh)) {
+                        if (!DecodeJpegFrame(display_frame, &dec, &dec_len, &dw, &dh)) {
                             disp_data = nullptr;  // 解码失败则本次不显示
                         } else {
                             disp_data = dec; disp_w = dw; disp_h = dh;
@@ -471,7 +490,7 @@ void VisionPipeline::PreviewLoop() {
 
                         if (image) {
                             auto t_disp0 = esp_timer_get_time();
-                            lcd->SetPreviewImage(std::move(image));
+                            lcd->SetVisionPreviewImage(std::move(image), current_result);
                             auto t_disp1 = esp_timer_get_time();
                             stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
                             stats_.display_count++;
@@ -480,8 +499,6 @@ void VisionPipeline::PreviewLoop() {
                 }
             }
 
-            // Step 4: Release frame
-            ReleaseCurrentFrame();
         }
 
         // Step 5: Sleep to maintain FPS
@@ -628,6 +645,9 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
         ESP_LOGW(TAG, "Continuous detect already running");
         return true;
     }
+    if (preview_running_.load()) {
+        StopPreview();
+    }
     // Join any previous threads that may have auto-stopped
     if (preview_thread_.joinable()) preview_thread_.join();
     if (detect_thread_.joinable()) detect_thread_.join();
@@ -661,7 +681,7 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
     // stack (3072B) is too small and caused a printf crash. Use a larger stack.
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
     cfg.stack_size = 8192;
-    cfg.prio = 5;
+    cfg.prio = 3;
     esp_pthread_set_cfg(&cfg);
     try {
         preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
@@ -732,7 +752,7 @@ void VisionPipeline::PreviewOnlyLoop() {
                 disp_data, disp_w, disp_h,
                 (size_t)disp_w * 2, empty_result);
             if (image) {
-                lcd->SetPreviewImage(std::move(image));
+                lcd->SetVisionPreviewImage(std::move(image), empty_result);
             }
         }
 
@@ -750,6 +770,10 @@ void VisionPipeline::PreviewOnlyLoop() {
 
 bool VisionPipeline::StartPreview(uint32_t period_ms) {
     if (!initialized_) return false;
+    if (continuous_running_.load()) {
+        ESP_LOGW(TAG, "Cannot start preview while continuous detection is running");
+        return false;
+    }
     if (preview_running_.load()) {
         ESP_LOGW(TAG, "Preview already running");
         return true;
@@ -796,6 +820,11 @@ const DetectionResult& VisionPipeline::GetLastResult() const { return last_resul
 // 缓存跨帧感知结果：心率值供查询，坐姿供 LCD 持续叠加
 void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
     std::lock_guard<std::mutex> lock(sensing_mutex_);
+    if (result.emotion.available && !result.emotion.label.empty()) {
+        latest_emotion_ = result.emotion;
+    } else if (result.task == kTaskFaceEmotion) {
+        latest_emotion_ = EmotionResult();
+    }
     if (result.heart_rate.available) {
         latest_heart_rate_ = result.heart_rate;
         heart_rate_timestamp_ms_ = result.timestamp_ms;
@@ -941,7 +970,6 @@ static bool QueueVoiceAsset(const char* filename) {
         (!was_listening && !audio.IsIdle())) {
         return false;
     }
-
     // 回收上一条已经播放完成的线程；正在播放时由 local_sound_playing_ 拦截。
     if (g_voice_alert_thread.joinable()) {
         g_voice_alert_thread.join();

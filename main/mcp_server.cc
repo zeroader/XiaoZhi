@@ -121,6 +121,9 @@ void McpServer::AddCommonTools() {
                         "Real-time detection is currently running in LOCAL mode (no image is uploaded). "
                         "Stop it with `self.vision.stop_continuous` first if you really need a cloud photo analysis.");
                 }
+                if (VisionPipeline::GetInstance().IsPreviewRunning()) {
+                    throw std::runtime_error("Camera preview is currently running; stop preview first.");
+                }
                 // Lower the priority to do the camera capture
                 TaskPriorityReset priority_reset(1);
 

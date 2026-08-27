@@ -1,0 +1,1247 @@
+diff --git a/README_BUILD.md b/README_BUILD.md
+index b5a2a66..d448557 100644
+--- a/README_BUILD.md
++++ b/README_BUILD.md
+@@ -229,3 +229,17 @@ python main.py --host 0.0.0.0 --port 8291
+ - **大日志不要用 `%lld` / `%zu`**：本项目固件启用 nano printf（`CONFIG_NEWLIB_NANO_FORMAT`），不识别 `%lld`，会打印成字面量并错位后续参数，请用 `%d` + `(int)` 强转。
+ - **连续检测期间不要调用 `detect_once`**：摄像头被预览线程独占，会并发取帧失败；请改用缓存读取工具（`get_*`）。
+ - 视觉工具命名约定：所有大模型工具以 `self.vision.*` 开头。
++
++# 告警提示
++- 在 [vision_pipeline.cc]() 实现坐姿告警：
++
++  - 连续两次 `bad_posture` 后触发。
++  - 连续两次正常结果后解除。
++  - 持续异常每 60 秒最多提醒一次。
++
++- 在 [vision_pipeline.cc]() 实现健康告警：
++
++  - 心率 `<50` 或 `>100` bpm。
++  - 收缩压 `<90` 或 `>=140` mmHg。
++  - 舒张压 `<60` 或 `>=90` mmHg。
++  - 各项独立防抖、恢复和 60 秒冷却，不会因另一项当前帧没有数据而错误解除。
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 9d416ce..282a3cf 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -340,6 +340,7 @@ elseif(CONFIG_BOARD_TYPE_ATK_DNESP32S3)
+     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
+     set(BUILTIN_ICON_FONT font_awesome_20_4)
+     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
++    list(APPEND DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/vision/runtime")
+ elseif(CONFIG_BOARD_TYPE_ATK_DNESP32S3_BOX)
+     set(BOARD_TYPE "atk-dnesp32s3-box")
+     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
+diff --git a/main/display/lcd_display.cc b/main/display/lcd_display.cc
+index 5d94e0c..4c310ba 100644
+--- a/main/display/lcd_display.cc
++++ b/main/display/lcd_display.cc
+@@ -14,6 +14,8 @@
+ #include <cstring>
+ 
+ #include "board.h"
++#include "assets.h"
++#include "vision/detector.h"
+ 
+ #define TAG "LcdDisplay"
+ 
+@@ -21,6 +23,185 @@ LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
+ LV_FONT_DECLARE(BUILTIN_ICON_FONT);
+ LV_FONT_DECLARE(font_awesome_30_4);
+ 
++static void StartVisionAlertAnimation(lv_obj_t* object) {
++    lv_obj_set_style_bg_opa(object, LV_OPA_COVER, 0);
++    lv_anim_t animation;
++    lv_anim_init(&animation);
++    lv_anim_set_var(&animation, object);
++    lv_anim_set_values(&animation, LV_OPA_30, LV_OPA_COVER);
++    lv_anim_set_duration(&animation, 650);
++    lv_anim_set_playback_duration(&animation, 650);
++    lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
++    lv_anim_set_exec_cb(&animation, [](void* var, int32_t value) {
++        lv_obj_set_style_opa(static_cast<lv_obj_t*>(var), static_cast<lv_opa_t>(value), 0);
++    });
++    lv_anim_start(&animation);
++}
++
++static const char* EmotionLabelZh(const std::string& label) {
++    if (label == "happy") return "开心";
++    if (label == "sad") return "悲伤";
++    if (label == "angry") return "生气";
++    if (label == "fear") return "害怕";
++    if (label == "surprise") return "惊讶";
++    if (label == "disgust") return "厌恶";
++    if (label == "contempt") return "轻蔑";
++    if (label == "neutral") return "平静";
++    return label.empty() ? "等待检测" : label.c_str();
++}
++
++static const char* EmotionEmojiKey(const std::string& label) {
++    if (label == "happy") return "happy";
++    if (label == "sad") return "sad";
++    if (label == "angry") return "angry";
++    if (label == "surprise" || label == "fear") return "surprised";
++    if (label == "disgust") return "confused";
++    return "neutral";
++}
++
++static const char* EmotionAssetKey(const std::string& label) {
++    if (label == "angry" || label == "contempt" || label == "disgust" ||
++        label == "fear" || label == "happy" || label == "neutral" ||
++        label == "sad" || label == "surprise") return label.c_str();
++    return "neutral";
++}
++
++static void StopVisionAlertAnimation(lv_obj_t* object) {
++    lv_anim_delete(object, nullptr);
++    // Dashboard cards are transparent over the supplied artwork when normal.
++    lv_obj_set_style_opa(object, LV_OPA_COVER, 0);
++    lv_obj_set_style_bg_opa(object, LV_OPA_TRANSP, 0);
++}
++
++static const lv_point_precise_t kVisionGoodPosturePoints[] = {
++    {26, 4}, {22, 8}, {26, 12}, {30, 8}, {26, 4},
++    {26, 12}, {26, 29}, {14, 48}, {26, 29}, {38, 48},
++    {26, 29}, {12, 22}, {40, 22}
++};
++
++static const lv_point_precise_t kVisionBadPosturePoints[] = {
++    {32, 4}, {28, 8}, {32, 12}, {36, 8}, {32, 4},
++    {32, 12}, {27, 29}, {13, 43}, {27, 29}, {37, 49},
++    {27, 29}, {12, 20}, {41, 25}
++};
++
++static void SetVisionPostureGraphic(lv_obj_t* object, bool bad) {
++    const auto* points = bad ? kVisionBadPosturePoints : kVisionGoodPosturePoints;
++    const uint32_t point_count = bad
++        ? sizeof(kVisionBadPosturePoints) / sizeof(kVisionBadPosturePoints[0])
++        : sizeof(kVisionGoodPosturePoints) / sizeof(kVisionGoodPosturePoints[0]);
++    lv_line_set_points(object, points, point_count);
++    lv_obj_set_style_line_color(object, bad ? lv_color_hex(0xE05663) : lv_color_hex(0x27A66A), 0);
++    lv_obj_set_style_line_width(object, 3, 0);
++    lv_obj_set_style_line_rounded(object, true, 0);
++}
++
++static void SetVisionEmojiImage(lv_obj_t* object, const LvglImage* image) {
++    if (image == nullptr || image->image_dsc() == nullptr) {
++        lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
++        return;
++    }
++
++    const auto* dsc = image->image_dsc();
++    lv_image_set_src(object, dsc);
++    // Fit either the 32px or 64px built-in Twemoji into the narrow right tile.
++    const lv_coord_t max_size = 52;
++    if (dsc->header.w > 0 && dsc->header.h > 0) {
++        const lv_coord_t scale_w = max_size * 256 / dsc->header.w;
++        const lv_coord_t scale_h = max_size * 256 / dsc->header.h;
++        lv_image_set_scale(object, scale_w < scale_h ? scale_w : scale_h);
++    }
++    lv_obj_set_size(object, max_size, max_size);
++    lv_obj_align(object, LV_ALIGN_TOP_MID, 0, 5);
++    lv_obj_remove_flag(object, LV_OBJ_FLAG_HIDDEN);
++}
++
++static std::unique_ptr<LvglImage> LoadVisionAsset(const char* name) {
++    void* data = nullptr;
++    size_t size = 0;
++    if (!Assets::GetInstance().GetAssetData(name, data, size)) return nullptr;
++    return std::make_unique<LvglRawImage>(data, size);
++}
++
++static bool LoadVisionDashboard(void*& data, size_t& size) {
++    const char* names[] = {"vision_dashboard_2.png", "vision_dashboard_1.png", "vision_dashboard.png"};
++    for (const char* name : names) {
++        if (Assets::GetInstance().GetAssetData(name, data, size)) {
++            ESP_LOGI(TAG, "Loaded vision dashboard asset: %s (%u bytes)", name, (unsigned)size);
++            return true;
++        }
++    }
++    ESP_LOGE(TAG, "No vision dashboard asset found in assets index");
++    return false;
++}
++
++static void StyleVisionCard(lv_obj_t* object, lv_color_t background, lv_color_t border,
++                            lv_coord_t radius = 10) {
++    lv_obj_set_style_bg_color(object, background, 0);
++    lv_obj_set_style_bg_opa(object, LV_OPA_COVER, 0);
++    lv_obj_set_style_border_color(object, border, 0);
++    lv_obj_set_style_border_width(object, 2, 0);
++    lv_obj_set_style_radius(object, radius, 0);
++    lv_obj_set_style_pad_all(object, 2, 0);
++    lv_obj_set_style_shadow_width(object, 0, 0);
++}
++
++static lv_obj_t* CreateVisionPart(lv_obj_t* parent, lv_coord_t x, lv_coord_t y,
++                                  lv_coord_t width, lv_coord_t height,
++                                  lv_color_t color, lv_coord_t radius) {
++    lv_obj_t* part = lv_obj_create(parent);
++    lv_obj_set_size(part, width, height);
++    lv_obj_set_pos(part, x, y);
++    lv_obj_set_style_bg_color(part, color, 0);
++    lv_obj_set_style_bg_opa(part, LV_OPA_COVER, 0);
++    lv_obj_set_style_border_width(part, 0, 0);
++    lv_obj_set_style_radius(part, radius, 0);
++    lv_obj_set_style_pad_all(part, 0, 0);
++    return part;
++}
++
++static void CreateVisionBear(lv_obj_t* parent) {
++    lv_obj_t* bear = lv_obj_create(parent);
++    lv_obj_set_size(bear, 25, 24);
++    lv_obj_set_pos(bear, 2, 0);
++    lv_obj_set_style_bg_opa(bear, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(bear, 0, 0);
++    lv_obj_set_style_pad_all(bear, 0, 0);
++    const lv_color_t brown = lv_color_hex(0xB86B35);
++    const lv_color_t face = lv_color_hex(0xFFE1AF);
++    CreateVisionPart(bear, 2, 1, 8, 8, brown, LV_RADIUS_CIRCLE);
++    CreateVisionPart(bear, 15, 1, 8, 8, brown, LV_RADIUS_CIRCLE);
++    CreateVisionPart(bear, 4, 4, 18, 18, brown, LV_RADIUS_CIRCLE);
++    CreateVisionPart(bear, 8, 10, 10, 7, face, LV_RADIUS_CIRCLE);
++    CreateVisionPart(bear, 8, 8, 3, 3, lv_color_hex(0x3A251C), LV_RADIUS_CIRCLE);
++    CreateVisionPart(bear, 15, 8, 3, 3, lv_color_hex(0x3A251C), LV_RADIUS_CIRCLE);
++}
++
++static lv_obj_t* CreateVisionPostureCartoon(lv_obj_t* parent) {
++    lv_obj_t* art = lv_obj_create(parent);
++    lv_obj_set_size(art, 68, 70);
++    lv_obj_align(art, LV_ALIGN_TOP_MID, 0, 3);
++    lv_obj_set_style_bg_opa(art, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(art, 0, 0);
++    lv_obj_set_style_pad_all(art, 0, 0);
++
++    // A small seated character behind the live posture skeleton.
++    const lv_color_t skin = lv_color_hex(0xFFD09C);
++    const lv_color_t hair = lv_color_hex(0x6C351D);
++    const lv_color_t shirt = lv_color_hex(0xFFC34D);
++    const lv_color_t chair = lv_color_hex(0x76A9D6);
++    CreateVisionPart(art, 5, 30, 5, 30, chair, 3);
++    CreateVisionPart(art, 9, 53, 43, 6, chair, 3);
++    CreateVisionPart(art, 26, 4, 16, 16, hair, LV_RADIUS_CIRCLE);
++    CreateVisionPart(art, 29, 7, 10, 10, skin, LV_RADIUS_CIRCLE);
++    CreateVisionPart(art, 25, 20, 18, 21, shirt, 6);
++    CreateVisionPart(art, 39, 28, 19, 5, skin, 3);
++    CreateVisionPart(art, 28, 40, 24, 7, lv_color_hex(0x315B9A), 3);
++    CreateVisionPart(art, 47, 44, 6, 21, skin, 3);
++    CreateVisionPart(art, 44, 62, 14, 5, lv_color_hex(0x25466F), 3);
++    return art;
++}
++
+ void LcdDisplay::InitializeLcdThemes() {
+     auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
+     auto icon_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_ICON_FONT);
+@@ -668,7 +849,24 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+         return;
+     }
+ 
++    // Leave the vision dashboard before showing a normal chat image.  The
++    // preview object is temporarily parented to the video tile while sensing.
++    if (vision_dashboard_ != nullptr) {
++        lv_obj_add_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
++        if (preview_image_ != nullptr) {
++            lv_obj_set_parent(preview_image_, content_);
++            lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
++        }
++        if (status_bar_ != nullptr) {
++            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
++        }
++        lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN);
++        lv_obj_set_flex_grow(content_, 1);
++        lv_obj_set_size(content_, LV_HOR_RES, LV_SIZE_CONTENT);
++    }
++
+     if (image == nullptr) {
++        preview_image_cached_.reset();
+         return;
+     }
+     
+@@ -745,7 +943,549 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+     // Auto-scroll to the image bubble
+     lv_obj_scroll_to_view_recursive(img_bubble, LV_ANIM_ON);
+ }
++
++void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
++                                       const DetectionResult& result) {
++    DisplayLockGuard lock(this);
++    if (content_ == nullptr || preview_image_ == nullptr || image == nullptr) return;
++
++    // Reset transient artwork before applying this frame.  The image objects
++    // are reused, so leaving one visible causes stale cards to flash over the
++    // next frame.
++    if (vision_posture_image_) lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_posture_icon_) lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_posture_cartoon_) lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_posture_label_) lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_emotion_image_) lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_emotion_label_) lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
++
++    // The detection dashboard is a full-screen mode. Hide the normal status
++    // bar so Wi-Fi, battery and clock do not consume layout height.
++    if (status_bar_ != nullptr) {
++        lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
++    }
++
++    auto theme = static_cast<LvglTheme*>(current_theme_);
++    const lv_coord_t w = LV_HOR_RES;
++    const lv_coord_t h = LV_VER_RES;
++    // The reference design is more comfortable with wider side cards than
++    // the original 1:3:1 split.  Use an adaptive 1:2:1 arrangement here.
++    const lv_coord_t bottom_h = 30;
++    const lv_coord_t left_w = std::max<lv_coord_t>(52, w / 6);
++    const lv_coord_t center_w = w - left_w * 2;
++    const lv_coord_t right_w = w - left_w - center_w;
++    // The target panel is 320x240; keep the header compact.
++        const lv_coord_t title_h = 20;
++
++    lv_obj_set_layout(content_, LV_LAYOUT_NONE);
++    lv_obj_set_size(content_, w, h);
++
++    if (vision_dashboard_ == nullptr) {
++        vision_dashboard_ = lv_obj_create(content_);
++        lv_obj_set_scrollbar_mode(vision_dashboard_, LV_SCROLLBAR_MODE_OFF);
++        lv_obj_clear_flag(vision_dashboard_, LV_OBJ_FLAG_SCROLLABLE);
++        lv_obj_set_size(vision_dashboard_, w, h);
++        lv_obj_set_pos(vision_dashboard_, 0, 0);
++        lv_obj_set_style_pad_all(vision_dashboard_, 0, 0);
++        lv_obj_set_style_border_width(vision_dashboard_, 0, 0);
++        // Cartoon dashboard palette adapted from the reference image.
++        lv_obj_set_style_bg_color(vision_dashboard_, lv_color_white(), 0);
++        void* dashboard_data = nullptr;
++        size_t dashboard_size = 0;
++        if (LoadVisionDashboard(dashboard_data, dashboard_size)) {
++            vision_background_image_ = std::make_unique<LvglRawImage>(dashboard_data, dashboard_size);
++            vision_background_view_ = lv_image_create(vision_dashboard_);
++            lv_obj_clear_flag(vision_background_view_, LV_OBJ_FLAG_SCROLLABLE);
++            lv_image_set_src(vision_background_view_, vision_background_image_->image_dsc());
++            lv_obj_set_size(vision_background_view_, w, h);
++            lv_obj_set_pos(vision_background_view_, 0, 0);
++        }
++        lv_obj_t* bottom_mask = lv_obj_create(vision_dashboard_);
++        lv_obj_set_size(bottom_mask, w, bottom_h);
++        lv_obj_set_pos(bottom_mask, 0, h - bottom_h);
++        lv_obj_set_style_bg_color(bottom_mask, lv_color_white(), 0);
++        lv_obj_set_style_bg_opa(bottom_mask, LV_OPA_COVER, 0);
++        lv_obj_set_style_border_width(bottom_mask, 0, 0);
++        lv_obj_set_style_pad_all(bottom_mask, 0, 0);
++
++        auto panel = [&](lv_coord_t x, lv_coord_t y, lv_coord_t pw, lv_coord_t ph) {
++            lv_obj_t* p = lv_obj_create(vision_dashboard_);
++            lv_obj_set_size(p, pw, ph); lv_obj_set_pos(p, x, y);
++            lv_obj_set_scrollbar_mode(p, LV_SCROLLBAR_MODE_OFF);
++            lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
++            lv_obj_set_style_pad_all(p, 0, 0);
++            lv_obj_set_style_bg_color(p, lv_color_hex(0xFFFFFF), 0);
++            lv_obj_set_style_border_width(p, 0, 0);
++            return p;
++        };
++        vision_heart_panel_ = panel(0, 0, left_w, h / 2);
++        vision_pressure_panel_ = panel(0, h / 2, left_w, h - h / 2);
++        vision_posture_panel_ = panel(left_w + center_w, 0, right_w, h / 2);
++        vision_emotion_panel_ = panel(left_w + center_w, h / 2, right_w, h - h / 2);
++        StyleVisionCard(vision_heart_panel_, lv_color_hex(0xFFF5F7), lv_color_hex(0xFF8FA3));
++        StyleVisionCard(vision_pressure_panel_, lv_color_hex(0xF1F7FF), lv_color_hex(0x6EA7FF));
++        StyleVisionCard(vision_posture_panel_, lv_color_hex(0xF2FFF3), lv_color_hex(0x80D780));
++        StyleVisionCard(vision_emotion_panel_, lv_color_hex(0xFFF9E9), lv_color_hex(0xFFD16A));
++        for (auto* panel : {vision_heart_panel_, vision_pressure_panel_, vision_posture_panel_, vision_emotion_panel_}) {
++            lv_obj_set_style_bg_opa(panel, LV_OPA_TRANSP, 0);
++            lv_obj_set_style_border_width(panel, 0, 0);
++            lv_obj_set_style_radius(panel, 0, 0);
++        }
++        vision_heart_icon_ = lv_label_create(vision_heart_panel_);
++        vision_pressure_icon_ = lv_label_create(vision_pressure_panel_);
++        vision_posture_cartoon_ = CreateVisionPostureCartoon(vision_posture_panel_);
++        vision_posture_icon_ = lv_line_create(vision_posture_panel_);
++        vision_posture_image_ = lv_image_create(vision_posture_panel_);
++        vision_emotion_image_ = lv_image_create(vision_emotion_panel_);
++        vision_heart_label_ = lv_label_create(vision_heart_panel_);
++        vision_pressure_label_ = lv_label_create(vision_pressure_panel_);
++        vision_posture_label_ = lv_label_create(vision_posture_panel_);
++        vision_emotion_label_ = lv_label_create(vision_emotion_panel_);
++        lv_obj_add_flag(vision_heart_icon_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_pressure_icon_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++        for (auto* label : {vision_heart_label_, vision_pressure_label_, vision_posture_label_, vision_emotion_label_}) {
++            lv_obj_set_width(label, left_w - 4);
++            lv_obj_set_height(label, LV_SIZE_CONTENT);
++            lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -5);
++            lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
++            lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
++            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
++            lv_obj_set_style_text_font(label, theme->text_font()->font(), 0);
++            lv_obj_set_style_text_color(label, lv_color_hex(0x243447), 0);
++            lv_obj_set_style_transform_zoom(label, 220, 0);
++            lv_obj_set_style_text_line_space(label, 2, 0);
++        }
++        lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
++        auto setup_icon = [&](lv_obj_t* icon, const char* glyph, lv_color_t color) {
++            lv_obj_set_width(icon, left_w);
++            lv_obj_set_height(icon, LV_SIZE_CONTENT);
++            lv_obj_set_style_text_font(icon, theme->large_icon_font()->font(), 0);
++            lv_obj_set_style_text_color(icon, color, 0);
++            lv_label_set_text(icon, glyph);
++            lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 8);
++        };
++        setup_icon(vision_heart_icon_, FONT_AWESOME_HEART, lv_color_hex(0xE53935));
++        // A static monitor pictogram keeps the blood-pressure card aligned
++        // with the reference design without competing with its value.
++        setup_icon(vision_pressure_icon_, FONT_AWESOME_CALCULATOR, lv_color_hex(0x4C8DFF));
++        lv_obj_set_style_text_font(vision_pressure_icon_, theme->large_icon_font()->font(), 0);
++        lv_obj_set_size(vision_posture_icon_, 52, 56);
++        lv_obj_align(vision_posture_icon_, LV_ALIGN_TOP_MID, 0, 5);
++        SetVisionPostureGraphic(vision_posture_icon_, false);
++        lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_set_size(vision_emotion_image_, 52, 52);
++        lv_obj_align(vision_emotion_image_, LV_ALIGN_TOP_MID, 0, 5);
++        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_t* title_panel = panel(left_w, 0, center_w, title_h);
++        StyleVisionCard(title_panel, lv_color_hex(0xEAF4FF), lv_color_hex(0x3F8FE8), 7);
++        CreateVisionBear(title_panel);
++        lv_obj_t* title_label = lv_label_create(title_panel);
++        // Leave a clear gap after the bear so the title never overlaps it.
++        lv_obj_set_width(title_label, center_w - 36);
++        lv_label_set_long_mode(title_label, LV_LABEL_LONG_CLIP);
++        lv_obj_set_style_text_align(title_label, LV_TEXT_ALIGN_CENTER, 0);
++        lv_obj_set_style_text_color(title_label, lv_color_hex(0x24507A), 0);
++        lv_obj_set_style_transform_zoom(title_label, 180, 0);
++        lv_label_set_text(title_label, "坐姿健康检测系统");
++        lv_obj_align(title_label, LV_ALIGN_RIGHT_MID, -3, 0);
++        // The supplied background already contains the final bear and title.
++        lv_obj_add_flag(title_panel, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_t* video_area = panel(left_w, title_h, center_w, h - title_h - bottom_h);
++        lv_obj_set_style_bg_opa(video_area, LV_OPA_TRANSP, 0);
++        lv_obj_set_style_border_width(video_area, 0, 0);
++        lv_obj_set_parent(preview_image_, vision_dashboard_);
++        // Exact inner video window of the 320x240 artwork.
++        const lv_coord_t video_w = (center_w - 8) * 9 / 10;
++        const lv_coord_t video_h = std::min<lv_coord_t>(h - title_h - bottom_h - 8, video_w * 3 / 4);
++        lv_obj_set_size(preview_image_, video_w, video_h);
++        lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
++        lv_obj_set_pos(preview_image_, left_w + (center_w - video_w) / 2,
++                       title_h + (h - title_h - bottom_h - video_h) / 2);
++        lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_COVER);
++        lv_obj_set_style_radius(preview_image_, 0, 0);
++        if (chat_message_label_ != nullptr) {
++            lv_obj_set_parent(chat_message_label_, vision_dashboard_);
++            lv_obj_set_size(chat_message_label_, w - 8, bottom_h - 4);
++            lv_obj_set_pos(chat_message_label_, 4, h - bottom_h + 2);
++            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
++            lv_obj_set_style_text_color(chat_message_label_, lv_color_hex(0x24507A), 0);
++            lv_obj_set_style_bg_color(chat_message_label_, lv_color_white(), 0);
++            lv_obj_set_style_bg_opa(chat_message_label_, LV_OPA_COVER, 0);
++            lv_obj_set_style_pad_all(chat_message_label_, 2, 0);
++            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
++            lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
++        }
++    }
++
++    char text[128];
++    // This label is refreshed on every preview frame; only the heart glyph
++    // is static.  Keep the live value inside the red heart as in the mockup.
++    if (result.heart_rate.available) {
++        snprintf(text, sizeof(text), "%.0f", result.heart_rate.bpm);
++        lv_label_set_text(vision_heart_label_, text);
++    } else {
++        lv_label_set_text(vision_heart_label_, "");
++    }
++    if (result.blood_pressure.available) {
++        snprintf(text, sizeof(text), "%.0f\n%.0f",
++                 result.blood_pressure.sbp_mmHg, result.blood_pressure.dbp_mmHg);
++        lv_label_set_text(vision_pressure_label_, text);
++    } else {
++        lv_label_set_text(vision_pressure_label_, "");
++    }
++    if (result.posture.available) {
++        bool posture_bad = result.posture.state == "bad_posture";
++        lv_obj_remove_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_align(vision_posture_label_, LV_ALIGN_TOP_MID, 0, 101);
++        lv_label_set_text(vision_posture_label_, posture_bad ? "\xE5\x9D\x90\xE5\xA7\xbf\xE4\xB8\x8D\xE6\xAD\xA3" : "\xE5\x9D\x90\xE5\xA7\xbf\xE7\AB\AF\xE6\xAD\xA3");
++        const char* posture_asset = posture_bad ? "vision_posture_incorrect.png" : "vision_posture_correct.png";
++        if (vision_posture_asset_name_ != posture_asset) {
++            auto posture_image = LoadVisionAsset(posture_asset);
++            if (posture_image != nullptr) {
++                lv_image_set_src(vision_posture_image_, posture_image->image_dsc());
++                if (vision_posture_asset_image_) {
++                    vision_asset_history_.push_back(std::move(vision_posture_asset_image_));
++                }
++                vision_posture_asset_image_ = std::move(posture_image);
++                vision_posture_asset_name_ = posture_asset;
++                lv_obj_set_size(vision_posture_image_, 76, 70);
++                lv_obj_set_align(vision_posture_image_, LV_ALIGN_DEFAULT);
++                lv_obj_set_pos(vision_posture_image_, -8, 27);
++                lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
++                lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
++            }
++        }
++        lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
++    }
++    if (result.emotion.available) {
++        std::string emotion_asset_name = "vision_emotion_";
++        emotion_asset_name += EmotionAssetKey(result.emotion.label);
++        emotion_asset_name += ".png";
++        if (vision_emotion_asset_name_ != emotion_asset_name) {
++            auto emotion_image = LoadVisionAsset(emotion_asset_name.c_str());
++            if (emotion_image != nullptr) {
++                lv_image_set_src(vision_emotion_image_, emotion_image->image_dsc());
++                if (vision_emotion_asset_image_) {
++                    vision_asset_history_.push_back(std::move(vision_emotion_asset_image_));
++                }
++                vision_emotion_asset_image_ = std::move(emotion_image);
++                vision_emotion_asset_name_ = emotion_asset_name;
++                lv_obj_set_size(vision_emotion_image_, 76, 80);
++                lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
++                lv_obj_set_pos(vision_emotion_image_, -8, 27);
++                lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
++                lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++            }
++        }
++        lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++    } else {
++        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++        lv_label_set_text(vision_emotion_label_, "");
++    }
++    lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
++    bool hr_alert = result.heart_rate.available && result.heart_rate.bpm > 120.0f;
++    bool bp_alert = result.blood_pressure.ready &&
++                    (result.blood_pressure.sbp_mmHg >= 140.0f ||
++                     result.blood_pressure.dbp_mmHg >= 90.0f);
++    bool posture_alert = result.posture.available && result.posture.state == "bad_posture";
++    if (false && hr_alert != vision_hr_alert_active_) {
++        vision_hr_alert_active_ = hr_alert;
++        lv_obj_set_style_bg_color(vision_heart_panel_, hr_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xFFF5F7), 0);
++        if (hr_alert) StartVisionAlertAnimation(vision_heart_panel_);
++        else StopVisionAlertAnimation(vision_heart_panel_);
++    }
++    if (false && bp_alert != vision_bp_alert_active_) {
++        vision_bp_alert_active_ = bp_alert;
++        lv_obj_set_style_bg_color(vision_pressure_panel_, bp_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xF1F7FF), 0);
++        if (bp_alert) StartVisionAlertAnimation(vision_pressure_panel_);
++        else StopVisionAlertAnimation(vision_pressure_panel_);
++    }
++    if (false && posture_alert != vision_posture_alert_active_) {
++        vision_posture_alert_active_ = posture_alert;
++        lv_obj_set_style_bg_color(vision_posture_panel_, posture_alert ? lv_color_hex(0xE85D75) : lv_color_hex(0xF2FFF3), 0);
++        if (posture_alert) StartVisionAlertAnimation(vision_posture_panel_);
++        else StopVisionAlertAnimation(vision_posture_panel_);
++    }
++    lv_color_t emotion_color = lv_color_hex(0x808080);
++    if (result.emotion.label == "happy") emotion_color = lv_color_hex(0x22AA55);
++    else if (result.emotion.label == "sad") emotion_color = lv_color_hex(0x3388CC);
++    else if (result.emotion.label == "angry") emotion_color = lv_color_hex(0xDD3333);
++    else if (result.emotion.label == "fear") emotion_color = lv_color_hex(0x9944CC);
++    else if (result.emotion.label == "surprise") emotion_color = lv_color_hex(0xEE9922);
++    lv_obj_set_style_text_color(vision_emotion_label_, emotion_color, 0);
++    // Re-assert the full-screen dashboard viewport on every camera frame.
++    lv_obj_set_parent(preview_image_, vision_dashboard_);
++    lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
++    const lv_coord_t video_w = center_w - 8;
++    const lv_coord_t video_h = std::min<lv_coord_t>(h - title_h - bottom_h - 8, video_w * 3 / 4);
++    lv_obj_set_size(preview_image_, video_w, video_h);
++    lv_obj_set_pos(preview_image_, left_w + (center_w - video_w) / 2,
++                   title_h + (h - title_h - bottom_h - video_h) / 2);
++    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
++    lv_image_set_src(preview_image_, image->image_dsc());
++    if (preview_image_cached_) {
++        vision_frame_history_.push_back(std::move(preview_image_cached_));
++        while (vision_frame_history_.size() > 8) vision_frame_history_.pop_front();
++    }
++    preview_image_cached_ = std::move(image);
++    // Keep the preview below the four information cards, but above the
++    // dashboard background image.
++    lv_obj_move_to_index(preview_image_, 1);
++    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
++    if (chat_message_label_ != nullptr) lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_remove_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
++}
+ #else
++void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
++                                       const DetectionResult& result) {
++    DisplayLockGuard lock(this);
++    if (!image || !content_ || !preview_image_) return;
++    if (vision_posture_image_) lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_posture_icon_) lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_posture_cartoon_) lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_posture_label_) lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_emotion_image_) lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++    if (vision_emotion_label_) lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
++    if (status_bar_ != nullptr) {
++        lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
++    }
++    const lv_coord_t w = LV_HOR_RES, h = LV_VER_RES;
++    const lv_coord_t th = 20;
++    const lv_coord_t bottom_h = 30;
++    const lv_coord_t lw = std::max<lv_coord_t>(52, w / 6);
++    const lv_coord_t cw = w - lw * 2;
++    lv_obj_set_layout(content_, LV_LAYOUT_NONE);
++    lv_obj_set_size(content_, w, h);
++    if (!vision_dashboard_) {
++        vision_dashboard_ = lv_obj_create(content_);
++        lv_obj_set_scrollbar_mode(vision_dashboard_, LV_SCROLLBAR_MODE_OFF);
++        lv_obj_clear_flag(vision_dashboard_, LV_OBJ_FLAG_SCROLLABLE);
++        lv_obj_set_size(vision_dashboard_, w, h); lv_obj_set_style_pad_all(vision_dashboard_, 0, 0);
++        lv_obj_set_style_bg_color(vision_dashboard_, lv_color_white(), 0);
++        void* dashboard_data = nullptr;
++        size_t dashboard_size = 0;
++        if (LoadVisionDashboard(dashboard_data, dashboard_size)) {
++            vision_background_image_ = std::make_unique<LvglRawImage>(dashboard_data, dashboard_size);
++            vision_background_view_ = lv_image_create(vision_dashboard_);
++            lv_obj_clear_flag(vision_background_view_, LV_OBJ_FLAG_SCROLLABLE);
++            lv_image_set_src(vision_background_view_, vision_background_image_->image_dsc());
++            lv_obj_set_size(vision_background_view_, w, h);
++            lv_obj_set_pos(vision_background_view_, 0, 0);
++        }
++        lv_obj_t* bottom_mask = lv_obj_create(vision_dashboard_);
++        lv_obj_set_size(bottom_mask, w, bottom_h);
++        lv_obj_set_pos(bottom_mask, 0, h - bottom_h);
++        lv_obj_set_style_bg_color(bottom_mask, lv_color_white(), 0);
++        lv_obj_set_style_bg_opa(bottom_mask, LV_OPA_COVER, 0);
++        lv_obj_set_style_border_width(bottom_mask, 0, 0);
++        lv_obj_set_style_pad_all(bottom_mask, 0, 0);
++        auto p = [&](lv_coord_t x, lv_coord_t y, lv_coord_t pw, lv_coord_t ph) { lv_obj_t* o = lv_obj_create(vision_dashboard_); lv_obj_set_size(o, pw, ph); lv_obj_set_pos(o, x, y); lv_obj_set_scrollbar_mode(o, LV_SCROLLBAR_MODE_OFF); lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_style_pad_all(o, 0, 0); lv_obj_set_style_bg_color(o, lv_color_hex(0xFFFFFF), 0); lv_obj_set_style_border_width(o, 0, 0); return o; };
++        auto l = [&](lv_obj_t* o) { lv_obj_t* x = lv_label_create(o); lv_obj_center(x); lv_obj_set_style_text_align(x, LV_TEXT_ALIGN_CENTER, 0); return x; };
++        vision_heart_panel_ = p(0, 0, lw, h / 2); vision_pressure_panel_ = p(0, h / 2, lw, h - h / 2);
++        vision_heart_label_ = l(vision_heart_panel_); vision_pressure_label_ = l(vision_pressure_panel_);
++        vision_posture_panel_ = p(w - lw, 0, lw, h / 2); vision_posture_label_ = l(vision_posture_panel_);
++        vision_emotion_panel_ = p(w - lw, h / 2, lw, h - h / 2); vision_emotion_label_ = l(vision_emotion_panel_);
++        vision_heart_icon_ = lv_label_create(vision_heart_panel_);
++        vision_pressure_icon_ = lv_label_create(vision_pressure_panel_);
++        vision_posture_cartoon_ = CreateVisionPostureCartoon(vision_posture_panel_);
++        vision_posture_icon_ = lv_line_create(vision_posture_panel_);
++        vision_posture_image_ = lv_image_create(vision_posture_panel_);
++        vision_emotion_image_ = lv_image_create(vision_emotion_panel_);
++        StyleVisionCard(vision_heart_panel_, lv_color_hex(0xFFF5F7), lv_color_hex(0xFF8FA3));
++        StyleVisionCard(vision_pressure_panel_, lv_color_hex(0xF1F7FF), lv_color_hex(0x6EA7FF));
++        StyleVisionCard(vision_posture_panel_, lv_color_hex(0xF2FFF3), lv_color_hex(0x80D780));
++        StyleVisionCard(vision_emotion_panel_, lv_color_hex(0xFFF9E9), lv_color_hex(0xFFD16A));
++        for (auto* panel : {vision_heart_panel_, vision_pressure_panel_, vision_posture_panel_, vision_emotion_panel_}) {
++            lv_obj_set_style_bg_opa(panel, LV_OPA_TRANSP, 0);
++            lv_obj_set_style_border_width(panel, 0, 0);
++            lv_obj_set_style_radius(panel, 0, 0);
++        }
++        lv_obj_add_flag(vision_heart_icon_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_pressure_icon_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++        for (auto* label : {vision_heart_label_, vision_pressure_label_, vision_posture_label_, vision_emotion_label_}) {
++            lv_obj_set_width(label, lw - 4);
++            lv_obj_set_height(label, LV_SIZE_CONTENT);
++            lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -5);
++            lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
++            lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
++            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
++            lv_obj_set_style_text_font(label, static_cast<LvglTheme*>(current_theme_)->text_font()->font(), 0);
++            lv_obj_set_style_text_color(label, lv_color_hex(0x243447), 0);
++            lv_obj_set_style_transform_zoom(label, 220, 0);
++            lv_obj_set_style_text_line_space(label, 2, 0);
++        }
++        lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
++        auto setup_icon = [&](lv_obj_t* icon, const char* glyph, lv_color_t color) {
++            lv_obj_set_width(icon, lw);
++            lv_obj_set_height(icon, LV_SIZE_CONTENT);
++            lv_obj_set_style_text_font(icon, static_cast<LvglTheme*>(current_theme_)->large_icon_font()->font(), 0);
++            lv_obj_set_style_text_color(icon, color, 0);
++            lv_label_set_text(icon, glyph);
++            lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 8);
++        };
++        setup_icon(vision_heart_icon_, FONT_AWESOME_HEART, lv_color_hex(0xE53935));
++        setup_icon(vision_pressure_icon_, FONT_AWESOME_CALCULATOR, lv_color_hex(0x4C8DFF));
++        lv_obj_set_style_text_font(vision_pressure_icon_, static_cast<LvglTheme*>(current_theme_)->large_icon_font()->font(), 0);
++        lv_obj_set_size(vision_posture_icon_, 52, 56);
++        lv_obj_align(vision_posture_icon_, LV_ALIGN_TOP_MID, 0, 5);
++        SetVisionPostureGraphic(vision_posture_icon_, false);
++        lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_set_size(vision_emotion_image_, 52, 52);
++        lv_obj_align(vision_emotion_image_, LV_ALIGN_TOP_MID, 0, 5);
++        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_t* title = l(p(lw, 0, cw, th));
++        StyleVisionCard(lv_obj_get_parent(title), lv_color_hex(0xEAF4FF), lv_color_hex(0x3F8FE8), 7);
++        CreateVisionBear(lv_obj_get_parent(title));
++        // Leave a clear gap after the bear so the title never overlaps it.
++        lv_obj_set_width(title, cw - 36);
++        lv_label_set_long_mode(title, LV_LABEL_LONG_CLIP);
++        lv_obj_set_style_text_color(title, lv_color_hex(0x24507A), 0);
++        lv_obj_set_style_transform_zoom(title, 180, 0);
++        lv_label_set_text(title, "坐姿健康检测系统");
++        lv_obj_align(title, LV_ALIGN_RIGHT_MID, -3, 0);
++        lv_obj_add_flag(lv_obj_get_parent(title), LV_OBJ_FLAG_HIDDEN);
++        lv_obj_t* video = p(lw, th, cw, h - th - bottom_h);
++        lv_obj_set_style_bg_opa(video, LV_OPA_TRANSP, 0);
++        lv_obj_set_style_border_width(video, 0, 0);
++        lv_obj_set_parent(preview_image_, vision_dashboard_);
++        const lv_coord_t video_w = cw - 8;
++        const lv_coord_t video_h = std::min<lv_coord_t>(h - th - bottom_h - 8, video_w * 3 / 4);
++        lv_obj_set_size(preview_image_, video_w, video_h);
++        lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
++        lv_obj_set_pos(preview_image_, lw + (cw - video_w) / 2, th + (h - th - bottom_h - video_h) / 2);
++        lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_COVER);
++        if (chat_message_label_ != nullptr) {
++            lv_obj_set_parent(chat_message_label_, vision_dashboard_);
++            lv_obj_set_size(chat_message_label_, w - 8, bottom_h - 4);
++            lv_obj_set_pos(chat_message_label_, 4, h - bottom_h + 2);
++            lv_obj_set_style_bg_color(chat_message_label_, lv_color_white(), 0);
++            lv_obj_set_style_bg_opa(chat_message_label_, LV_OPA_COVER, 0);
++            lv_obj_set_style_pad_all(chat_message_label_, 2, 0);
++            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
++            lv_obj_set_style_text_color(chat_message_label_, lv_color_hex(0x24507A), 0);
++            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
++            lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
++        }
++    }
++    char buf[96];
++    if (result.heart_rate.available) {
++        snprintf(buf, sizeof(buf), "%.0f", result.heart_rate.bpm);
++        lv_label_set_text(vision_heart_label_, buf);
++    } else {
++        lv_label_set_text(vision_heart_label_, "");
++    }
++    if (result.blood_pressure.available) {
++        snprintf(buf, sizeof(buf), "%.0f\n%.0f",
++                 result.blood_pressure.sbp_mmHg, result.blood_pressure.dbp_mmHg);
++        lv_label_set_text(vision_pressure_label_, buf);
++    } else {
++        lv_label_set_text(vision_pressure_label_, "");
++    }
++    lv_obj_set_align(vision_heart_label_, LV_ALIGN_DEFAULT);
++    lv_obj_set_pos(vision_heart_label_, 14, 47);
++    lv_obj_set_width(vision_heart_label_, 44);
++    lv_obj_set_align(vision_pressure_label_, LV_ALIGN_DEFAULT);
++    lv_obj_set_pos(vision_pressure_label_, 2, 31);
++    lv_obj_set_width(vision_pressure_label_, 64);
++    lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
++    lv_obj_set_style_text_color(vision_pressure_label_, lv_color_hex(0x1267D6), 0);
++    lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
++    if (result.posture.available) {
++        bool posture_bad = result.posture.state == "bad_posture";
++        lv_obj_remove_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_align(vision_posture_label_, LV_ALIGN_TOP_MID, 0, 101);
++        lv_label_set_text(vision_posture_label_, posture_bad ? "\xE5\x9D\x90\xE5\xA7\xBF\xE4\xB8\x8D\xE6\xAD\xA3" : "\xE5\x9D\x90\xE5\xA7\xBF\xE7\xAB\xAF\xE6\xAD\xA3");
++        const char* posture_asset = posture_bad ? "vision_posture_incorrect.png" : "vision_posture_correct.png";
++        if (vision_posture_asset_name_ != posture_asset) {
++            auto posture_image = LoadVisionAsset(posture_asset);
++            if (posture_image != nullptr) {
++                lv_image_set_src(vision_posture_image_, posture_image->image_dsc());
++                if (vision_posture_asset_image_) {
++                    vision_asset_history_.push_back(std::move(vision_posture_asset_image_));
++                }
++                vision_posture_asset_image_ = std::move(posture_image);
++                vision_posture_asset_name_ = posture_asset;
++                lv_obj_set_size(vision_posture_image_, 76, 70);
++                lv_obj_set_align(vision_posture_image_, LV_ALIGN_DEFAULT);
++                lv_obj_set_pos(vision_posture_image_, -8, 27);
++                lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
++                lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
++            }
++        }
++        lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
++    }
++    lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++    if (result.emotion.available) {
++        std::string emotion_asset_name = "vision_emotion_";
++        emotion_asset_name += EmotionAssetKey(result.emotion.label);
++        emotion_asset_name += ".png";
++        if (vision_emotion_asset_name_ != emotion_asset_name) {
++            auto emotion_image = LoadVisionAsset(emotion_asset_name.c_str());
++            if (emotion_image != nullptr) {
++                lv_image_set_src(vision_emotion_image_, emotion_image->image_dsc());
++                if (vision_emotion_asset_image_) {
++                    vision_asset_history_.push_back(std::move(vision_emotion_asset_image_));
++                }
++                vision_emotion_asset_image_ = std::move(emotion_image);
++                vision_emotion_asset_name_ = emotion_asset_name;
++                lv_obj_set_size(vision_emotion_image_, 76, 80);
++                lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
++                lv_obj_set_pos(vision_emotion_image_, -8, 27);
++                lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
++                lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++            }
++        }
++        lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
++    } else {
++        lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
++        lv_label_set_text(vision_emotion_label_, "");
++    }
++    // Keep visual cards stable. Health warnings are spoken by main's fixed
++    // voice-alert path; the dashboard must not flash or change layers.
++    StopVisionAlertAnimation(vision_heart_panel_);
++    StopVisionAlertAnimation(vision_pressure_panel_);
++    StopVisionAlertAnimation(vision_posture_panel_);
++    lv_color_t emotion_color = lv_color_hex(0x808080);
++    if (result.emotion.label == "happy") emotion_color = lv_color_hex(0x22AA55);
++    else if (result.emotion.label == "sad") emotion_color = lv_color_hex(0x3388CC);
++    else if (result.emotion.label == "angry") emotion_color = lv_color_hex(0xDD3333);
++    else if (result.emotion.label == "fear") emotion_color = lv_color_hex(0x9944CC);
++    else if (result.emotion.label == "surprise") emotion_color = lv_color_hex(0xEE9922);
++    lv_obj_set_style_text_color(vision_emotion_label_, emotion_color, 0);
++    lv_obj_set_parent(preview_image_, vision_dashboard_);
++    lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
++    const lv_coord_t video_w = (cw - 8) * 9 / 10;
++    const lv_coord_t video_h = std::min<lv_coord_t>(h - th - bottom_h - 8, video_w * 3 / 4);
++    lv_obj_set_size(preview_image_, video_w, video_h);
++    lv_obj_set_pos(preview_image_, lw + (cw - video_w) / 2, th + (h - th - bottom_h - video_h) / 2);
++    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
++    lv_image_set_src(preview_image_, image->image_dsc());
++    if (preview_image_cached_) {
++        vision_frame_history_.push_back(std::move(preview_image_cached_));
++        while (vision_frame_history_.size() > 8) vision_frame_history_.pop_front();
++    }
++    preview_image_cached_ = std::move(image);
++    lv_obj_move_to_index(preview_image_, 1);
++    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
++    if (chat_message_label_ != nullptr) lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
++}
++
+ void LcdDisplay::SetupUI() {
+     DisplayLockGuard lock(this);
+     LvglTheme* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+@@ -876,7 +1616,24 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+ 
+     if (image == nullptr) {
+         esp_timer_stop(preview_timer_);
++        if (status_bar_ != nullptr) {
++            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
++        }
++        if (vision_dashboard_ != nullptr) {
++            lv_obj_add_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
++        }
++        lv_obj_set_parent(preview_image_, content_);
++        if (chat_message_label_ != nullptr) {
++            lv_obj_set_parent(chat_message_label_, content_);
++            lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
++        }
++        lv_obj_set_size(preview_image_, width_ / 2, height_ / 2);
++        lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
++        lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN);
++        lv_obj_set_flex_grow(content_, 1);
++        lv_obj_set_size(content_, LV_HOR_RES, LV_SIZE_CONTENT);
+         lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
+         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+         preview_image_cached_.reset();
+         if (gif_controller_) {
+@@ -886,6 +1643,16 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+     }
+ 
+     preview_image_cached_ = std::move(image);
++    if (vision_dashboard_ != nullptr) {
++        lv_obj_add_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_set_parent(preview_image_, content_);
++        if (status_bar_ != nullptr) {
++            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
++        }
++        lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN);
++        lv_obj_set_flex_grow(content_, 1);
++        lv_obj_set_size(content_, LV_HOR_RES, LV_SIZE_CONTENT);
++    }
+     auto img_dsc = preview_image_cached_->image_dsc();
+     // 设置图片源并显示预览图片
+     lv_image_set_src(preview_image_, img_dsc);
+diff --git a/main/display/lcd_display.h b/main/display/lcd_display.h
+index 1c2904c..4387af6 100644
+--- a/main/display/lcd_display.h
++++ b/main/display/lcd_display.h
+@@ -10,6 +10,8 @@
+ 
+ #include <atomic>
+ #include <memory>
++#include <deque>
++#include <string>
+ 
+ #define PREVIEW_IMAGE_DURATION_MS 30000
+ 
+@@ -30,8 +32,36 @@ protected:
+     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
+     lv_obj_t* emoji_box_ = nullptr;
+     lv_obj_t* chat_message_label_ = nullptr;
++    lv_obj_t* vision_dashboard_ = nullptr;
++    lv_obj_t* vision_background_view_ = nullptr;
++    lv_obj_t* vision_heart_label_ = nullptr;
++    lv_obj_t* vision_pressure_label_ = nullptr;
++    lv_obj_t* vision_posture_label_ = nullptr;
++    lv_obj_t* vision_emotion_label_ = nullptr;
++    lv_obj_t* vision_heart_icon_ = nullptr;
++    lv_obj_t* vision_pressure_icon_ = nullptr;
++    lv_obj_t* vision_posture_icon_ = nullptr;
++    lv_obj_t* vision_emotion_image_ = nullptr;
++    lv_obj_t* vision_posture_image_ = nullptr;
++    lv_obj_t* vision_posture_cartoon_ = nullptr;
++    lv_obj_t* vision_heart_panel_ = nullptr;
++    lv_obj_t* vision_pressure_panel_ = nullptr;
++    lv_obj_t* vision_posture_panel_ = nullptr;
++    lv_obj_t* vision_emotion_panel_ = nullptr;
++    bool vision_hr_alert_active_ = false;
++    bool vision_bp_alert_active_ = false;
++    bool vision_posture_alert_active_ = false;
+     esp_timer_handle_t preview_timer_ = nullptr;
+     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
++    // LVGL/SPI may still reference a previous image after lv_image_set_src().
++    // Retain a short history so its PSRAM buffer is not freed during DMA.
++    std::deque<std::unique_ptr<LvglImage>> vision_frame_history_;
++    std::deque<std::unique_ptr<LvglImage>> vision_asset_history_;
++    std::unique_ptr<LvglImage> vision_background_image_ = nullptr;
++    std::unique_ptr<LvglImage> vision_posture_asset_image_ = nullptr;
++    std::unique_ptr<LvglImage> vision_emotion_asset_image_ = nullptr;
++    std::string vision_posture_asset_name_;
++    std::string vision_emotion_asset_name_;
+ 
+     void InitializeLcdThemes();
+     void SetupUI();
+@@ -47,6 +77,8 @@ public:
+     virtual void SetEmotion(const char* emotion) override;
+     virtual void SetChatMessage(const char* role, const char* content) override; 
+     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
++    virtual void SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
++                                       const DetectionResult& result) override;
+ 
+     // Add theme switching function
+     virtual void SetTheme(Theme* theme) override;
+diff --git a/main/display/lvgl_display/lvgl_display.cc b/main/display/lvgl_display/lvgl_display.cc
+index 2a1416b..6188978 100644
+--- a/main/display/lvgl_display/lvgl_display.cc
++++ b/main/display/lvgl_display/lvgl_display.cc
+@@ -205,6 +205,11 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
+ void LvglDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+ }
+ 
++void LvglDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
++                                        const DetectionResult& result) {
++    SetPreviewImage(std::move(image));
++}
++
+ void LvglDisplay::SetPowerSaveMode(bool on) {
+     if (on) {
+         SetChatMessage("system", "");
+diff --git a/main/display/lvgl_display/lvgl_display.h b/main/display/lvgl_display/lvgl_display.h
+index 226a6ff..06d2702 100644
+--- a/main/display/lvgl_display/lvgl_display.h
++++ b/main/display/lvgl_display/lvgl_display.h
+@@ -12,6 +12,8 @@
+ #include <string>
+ #include <chrono>
+ 
++struct DetectionResult;
++
+ class LvglDisplay : public Display {
+ public:
+     LvglDisplay();
+@@ -21,6 +23,8 @@ public:
+     virtual void ShowNotification(const char* notification, int duration_ms = 3000);
+     virtual void ShowNotification(const std::string &notification, int duration_ms = 3000);
+     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image);
++    virtual void SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
++                                       const DetectionResult& result);
+     virtual void UpdateStatusBar(bool update_all = false);
+     virtual void SetPowerSaveMode(bool on);
+     virtual bool SnapshotToJpeg(std::string& jpeg_data, int quality = 80);
+diff --git a/main/mcp_server.cc b/main/mcp_server.cc
+index 2ff1267..e486ed4 100644
+--- a/main/mcp_server.cc
++++ b/main/mcp_server.cc
+@@ -121,6 +121,9 @@ void McpServer::AddCommonTools() {
+                         "Real-time detection is currently running in LOCAL mode (no image is uploaded). "
+                         "Stop it with `self.vision.stop_continuous` first if you really need a cloud photo analysis.");
+                 }
++                if (VisionPipeline::GetInstance().IsPreviewRunning()) {
++                    throw std::runtime_error("Camera preview is currently running; stop preview first.");
++                }
+                 // Lower the priority to do the camera capture
+                 TaskPriorityReset priority_reset(1);
+ 
+diff --git a/main/vision/vision_pipeline.cc b/main/vision/vision_pipeline.cc
+index c634b7a..c53b3ae 100644
+--- a/main/vision/vision_pipeline.cc
++++ b/main/vision/vision_pipeline.cc
+@@ -321,7 +321,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
+     // 连续检测运行时摄像头被 PreviewLoop 独占，此处不再取帧，
+     // 避免并发 esp_camera_fb_get 失败被大模型误判为"摄像头坏了"。
+     // 引导大模型改用缓存读取工具。
+-    if (continuous_running_.load()) {
++    if (continuous_running_.load() || preview_running_.load()) {
+         if (out_debug_info) {
+             *out_debug_info = "continuous detection is running (camera busy). "
+                               "Use self.vision.get_user_emotion / get_posture / "
+@@ -379,7 +379,7 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
+                 ESP_LOGW(TAG, "OneShotDetect: ComposePreview returned NULL (bad alloc or invalid dims?)");
+             } else {
+                 auto t_disp0 = esp_timer_get_time();
+-                lcd->SetPreviewImage(std::move(image));
++                lcd->SetVisionPreviewImage(std::move(image), result);
+                 auto t_disp1 = esp_timer_get_time();
+                 stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
+                 stats_.display_count++;
+@@ -410,10 +410,12 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
+ // ---------- Two-thread architecture: Preview (15 FPS) + Detect (async) ----------
+ 
+ void VisionPipeline::PreviewLoop() {
+-    ESP_LOGI(TAG, "Preview loop started (15 FPS)");
++    ESP_LOGI(TAG, "Preview loop started (15 FPS capture, 15 FPS LCD)");
+ 
+     constexpr uint32_t kPreviewPeriodMs = 67;  // ~15 FPS
++    constexpr uint32_t kDisplayPeriodMs = 100;  // 10 FPS keeps audio responsive while remaining smooth.
+     uint64_t last_iter = 0;
++    uint64_t last_display_ms = 0;
+ 
+     while (continuous_running_.load()) {
+         auto t0 = esp_timer_get_time();
+@@ -433,8 +435,23 @@ void VisionPipeline::PreviewLoop() {
+                 shared_frame_version_++;
+             }
+ 
+-            // Step 3: Compose preview with latest bbox (if any)
+-            if (display_composer_) {
++            // Release the camera buffer before doing any JPEG/LVGL work.  The
++            // camera often has only one framebuffer, so holding it during a
++            // display refresh stalls the next capture.
++            const uint64_t now_ms = esp_timer_get_time() / 1000LL;
++            const bool should_display = last_display_ms == 0 ||
++                                        now_ms - last_display_ms >= kDisplayPeriodMs;
++            std::vector<uint8_t> display_frame_data;
++            ImageFrame display_frame = frame;
++            if (should_display) {
++                display_frame_data.assign(frame.data, frame.data + frame.len);
++            }
++            ReleaseCurrentFrame();
++
++            // Step 3: Compose preview with latest bbox (if any), at a bounded
++            // LCD rate. Detection continues to receive every captured frame.
++            if (should_display && display_composer_) {
++                last_display_ms = now_ms;
+                 auto* lcd = ResolveLvglDisplay();
+                 if (lcd != nullptr) {
+                     DetectionResult current_result;
+@@ -445,17 +462,19 @@ void VisionPipeline::PreviewLoop() {
+                     // 合并跨帧缓存的坐姿/心率/血压，保证 LCD 上持续显示（不被每帧 face_emotion 覆盖）
+                     {
+                         std::lock_guard<std::mutex> lock(sensing_mutex_);
++                        current_result.emotion = latest_emotion_;
+                         current_result.posture = latest_posture_;
+                         current_result.heart_rate = latest_heart_rate_;
+                         current_result.blood_pressure = latest_blood_pressure_;
+                     }
+                     // OV2640 直出 JPEG：解码成 RGB565 再送 LCD（检测线程直接用 JPEG 上传，互不影响）
+-                    const uint8_t* disp_data = frame.data;
+-                    int disp_w = frame.width;
+-                    int disp_h = frame.height;
+-                    if (frame.pixel_format == PIXFORMAT_JPEG) {
++                    display_frame.data = display_frame_data.data();
++                    const uint8_t* disp_data = display_frame.data;
++                    int disp_w = display_frame.width;
++                    int disp_h = display_frame.height;
++                    if (display_frame.pixel_format == PIXFORMAT_JPEG) {
+                         uint8_t* dec = nullptr; size_t dec_len = 0; int dw = 0, dh = 0;
+-                        if (!DecodeJpegFrame(frame, &dec, &dec_len, &dw, &dh)) {
++                        if (!DecodeJpegFrame(display_frame, &dec, &dec_len, &dw, &dh)) {
+                             disp_data = nullptr;  // 解码失败则本次不显示
+                         } else {
+                             disp_data = dec; disp_w = dw; disp_h = dh;
+@@ -471,7 +490,7 @@ void VisionPipeline::PreviewLoop() {
+ 
+                         if (image) {
+                             auto t_disp0 = esp_timer_get_time();
+-                            lcd->SetPreviewImage(std::move(image));
++                            lcd->SetVisionPreviewImage(std::move(image), current_result);
+                             auto t_disp1 = esp_timer_get_time();
+                             stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
+                             stats_.display_count++;
+@@ -480,8 +499,6 @@ void VisionPipeline::PreviewLoop() {
+                 }
+             }
+ 
+-            // Step 4: Release frame
+-            ReleaseCurrentFrame();
+         }
+ 
+         // Step 5: Sleep to maintain FPS
+@@ -628,6 +645,9 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
+         ESP_LOGW(TAG, "Continuous detect already running");
+         return true;
+     }
++    if (preview_running_.load()) {
++        StopPreview();
++    }
+     // Join any previous threads that may have auto-stopped
+     if (preview_thread_.joinable()) preview_thread_.join();
+     if (detect_thread_.joinable()) detect_thread_.join();
+@@ -661,7 +681,7 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
+     // stack (3072B) is too small and caused a printf crash. Use a larger stack.
+     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+     cfg.stack_size = 8192;
+-    cfg.prio = 5;
++    cfg.prio = 3;
+     esp_pthread_set_cfg(&cfg);
+     try {
+         preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
+@@ -732,7 +752,7 @@ void VisionPipeline::PreviewOnlyLoop() {
+                 disp_data, disp_w, disp_h,
+                 (size_t)disp_w * 2, empty_result);
+             if (image) {
+-                lcd->SetPreviewImage(std::move(image));
++                lcd->SetVisionPreviewImage(std::move(image), empty_result);
+             }
+         }
+ 
+@@ -750,6 +770,10 @@ void VisionPipeline::PreviewOnlyLoop() {
+ 
+ bool VisionPipeline::StartPreview(uint32_t period_ms) {
+     if (!initialized_) return false;
++    if (continuous_running_.load()) {
++        ESP_LOGW(TAG, "Cannot start preview while continuous detection is running");
++        return false;
++    }
+     if (preview_running_.load()) {
+         ESP_LOGW(TAG, "Preview already running");
+         return true;
+@@ -796,6 +820,11 @@ const DetectionResult& VisionPipeline::GetLastResult() const { return last_resul
+ // 缓存跨帧感知结果：心率值供查询，坐姿供 LCD 持续叠加
+ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
+     std::lock_guard<std::mutex> lock(sensing_mutex_);
++    if (result.emotion.available && !result.emotion.label.empty()) {
++        latest_emotion_ = result.emotion;
++    } else if (result.task == kTaskFaceEmotion) {
++        latest_emotion_ = EmotionResult();
++    }
+     if (result.heart_rate.available) {
+         latest_heart_rate_ = result.heart_rate;
+         heart_rate_timestamp_ms_ = result.timestamp_ms;
+@@ -941,7 +970,6 @@ static bool QueueVoiceAsset(const char* filename) {
+         (!was_listening && !audio.IsIdle())) {
+         return false;
+     }
+-
+     // 回收上一条已经播放完成的线程；正在播放时由 local_sound_playing_ 拦截。
+     if (g_voice_alert_thread.joinable()) {
+         g_voice_alert_thread.join();
+diff --git a/main/vision/vision_pipeline.h b/main/vision/vision_pipeline.h
+index 0863a1f..7fc1053 100644
+--- a/main/vision/vision_pipeline.h
++++ b/main/vision/vision_pipeline.h
+@@ -136,7 +136,8 @@ private:
+     int shared_frame_pixfmt_ = PIXFORMAT_RGB565;  // 记录共享帧格式（OV2640 直出 JPEG 时上传零编码）
+     uint32_t shared_frame_version_ = 0; // 每次新帧自增，Detection 线程据此跳过重复帧
+ 
+-    // 跨帧缓存的感知结果：心率值供查询，坐姿用于 LCD 持续叠加
++    // 跨帧缓存的感知结果：自动调度切换任务时供 LCD 持续叠加
++    EmotionResult latest_emotion_;
+     HeartRateResult latest_heart_rate_;
+     BloodPressureResult latest_blood_pressure_;
+     PostureResult latest_posture_;
+diff --git a/server/main.py b/server/main.py
+index 5201f8b..b100dfd 100644
+--- a/server/main.py
++++ b/server/main.py
+@@ -33,6 +33,7 @@ import protocol
+ import state as state_mod
+ from detectors.face_detector import FaceDetector
+ from detectors.emotion_detector import EmotionDetector
++from detectors.face_posture_detector import FacePostureDetector
+ from detectors.pose_detector import PoseDetector
+ from detectors.heart_detector import HeartRateDetector, METHODS as HEART_METHODS
+ from detectors.blood_pressure_detector import BloodPressureDetector
+@@ -70,7 +71,8 @@ CACHE_MAX_WIDTH = 320
+ state: state_mod.ServerState = None
+ face_detector: FaceDetector = None
+ emotion_detector: EmotionDetector = None
+-pose_detector: PoseDetector = None
++pose_detector: FacePostureDetector = None
++pose_keypoint_detector: PoseDetector = None
+ heart_detector: HeartRateDetector = None
+ blood_pressure_detector: BloodPressureDetector = None
+ 
+@@ -158,40 +160,10 @@ def _detect_face_emotion(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
+ 
+ 
+ def _detect_posture(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
+-    """基于当前帧人脸位置和面积的简化坐姿检测。"""
+-    face = face_detector.detect_primary_face(rgb, src_w, src_h)
+-    if face is None:
+-        raw_state = "unknown"
+-        reason = "no_face"
+-        metrics = {}
+-    else:
+-        bbox = face["bbox"]
+-        frame_w = max(1, src_w)
+-        frame_h = max(1, src_h)
+-        face_center_x = bbox["x"] + bbox["width"] / 2.0
+-        face_area_ratio = (bbox["width"] * bbox["height"]) / (frame_w * frame_h)
+-        center_ratio = face_center_x / frame_w
+-
+-        # 画面中间取水平居中的 50%；人脸面积达到四分之一即视为过大。
+-        if face_area_ratio >= 0.25:
+-            raw_state = "bad_posture"
+-            reason = "face_too_large"
+-        elif center_ratio < 0.25:
+-            raw_state = "bad_posture"
+-            reason = "face_too_left"
+-        elif center_ratio > 0.75:
+-            raw_state = "bad_posture"
+-            reason = "face_too_right"
+-        else:
+-            raw_state = "normal"
+-            reason = "ok"
+-        metrics = {
+-            "face_center_x": round(center_ratio, 4),
+-            "face_area_ratio": round(face_area_ratio, 4),
+-            "face": face,
+-        }
+-
+-    return {"state": raw_state, "reason": reason, "metrics": metrics}
++    """稳定的人脸几何坐姿检测，供 LCD 仪表盘显示。"""
++    if pose_detector is None:
++        return {"state": "unknown", "reason": "posture_detector_missing", "metrics": {}}
++    return pose_detector.detect(rgb)
+ 
+ 
+ def _detect_heart_rate() -> dict:
+@@ -215,11 +187,11 @@ def _dispatch_task(task: str, rgb: np.ndarray, src_w: int, src_h: int,
+         state.set_emotion(result["emotion"])
+     elif task == protocol.TASK_POSTURE:
+         # calibrate 参数为兼容旧客户端保留，但新版人脸规则不需要校准。
+-        if calibrate:
+-            # 新版坐姿判定不需要姿态模型或人工校准；直接使用人脸规则。
+-            result = _detect_posture(rgb, src_w, src_h)
+-        else:
+-            result = _detect_posture(rgb, src_w, src_h)
++        result = _detect_posture(rgb, src_w, src_h)
++        if calibrate and pose_detector is not None:
++            if pose_detector.calibrate(result.get("metrics")):
++                result["state"] = "normal"
++                result["reason"] = "baseline_set"
+         state.set_posture(result)
+     elif task == protocol.TASK_HEART_RATE:
+         result = _detect_heart_rate()
+@@ -480,7 +452,7 @@ def download_models():
+ # ============================================================
+ 
+ def main():
+-    global face_detector, emotion_detector, pose_detector, heart_detector, blood_pressure_detector, state
++    global face_detector, emotion_detector, pose_detector, pose_keypoint_detector, heart_detector, blood_pressure_detector, state
+ 
+     parser = argparse.ArgumentParser(description="ESP32 Bio-Perception Server")
+     parser.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
+@@ -529,10 +501,11 @@ def main():
+ 
+     # 坐姿模型可选
+     if Path(args.pose_model).exists():
+-        pose_detector = PoseDetector(args.pose_model)
++        pose_keypoint_detector = PoseDetector(args.pose_model)
+     else:
+-        pose_detector = None
+-        print(f"[WARN] Pose model not found: {args.pose_model} (posture 任务将不可用)")
++        pose_keypoint_detector = None
++        print(f"[WARN] Pose model not found: {args.pose_model}; using face geometry posture detection")
++    pose_detector = FacePostureDetector(face_detector, pose_keypoint_detector)
+ 
+     heart_detector = HeartRateDetector(face_detector, method=args.heart_method)
+     blood_pressure_detector = BloodPressureDetector(

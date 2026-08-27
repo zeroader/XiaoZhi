@@ -136,7 +136,8 @@ private:
     int shared_frame_pixfmt_ = PIXFORMAT_RGB565;  // 记录共享帧格式（OV2640 直出 JPEG 时上传零编码）
     uint32_t shared_frame_version_ = 0; // 每次新帧自增，Detection 线程据此跳过重复帧
 
-    // 跨帧缓存的感知结果：心率值供查询，坐姿用于 LCD 持续叠加
+    // 跨帧缓存的感知结果：自动调度切换任务时供 LCD 持续叠加
+    EmotionResult latest_emotion_;
     HeartRateResult latest_heart_rate_;
     BloodPressureResult latest_blood_pressure_;
     PostureResult latest_posture_;
