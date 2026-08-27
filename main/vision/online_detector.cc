@@ -250,7 +250,11 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
     std::string boundary = "----VISION_ONLINE_DETECT_BOUNDARY";
 
     auto network = Board::GetInstance().GetNetwork();
-    auto http = network->CreateHttp(timeout_sec_);
+    auto http = network->CreateHttp();
+    // CreateHttp's argument is a connection ID, not a timeout.  Without this
+    // explicit timeout the client waits for its 30-second default, making a
+    // short LAN outage look like a permanently stalled detector.
+    http->SetTimeout(timeout_sec_ * 1000);
 
     http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
     http->SetHeader("Transfer-Encoding", "chunked");

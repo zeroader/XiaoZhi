@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <thread>
 #include <mutex>
 #include <cJSON.h>
@@ -138,10 +139,13 @@ bool VisionPipeline::Initialize() {
     {
         Settings settings("vision");
         const auto saved = settings.GetString("active_detector");
+#ifndef VISION_DISABLE_LOCAL_FACE
         if (saved == "face" && face_detector_ != nullptr) {
             active_detector_type_ = DetectorType::kFace;
             active_detector_ = face_detector_.get();
-        } else if (saved == "remote" && remote_detector_ != nullptr) {
+        } else
+#endif
+        if (saved == "remote" && remote_detector_ != nullptr) {
             active_detector_type_ = DetectorType::kRemote;
             active_detector_ = remote_detector_.get();
         }
@@ -629,15 +633,19 @@ void VisionPipeline::DetectionLoop() {
         // 根据服务器结果触发本地语音提醒
         MaybePlayVoiceAlerts(result);
 
-        // Track connection errors
+        // Keep the preview and detection session alive across temporary LAN,
+        // server, or MQTT-related outages.  Previously three failed requests
+        // stopped the loop permanently, leaving only camera-capture logs until
+        // the user manually started detection again.
         if (!result.connection_ok) {
             consecutive_errors++;
-            ESP_LOGW(TAG, "Detection error (%d/3): %s", consecutive_errors,
-                     result.error_message.c_str());
-            if (consecutive_errors >= 3) {
-                ESP_LOGE(TAG, "Stopping after %d consecutive detection errors", consecutive_errors);
-                continuous_running_.store(false);
-                break;
+            const uint32_t retry_delay_ms = std::min<uint32_t>(
+                1000U * static_cast<uint32_t>(consecutive_errors), 5000U);
+            ESP_LOGW(TAG, "Detection error (%d): %s; retrying in %ums",
+                     consecutive_errors,
+                     result.error_message.c_str(), retry_delay_ms);
+            if (continuous_running_.load()) {
+                vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
             }
         } else {
             consecutive_errors = 0;
@@ -1214,7 +1222,8 @@ void RegisterVisionMcpTools() {
         "Note: `online` is the default after initialization.\n"
         "Args:\n"
         "  `detector`: One of `face` (local, low-latency, ESP-SR based, NO upload), "
-        "`remote` (HTTP server based, UPLOADS the frame to the configured server).",
+        "`remote` (legacy HTTP server based, uploads the frame to its configured endpoint), "
+        "or `online` (the unified LAN vision server used for face, posture, heart rate, and blood pressure).",
         PropertyList({
             Property("detector", kPropertyTypeString)
         }),

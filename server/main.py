@@ -203,7 +203,13 @@ def _detect_heart_rate() -> dict:
 def _detect_blood_pressure() -> dict:
     """Evaluate the latest long rPPG window without recording another video sequence."""
     samples = state.get_recent_rppg_samples(blood_pressure_detector.window_seconds)
-    return blood_pressure_detector.detect(samples)
+    result = blood_pressure_detector.detect(samples)
+    # Blood-pressure requests also sample the current frame. Return that face
+    # so the device can keep the overlay tracking while the BP window is built.
+    face = blood_pressure_detector.get_last_face()
+    if face is not None:
+        result["face"] = face
+    return result
 
 
 def _dispatch_task(task: str, rgb: np.ndarray, src_w: int, src_h: int,
