@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <thread>
 #include <mutex>
 #include <cJSON.h>
@@ -632,15 +633,19 @@ void VisionPipeline::DetectionLoop() {
         // 根据服务器结果触发本地语音提醒
         MaybePlayVoiceAlerts(result);
 
-        // Track connection errors
+        // Keep the preview and detection session alive across temporary LAN,
+        // server, or MQTT-related outages.  Previously three failed requests
+        // stopped the loop permanently, leaving only camera-capture logs until
+        // the user manually started detection again.
         if (!result.connection_ok) {
             consecutive_errors++;
-            ESP_LOGW(TAG, "Detection error (%d/3): %s", consecutive_errors,
-                     result.error_message.c_str());
-            if (consecutive_errors >= 3) {
-                ESP_LOGE(TAG, "Stopping after %d consecutive detection errors", consecutive_errors);
-                continuous_running_.store(false);
-                break;
+            const uint32_t retry_delay_ms = std::min<uint32_t>(
+                1000U * static_cast<uint32_t>(consecutive_errors), 5000U);
+            ESP_LOGW(TAG, "Detection error (%d): %s; retrying in %ums",
+                     consecutive_errors,
+                     result.error_message.c_str(), retry_delay_ms);
+            if (continuous_running_.load()) {
+                vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
             }
         } else {
             consecutive_errors = 0;
