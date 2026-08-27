@@ -145,17 +145,24 @@ class BloodPressureDetector:
         self.relaxed_quality = bool(relaxed_quality)
         self._roi = HeartRateDetector(None, method=method)
         self.model = OnnxBloodPressureModel(model_path, config_path)
+        self._last_face = None
 
     def sample_frame(self, image_rgb: np.ndarray) -> tuple:
         """Return (forehead_rgb, confidence); rgb is None when no usable face exists."""
+        self._last_face = None
         if self.face_detector is None:
             return None, 0.0
         h, w = image_rgb.shape[:2]
         face = self.face_detector.detect_primary_face(image_rgb, w, h)
+        self._last_face = face
         if face is None:
             return None, 0.0
         rgb = self._roi._forehead_mean_rgb(image_rgb, face["bbox"])
         return rgb, float(face["confidence"])
+
+    def get_last_face(self) -> Optional[dict]:
+        """Return the face detected while sampling the most recent frame."""
+        return self._last_face
 
     def _quality(self, samples: Iterable) -> tuple:
         samples = list(samples)
