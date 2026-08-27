@@ -40,9 +40,10 @@ set(SOURCES "audio/audio_codec.cc"
             "vision/online_detector.cc"
             "vision/vision_display.cc"
             "vision/vision_pipeline.cc"
+            "lamp/miot_lamp_controller.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "protocols" "vision")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "protocols" "vision" "lamp")
 
 # Add board common files
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)

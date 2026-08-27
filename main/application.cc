@@ -10,6 +10,7 @@
 #include "assets.h"
 #include "settings.h"
 #include "vision_pipeline.h"
+#include "miot_lamp_controller.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -402,6 +403,7 @@ void Application::Start() {
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
     RegisterVisionMcpTools();
+    RegisterMiotLampMcpTools();
 
     if (ota.HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();

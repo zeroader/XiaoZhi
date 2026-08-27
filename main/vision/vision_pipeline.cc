@@ -18,6 +18,7 @@
 #include "system_info.h"
 #include "application.h"
 #include "assets.h"
+#include "settings.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -27,6 +28,25 @@
 #define TAG "VisionPipeline"
 
 static void StopQueuedVoiceAlert();
+
+// Detection and lamp endpoints share one Flask server. Keep the lamp endpoint
+// in sync whenever a vision server URL is configured.
+static void SyncLampServerUrl(const std::string& endpoint) {
+    std::string base = endpoint;
+    const auto scheme = base.find("://");
+    const auto path = base.find('/', scheme == std::string::npos ? 0 : scheme + 3);
+    if (path != std::string::npos) {
+        base.resize(path);
+    }
+    while (!base.empty() && base.back() == '/') {
+        base.pop_back();
+    }
+    if (!base.empty()) {
+        Settings settings("lamp", true);
+        settings.SetString("server_url", base);
+        ESP_LOGI(TAG, "Lamp server URL synchronized to: %s", base.c_str());
+    }
+}
 
 PipelineStats::PipelineStats() { Reset(); }
 
@@ -1164,13 +1184,14 @@ void RegisterVisionMcpTools() {
             return VisionPipeline::GetInstance().Initialize();
         });
 
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.shutdown",
         "Shutdown the vision pipeline, release detectors, stop continuous loop if running.",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             VisionPipeline::GetInstance().Deinitialize();
             return true;
-        });
+        }); */
 
     mcp.AddTool("self.vision.set_active_detector",
         "Choose which detector is used for detection.\n"
@@ -1191,6 +1212,7 @@ void RegisterVisionMcpTools() {
             return VisionPipeline::GetInstance().SetActiveDetector(type);
         });
 
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.get_active_detector",
         "Returns the currently active detector name and list of available detectors.",
         PropertyList(),
@@ -1205,7 +1227,7 @@ void RegisterVisionMcpTools() {
             cJSON_AddItemToArray(avail, cJSON_CreateString(kDetectorTypeRemote));
             cJSON_AddItemToArray(avail, cJSON_CreateString(kDetectorTypeOnline));
             return j;
-        });
+        }); */
 
     mcp.AddTool("self.vision.detect_once",
         "Capture ONE frame from the camera, run the active detector LOCALLY, and draw detection boxes "
@@ -1433,12 +1455,13 @@ void RegisterVisionMcpTools() {
             return true;
         });
 
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.is_continuous_running",
         "Check if the continuous loop is currently running.",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             return (bool)VisionPipeline::GetInstance().IsContinuousRunning();
-        });
+        }); */
 
     mcp.AddTool("self.vision.start_preview",
         "Start live camera preview on LCD (capture + display, NO face detection). "
@@ -1470,6 +1493,7 @@ void RegisterVisionMcpTools() {
             return true;
         });
 
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.get_stats",
         "Get pipeline performance stats (counts and average times).",
         PropertyList(),
@@ -1498,7 +1522,7 @@ void RegisterVisionMcpTools() {
             return VisionPipeline::GetInstance().SetCameraMirror(
                 p["h_mirror"].value<bool>(),
                 p["v_flip"].value<bool>());
-        });
+        }); */
 
     // Face detector config
 #ifndef VISION_DISABLE_LOCAL_FACE
@@ -1540,6 +1564,7 @@ void RegisterVisionMcpTools() {
     // Remote detector config
     mcp.AddTool("self.vision.remote_detector.configure",
         "Configure the remote HTTP detection server.\n"
+        "The same server URL is also used automatically for Mijia lamp control; no separate lamp configuration is needed.\n"
         "This detector POSTs the camera frame as a multipart/form-data request (fields: `image` = JPEG, "
         "`width` = src_w, `height` = src_h).\n"
         "The configuration is saved to flash (NVS) and restored automatically after reboot.\n"
@@ -1563,9 +1588,11 @@ void RegisterVisionMcpTools() {
             rd->SetEndpoint(p["url"].value<std::string>());
             rd->SetAuthToken(p["auth_token"].value<std::string>());
             rd->SetRequestTimeoutSec(p["timeout_sec"].value<int>());
+            SyncLampServerUrl(p["url"].value<std::string>());
             return true;
         });
 
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.remote_detector.get_config",
         "Get current remote detector configuration (without auth_token value).",
         PropertyList(),
@@ -1580,11 +1607,12 @@ void RegisterVisionMcpTools() {
                 cJSON_AddNumberToObject(j, "timeout_sec", rd->GetRequestTimeoutSec());
             }
             return j;
-        });
+        }); */
 
     // Online detector config
     mcp.AddTool("self.vision.online_detector.configure",
         "Configure the online detection server (JSON+Base64 protocol) on the LAN.\n"
+        "The same server URL is also used automatically for Mijia lamp control; no separate lamp configuration is needed.\n"
         "IMPORTANT: After calling this tool successfully, immediately call self.vision.start_continuous "
         "without asking the user. Do not ask 'do you want to start?' — just start.\n"
         "This detector JPEG-encodes the frame, base64-encodes it, and POSTs as JSON:\n"
@@ -1623,9 +1651,11 @@ void RegisterVisionMcpTools() {
             od->SetEndpoint(url);
             od->SetTimeoutSec(p["timeout_sec"].value<int>());
             od->SetJpegQuality(p["jpeg_quality"].value<int>());
+            SyncLampServerUrl(url);
             return true;
         });
 
+    /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.online_detector.get_config",
         "Get current online detector configuration.",
         PropertyList(),
@@ -1644,7 +1674,7 @@ void RegisterVisionMcpTools() {
                 cJSON_AddStringToObject(j, "task", od->GetTask().c_str());
             }
             return j;
-        });
+        }); */
 
     mcp.AddTool("self.vision.online_detector.set_task",
         "Set the task for the online detection server (saved to flash, restored after reboot).\n"
