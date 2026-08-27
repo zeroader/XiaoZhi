@@ -946,7 +946,10 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 
 void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                                        const DetectionResult& result) {
-    DisplayLockGuard lock(this);
+    // Conversation updates share this lock. Never let a busy UI stall camera
+    // capture: dropping one LCD frame is preferable to blocking the pipeline.
+    DisplayLockGuard lock(this, 1);
+    if (!lock) return;
     if (content_ == nullptr || preview_image_ == nullptr || image == nullptr) return;
 
     // Reset transient artwork before applying this frame.  The image objects
@@ -968,12 +971,12 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     auto theme = static_cast<LvglTheme*>(current_theme_);
     const lv_coord_t w = LV_HOR_RES;
     const lv_coord_t h = LV_VER_RES;
-    // The reference design is more comfortable with wider side cards than
-    // the original 1:3:1 split.  Use an adaptive 1:2:1 arrangement here.
-    const lv_coord_t bottom_h = 30;
     const lv_coord_t left_w = std::max<lv_coord_t>(52, w / 6);
     const lv_coord_t center_w = w - left_w * 2;
-    const lv_coord_t right_w = w - left_w - center_w;
+    const lv_coord_t preview_w = (center_w - 8) * 9 / 10;
+    const lv_coord_t side_w = left_w + (center_w - preview_w) / 2;
+    const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
+    const lv_coord_t bottom_h = 30;
     // The target panel is 320x240; keep the header compact.
         const lv_coord_t title_h = 20;
 
@@ -1018,10 +1021,14 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
             lv_obj_set_style_border_width(p, 0, 0);
             return p;
         };
-        vision_heart_panel_ = panel(0, 0, left_w, h / 2);
-        vision_pressure_panel_ = panel(0, h / 2, left_w, h - h / 2);
-        vision_posture_panel_ = panel(left_w + center_w, 0, right_w, h / 2);
-        vision_emotion_panel_ = panel(left_w + center_w, h / 2, right_w, h - h / 2);
+        // Expand side cards into the existing preview margins.
+        const lv_coord_t video_w = (center_w - 8) * 9 / 10;
+        const lv_coord_t side_w = left_w + (center_w - video_w) / 2;
+        const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
+        vision_heart_panel_ = panel(0, 0, side_w, h / 2);
+        vision_pressure_panel_ = panel(0, h / 2, side_w, h - h / 2);
+        vision_posture_panel_ = panel(w - side_w, 0, side_w, h / 2);
+        vision_emotion_panel_ = panel(w - side_w, h / 2, side_w, h - h / 2);
         StyleVisionCard(vision_heart_panel_, lv_color_hex(0xFFF5F7), lv_color_hex(0xFF8FA3));
         StyleVisionCard(vision_pressure_panel_, lv_color_hex(0xF1F7FF), lv_color_hex(0x6EA7FF));
         StyleVisionCard(vision_posture_panel_, lv_color_hex(0xF2FFF3), lv_color_hex(0x80D780));
@@ -1048,7 +1055,7 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
         for (auto* label : {vision_heart_label_, vision_pressure_label_, vision_posture_label_, vision_emotion_label_}) {
-            lv_obj_set_width(label, left_w - 4);
+            lv_obj_set_width(label, side_w - 4);
             lv_obj_set_height(label, LV_SIZE_CONTENT);
             lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -5);
             lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
@@ -1061,7 +1068,7 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         }
         lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
         auto setup_icon = [&](lv_obj_t* icon, const char* glyph, lv_color_t color) {
-            lv_obj_set_width(icon, left_w);
+            lv_obj_set_width(icon, side_w);
             lv_obj_set_height(icon, LV_SIZE_CONTENT);
             lv_obj_set_style_text_font(icon, theme->large_icon_font()->font(), 0);
             lv_obj_set_style_text_color(icon, color, 0);
@@ -1152,9 +1159,9 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                 }
                 vision_posture_asset_image_ = std::move(posture_image);
                 vision_posture_asset_name_ = posture_asset;
-                lv_obj_set_size(vision_posture_image_, 76, 70);
-                lv_obj_set_align(vision_posture_image_, LV_ALIGN_DEFAULT);
-                lv_obj_set_pos(vision_posture_image_, -8, 27);
+        lv_obj_set_size(vision_posture_image_, card_icon_w, 60);
+        lv_obj_set_align(vision_posture_image_, LV_ALIGN_TOP_MID);
+        lv_obj_set_pos(vision_posture_image_, 0, 25);
                 lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
                 lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
             }
@@ -1174,9 +1181,9 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                 }
                 vision_emotion_asset_image_ = std::move(emotion_image);
                 vision_emotion_asset_name_ = emotion_asset_name;
-                lv_obj_set_size(vision_emotion_image_, 76, 80);
-                lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
-                lv_obj_set_pos(vision_emotion_image_, -8, 27);
+        lv_obj_set_size(vision_emotion_image_, card_icon_w, 60);
+        lv_obj_set_align(vision_emotion_image_, LV_ALIGN_TOP_MID);
+        lv_obj_set_pos(vision_emotion_image_, 0, 25);
                 lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
                 lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
             }
@@ -1220,10 +1227,10 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     // Re-assert the full-screen dashboard viewport on every camera frame.
     lv_obj_set_parent(preview_image_, vision_dashboard_);
     lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
-    const lv_coord_t video_w = center_w - 8;
+    const lv_coord_t video_w = preview_w;
     const lv_coord_t video_h = std::min<lv_coord_t>(h - title_h - bottom_h - 8, video_w * 3 / 4);
     lv_obj_set_size(preview_image_, video_w, video_h);
-    lv_obj_set_pos(preview_image_, left_w + (center_w - video_w) / 2,
+    lv_obj_set_pos(preview_image_, side_w,
                    title_h + (h - title_h - bottom_h - video_h) / 2);
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
     lv_image_set_src(preview_image_, image->image_dsc());
@@ -1243,7 +1250,10 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
 #else
 void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                                        const DetectionResult& result) {
-    DisplayLockGuard lock(this);
+    // Conversation updates share this lock. Never let a busy UI stall camera
+    // capture: dropping one LCD frame is preferable to blocking the pipeline.
+    DisplayLockGuard lock(this, 1);
+    if (!lock) return;
     if (!image || !content_ || !preview_image_) return;
     if (vision_posture_image_) lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
     if (vision_posture_icon_) lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
@@ -1259,6 +1269,9 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     const lv_coord_t bottom_h = 30;
     const lv_coord_t lw = std::max<lv_coord_t>(52, w / 6);
     const lv_coord_t cw = w - lw * 2;
+    const lv_coord_t preview_w = (cw - 8) * 9 / 10;
+    const lv_coord_t side_w = lw + (cw - preview_w) / 2;
+    const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
     lv_obj_set_layout(content_, LV_LAYOUT_NONE);
     lv_obj_set_size(content_, w, h);
     if (!vision_dashboard_) {
@@ -1286,10 +1299,13 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_set_style_pad_all(bottom_mask, 0, 0);
         auto p = [&](lv_coord_t x, lv_coord_t y, lv_coord_t pw, lv_coord_t ph) { lv_obj_t* o = lv_obj_create(vision_dashboard_); lv_obj_set_size(o, pw, ph); lv_obj_set_pos(o, x, y); lv_obj_set_scrollbar_mode(o, LV_SCROLLBAR_MODE_OFF); lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_style_pad_all(o, 0, 0); lv_obj_set_style_bg_color(o, lv_color_hex(0xFFFFFF), 0); lv_obj_set_style_border_width(o, 0, 0); return o; };
         auto l = [&](lv_obj_t* o) { lv_obj_t* x = lv_label_create(o); lv_obj_center(x); lv_obj_set_style_text_align(x, LV_TEXT_ALIGN_CENTER, 0); return x; };
-        vision_heart_panel_ = p(0, 0, lw, h / 2); vision_pressure_panel_ = p(0, h / 2, lw, h - h / 2);
+        const lv_coord_t video_w = cw - 8;
+        const lv_coord_t side_w = lw + (cw - video_w) / 2;
+        const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
+        vision_heart_panel_ = p(0, 0, side_w, h / 2); vision_pressure_panel_ = p(0, h / 2, side_w, h - h / 2);
         vision_heart_label_ = l(vision_heart_panel_); vision_pressure_label_ = l(vision_pressure_panel_);
-        vision_posture_panel_ = p(w - lw, 0, lw, h / 2); vision_posture_label_ = l(vision_posture_panel_);
-        vision_emotion_panel_ = p(w - lw, h / 2, lw, h - h / 2); vision_emotion_label_ = l(vision_emotion_panel_);
+        vision_posture_panel_ = p(w - side_w, 0, side_w, h / 2); vision_posture_label_ = l(vision_posture_panel_);
+        vision_emotion_panel_ = p(w - side_w, h / 2, side_w, h - h / 2); vision_emotion_label_ = l(vision_emotion_panel_);
         vision_heart_icon_ = lv_label_create(vision_heart_panel_);
         vision_pressure_icon_ = lv_label_create(vision_pressure_panel_);
         vision_posture_cartoon_ = CreateVisionPostureCartoon(vision_posture_panel_);
@@ -1312,7 +1328,7 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
         for (auto* label : {vision_heart_label_, vision_pressure_label_, vision_posture_label_, vision_emotion_label_}) {
-            lv_obj_set_width(label, lw - 4);
+            lv_obj_set_width(label, side_w - 4);
             lv_obj_set_height(label, LV_SIZE_CONTENT);
             lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -5);
             lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
@@ -1325,7 +1341,7 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         }
         lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
         auto setup_icon = [&](lv_obj_t* icon, const char* glyph, lv_color_t color) {
-            lv_obj_set_width(icon, lw);
+            lv_obj_set_width(icon, side_w);
             lv_obj_set_height(icon, LV_SIZE_CONTENT);
             lv_obj_set_style_text_font(icon, static_cast<LvglTheme*>(current_theme_)->large_icon_font()->font(), 0);
             lv_obj_set_style_text_color(icon, color, 0);
@@ -1357,11 +1373,10 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_set_style_bg_opa(video, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(video, 0, 0);
         lv_obj_set_parent(preview_image_, vision_dashboard_);
-        const lv_coord_t video_w = cw - 8;
         const lv_coord_t video_h = std::min<lv_coord_t>(h - th - bottom_h - 8, video_w * 3 / 4);
         lv_obj_set_size(preview_image_, video_w, video_h);
         lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(preview_image_, lw + (cw - video_w) / 2, th + (h - th - bottom_h - video_h) / 2);
+        lv_obj_set_pos(preview_image_, side_w, th + (h - th - bottom_h - video_h) / 2);
         lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_COVER);
         if (chat_message_label_ != nullptr) {
             lv_obj_set_parent(chat_message_label_, vision_dashboard_);
@@ -1417,9 +1432,9 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                 }
                 vision_posture_asset_image_ = std::move(posture_image);
                 vision_posture_asset_name_ = posture_asset;
-                lv_obj_set_size(vision_posture_image_, 76, 70);
+                lv_obj_set_size(vision_posture_image_, card_icon_w, 60);
                 lv_obj_set_align(vision_posture_image_, LV_ALIGN_DEFAULT);
-                lv_obj_set_pos(vision_posture_image_, -8, 27);
+                lv_obj_set_pos(vision_posture_image_, 0, 25);
                 lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
                 lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
             }
@@ -1442,9 +1457,9 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                 }
                 vision_emotion_asset_image_ = std::move(emotion_image);
                 vision_emotion_asset_name_ = emotion_asset_name;
-                lv_obj_set_size(vision_emotion_image_, 76, 80);
+                lv_obj_set_size(vision_emotion_image_, card_icon_w, 60);
                 lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
-                lv_obj_set_pos(vision_emotion_image_, -8, 27);
+                lv_obj_set_pos(vision_emotion_image_, 0, 25);
                 lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
                 lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
             }
@@ -1469,10 +1484,10 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     lv_obj_set_style_text_color(vision_emotion_label_, emotion_color, 0);
     lv_obj_set_parent(preview_image_, vision_dashboard_);
     lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
-    const lv_coord_t video_w = (cw - 8) * 9 / 10;
+    const lv_coord_t video_w = preview_w;
     const lv_coord_t video_h = std::min<lv_coord_t>(h - th - bottom_h - 8, video_w * 3 / 4);
     lv_obj_set_size(preview_image_, video_w, video_h);
-    lv_obj_set_pos(preview_image_, lw + (cw - video_w) / 2, th + (h - th - bottom_h - video_h) / 2);
+    lv_obj_set_pos(preview_image_, side_w, th + (h - th - bottom_h - video_h) / 2);
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
     lv_image_set_src(preview_image_, image->image_dsc());
     if (preview_image_cached_) {
