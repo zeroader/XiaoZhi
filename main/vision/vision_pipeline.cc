@@ -132,8 +132,20 @@ bool VisionPipeline::Initialize() {
 
     display_composer_ = std::make_unique<VisionDisplay>();
 
+    // Restore the detector selected by the user; online remains the default.
     active_detector_type_ = DetectorType::kOnline;
     active_detector_ = online_detector_.get();
+    {
+        Settings settings("vision");
+        const auto saved = settings.GetString("active_detector");
+        if (saved == "face" && face_detector_ != nullptr) {
+            active_detector_type_ = DetectorType::kFace;
+            active_detector_ = face_detector_.get();
+        } else if (saved == "remote" && remote_detector_ != nullptr) {
+            active_detector_type_ = DetectorType::kRemote;
+            active_detector_ = remote_detector_.get();
+        }
+    }
 
     initialized_ = true;
     ESP_LOGI(TAG, "Vision pipeline initialized (active=%s, camera=%s)",
@@ -207,6 +219,10 @@ bool VisionPipeline::SetActiveDetector(DetectorType type) {
     }
     active_detector_type_ = type;
     active_detector_ = d;
+    Settings settings("vision", true);
+    const char* detector_name = type == DetectorType::kFace ? "face"
+        : (type == DetectorType::kRemote ? "remote" : "online");
+    settings.SetString("active_detector", detector_name);
     ESP_LOGI(TAG, "Active detector changed to: %s", d->GetName());
     return true;
 }
@@ -1561,7 +1577,9 @@ void RegisterVisionMcpTools() {
         });
 #endif
 
-    // Remote detector config
+    // Remote detector config is retained in code for compatibility, but the
+    // current unified server uses online_detector for all detection tasks.
+    /* [tool-limit] disabled: use self.vision.online_detector.configure instead
     mcp.AddTool("self.vision.remote_detector.configure",
         "Configure the remote HTTP detection server.\n"
         "The same server URL is also used automatically for Mijia lamp control; no separate lamp configuration is needed.\n"
@@ -1590,7 +1608,7 @@ void RegisterVisionMcpTools() {
             rd->SetRequestTimeoutSec(p["timeout_sec"].value<int>());
             SyncLampServerUrl(p["url"].value<std::string>());
             return true;
-        });
+        }); */
 
     /* [tool-limit] hidden from LLM tool list; implementation retained
     mcp.AddTool("self.vision.remote_detector.get_config",
