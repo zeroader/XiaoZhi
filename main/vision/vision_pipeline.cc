@@ -120,11 +120,6 @@ bool VisionPipeline::Initialize() {
     }
 #endif
 
-    remote_detector_ = std::make_unique<RemoteDetector>();
-    if (!remote_detector_->Initialize()) {
-        ESP_LOGW(TAG, "Remote detector initialize returned false");
-    }
-
     online_detector_ = std::make_unique<OnlineDetector>();
     if (!online_detector_->Initialize()) {
         ESP_LOGW(TAG, "Online detector initialize returned false");
@@ -133,18 +128,27 @@ bool VisionPipeline::Initialize() {
     display_composer_ = std::make_unique<VisionDisplay>();
 
     // Restore the detector selected by the user; online remains the default.
+    // Migrate the legacy remote mode so stale NVS values cannot trigger
+    // requests to an obsolete detection server.
     active_detector_type_ = DetectorType::kOnline;
     active_detector_ = online_detector_.get();
     {
         Settings settings("vision");
         const auto saved = settings.GetString("active_detector");
-        if (saved == "face" && face_detector_ != nullptr) {
+        if (saved == "remote") {
+            Settings migrated("vision", true);
+            migrated.SetString("active_detector", "online");
+            migrated.EraseKey("remote_url");
+            migrated.EraseKey("remote_token");
+            migrated.EraseKey("remote_timeout");
+            ESP_LOGW(TAG, "Migrated legacy remote detector configuration to online");
+        }
+#ifndef VISION_DISABLE_LOCAL_FACE
+        else if (saved == "face" && face_detector_ != nullptr) {
             active_detector_type_ = DetectorType::kFace;
             active_detector_ = face_detector_.get();
-        } else if (saved == "remote" && remote_detector_ != nullptr) {
-            active_detector_type_ = DetectorType::kRemote;
-            active_detector_ = remote_detector_.get();
         }
+#endif
     }
 
     initialized_ = true;
@@ -194,7 +198,7 @@ Detector* VisionPipeline::GetDetector(DetectorType type) {
 #ifndef VISION_DISABLE_LOCAL_FACE
         case DetectorType::kFace:   return face_detector_.get();
 #endif
-        case DetectorType::kRemote: return remote_detector_.get();
+        case DetectorType::kRemote: return nullptr;
         case DetectorType::kOnline: return online_detector_.get();
         default: return nullptr;
     }
@@ -212,6 +216,10 @@ static bool ApplyTaskToOnlineDetector(Detector* detector, const std::string& tas
 }
 
 bool VisionPipeline::SetActiveDetector(DetectorType type) {
+    if (type == DetectorType::kRemote) {
+        ESP_LOGW(TAG, "Legacy remote detector is disabled; use online detector");
+        return false;
+    }
     Detector* d = GetDetector(type);
     if (d == nullptr) {
         ESP_LOGE(TAG, "Invalid detector type: %d", (int)type);
@@ -230,7 +238,7 @@ bool VisionPipeline::SetActiveDetector(DetectorType type) {
 #ifndef VISION_DISABLE_LOCAL_FACE
 FaceDetector* VisionPipeline::GetFaceDetector() { return face_detector_.get(); }
 #endif
-RemoteDetector* VisionPipeline::GetRemoteDetector() { return remote_detector_.get(); }
+RemoteDetector* VisionPipeline::GetRemoteDetector() { return nullptr; }
 OnlineDetector* VisionPipeline::GetOnlineDetector() { return online_detector_.get(); }
 VisionDisplay* VisionPipeline::GetDisplayComposer() { return display_composer_.get(); }
 
@@ -477,10 +485,9 @@ void VisionPipeline::PreviewLoop() {
             const uint64_t now_ms = esp_timer_get_time() / 1000LL;
             const bool should_display = last_display_ms == 0 ||
                                         now_ms - last_display_ms >= kDisplayPeriodMs;
-            std::vector<uint8_t> display_frame_data;
             ImageFrame display_frame = frame;
             if (should_display) {
-                display_frame_data.assign(frame.data, frame.data + frame.len);
+                display_frame_.assign(frame.data, frame.data + frame.len);
             }
             ReleaseCurrentFrame();
 
@@ -504,7 +511,7 @@ void VisionPipeline::PreviewLoop() {
                         current_result.blood_pressure = latest_blood_pressure_;
                     }
                     // OV2640 直出 JPEG：解码成 RGB565 再送 LCD（检测线程直接用 JPEG 上传，互不影响）
-                    display_frame.data = display_frame_data.data();
+                    display_frame.data = display_frame_.data();
                     const uint8_t* disp_data = display_frame.data;
                     int disp_w = display_frame.width;
                     int disp_h = display_frame.height;
@@ -563,7 +570,6 @@ void VisionPipeline::DetectionLoop() {
         // 检测（HTTP 上传）在线程锁外执行，因此必须拥有独立的帧副本。
         // 不能只保存 shared_frame_.data()：预览线程可能在上传期间用下一帧
         // 覆盖或重分配 shared_frame_，从而发送损坏的 JPEG 并触发服务器 400。
-        std::vector<uint8_t> detect_frame_data;
         uint32_t current_version;
         {
             std::lock_guard<std::mutex> lock(frame_mutex_);
@@ -578,9 +584,9 @@ void VisionPipeline::DetectionLoop() {
                 continue;
             }
             last_version = current_version;
-            detect_frame_data = shared_frame_;
-            detect_frame.data = detect_frame_data.data();
-            detect_frame.len = detect_frame_data.size();
+            detect_frame_ = shared_frame_;
+            detect_frame.data = detect_frame_.data();
+            detect_frame.len = detect_frame_.size();
             detect_frame.width = shared_frame_w_;
             detect_frame.height = shared_frame_h_;
             detect_frame.pixel_format = shared_frame_pixfmt_;  // JPEG 直出时上传零编码
@@ -713,12 +719,14 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
 
     continuous_period_ms_ = period_ms;
     continuous_running_.store(true);
-    // The loop thread runs snprintf/ESP_LOGI and LVGL calls; the default pthread
-    // stack (3072B) is too small and caused a printf crash. Use a larger stack.
-    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-    cfg.stack_size = 8192;
-    cfg.prio = 2;
-    esp_pthread_set_cfg(&cfg);
+    // Camera capture can run with Flash cache disabled. Keep both stacks in
+    // internal memory; PSRAM-backed task stacks are not valid in that path.
+    // Preview performs camera and LVGL work, while detection does not need the
+    // same stack headroom. Configure them separately to reduce SRAM pressure.
+    esp_pthread_cfg_t preview_cfg = esp_pthread_get_default_config();
+    preview_cfg.stack_size = 8192;
+    preview_cfg.prio = 2;
+    esp_pthread_set_cfg(&preview_cfg);
     try {
         preview_thread_ = std::thread([this]() { this->PreviewLoop(); });
     } catch (...) {
@@ -727,13 +735,21 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
         ESP_LOGE(TAG, "Failed to spawn preview thread");
         return false;
     }
+
+    esp_pthread_cfg_t detect_cfg = esp_pthread_get_default_config();
+    detect_cfg.stack_size = 6144;
+    detect_cfg.prio = 2;
+    esp_pthread_set_cfg(&detect_cfg);
     try {
         detect_thread_ = std::thread([this]() { this->DetectionLoop(); });
     } catch (...) {
         esp_pthread_set_cfg(nullptr);
         continuous_running_.store(false);
         if (preview_thread_.joinable()) preview_thread_.join();
-        ESP_LOGE(TAG, "Failed to spawn detection thread");
+        ESP_LOGE(TAG, "Failed to spawn detection thread (internal SRAM may be insufficient; "
+                 "free=%u B, largest=%u B)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return false;
     }
     esp_pthread_set_cfg(nullptr);
@@ -741,7 +757,6 @@ bool VisionPipeline::StartContinuous(uint32_t period_ms, const std::string& task
 }
 
 void VisionPipeline::StopContinuous() {
-    if (!continuous_running_.load()) return;
     continuous_running_.store(false);
     if (preview_thread_.joinable()) preview_thread_.join();
     if (detect_thread_.joinable()) detect_thread_.join();
@@ -1076,7 +1091,6 @@ void VisionPipeline::MaybePlayVoiceAlerts(const DetectionResult& result) {
 
 // ---------- MCP Tools Registration ----------
 
-static const char* kDetectorTypeRemote = "remote";
 static const char* kDetectorTypeOnline = "online";
 #ifndef VISION_DISABLE_LOCAL_FACE
 static const char* kDetectorTypeFace = "face";
@@ -1086,38 +1100,8 @@ static DetectorType DetectorTypeFromString(const std::string& s) {
 #ifndef VISION_DISABLE_LOCAL_FACE
     if (s == kDetectorTypeFace) return DetectorType::kFace;
 #endif
-    if (s == kDetectorTypeRemote) return DetectorType::kRemote;
     if (s == kDetectorTypeOnline) return DetectorType::kOnline;
     return DetectorType::kNone;
-}
-
-static std::string DetectorTypeToString(DetectorType t) {
-    switch (t) {
-#ifndef VISION_DISABLE_LOCAL_FACE
-        case DetectorType::kFace:   return kDetectorTypeFace;
-#endif
-        case DetectorType::kRemote: return kDetectorTypeRemote;
-        case DetectorType::kOnline: return kDetectorTypeOnline;
-        default: return "none";
-    }
-}
-
-static cJSON* StatsToJson(const PipelineStats& s) {
-    cJSON* j = cJSON_CreateObject();
-    cJSON_AddNumberToObject(j, "capture_count", (double)s.capture_count);
-    cJSON_AddNumberToObject(j, "detect_count", (double)s.detect_count);
-    cJSON_AddNumberToObject(j, "display_count", (double)s.display_count);
-    cJSON_AddNumberToObject(j, "last_detection_count", (double)s.last_detection_count);
-    cJSON_AddNumberToObject(j, "loop_period_ms", (double)s.loop_period_ms);
-    if (s.capture_count > 0)
-        cJSON_AddNumberToObject(j, "avg_capture_ms", (double)(s.total_capture_ms / s.capture_count));
-    if (s.detect_count > 0)
-        cJSON_AddNumberToObject(j, "avg_detect_ms", (double)(s.total_detect_ms / s.detect_count));
-    if (s.display_count > 0) {
-        cJSON_AddNumberToObject(j, "avg_compose_ms", (double)(s.total_compose_ms / s.display_count));
-        cJSON_AddNumberToObject(j, "avg_display_ms", (double)(s.total_display_ms / s.display_count));
-    }
-    return j;
 }
 
 static cJSON* DetectionsToJson(const DetectionResult& r) {
@@ -1193,8 +1177,8 @@ void RegisterVisionMcpTools() {
     mcp.AddTool("self.vision.init",
         "Initialize the vision pipeline (camera + detectors + display composer). "
         "Must be called before other self.vision.* tools. Safe to call multiple times.\n"
-        "NOTE: all self.vision.* tools process images LOCALLY on the device - no image is ever uploaded "
-        "(unless you explicitly configure and select the `remote` detector).",
+        "NOTE: all self.vision.* tools process images LOCALLY on the device unless the online detector "
+        "is explicitly configured and selected.",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             return VisionPipeline::GetInstance().Initialize();
@@ -1213,8 +1197,8 @@ void RegisterVisionMcpTools() {
         "Choose which detector is used for detection.\n"
         "Note: `online` is the default after initialization.\n"
         "Args:\n"
-        "  `detector`: One of `face` (local, low-latency, ESP-SR based, NO upload), "
-        "`remote` (HTTP server based, UPLOADS the frame to the configured server).",
+        "  `detector`: One of `face` (local, low-latency, ESP-SR based, NO upload) or "
+        "`online` (HTTP server based, uploads the frame to the configured server).",
         PropertyList({
             Property("detector", kPropertyTypeString)
         }),
@@ -1223,7 +1207,7 @@ void RegisterVisionMcpTools() {
             pipe.Initialize();  // auto-init if not done yet
             auto type = DetectorTypeFromString(p["detector"].value<std::string>());
             if (type == DetectorType::kNone) {
-                throw std::runtime_error("Invalid detector name, expected `face`, `remote` or `online`");
+                throw std::runtime_error("Invalid detector name, expected `face` or `online`");
             }
             return VisionPipeline::GetInstance().SetActiveDetector(type);
         });

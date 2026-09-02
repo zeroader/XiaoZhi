@@ -125,7 +125,8 @@ DetectionResult RemoteDetector::Detect(const ImageFrame& frame) {
     }
 
     auto network = Board::GetInstance().GetNetwork();
-    auto http = network->CreateHttp(timeout_sec_);
+    auto http = network->CreateHttp(0);
+    http->SetTimeout(timeout_sec_ * 1000);
 
     std::string boundary = "----VISION_REMOTE_DETECT_BOUNDARY";
 

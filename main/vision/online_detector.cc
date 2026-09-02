@@ -250,7 +250,8 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
     std::string boundary = "----VISION_ONLINE_DETECT_BOUNDARY";
 
     auto network = Board::GetInstance().GetNetwork();
-    auto http = network->CreateHttp(timeout_sec_);
+    auto http = network->CreateHttp(0);
+    http->SetTimeout(timeout_sec_ * 1000);
 
     http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
     http->SetHeader("Transfer-Encoding", "chunked");

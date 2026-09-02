@@ -12,12 +12,48 @@
 #include <string>
 #include <memory>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <thread>
 #include <mutex>
 #include <vector>
 #include <deque>
+#include <new>
 
 #include <esp_camera.h>
+#include <esp_heap_caps.h>
+
+template <typename T>
+class PsramAllocator {
+public:
+    using value_type = T;
+
+    PsramAllocator() noexcept = default;
+
+    template <typename U>
+    PsramAllocator(const PsramAllocator<U>&) noexcept {}
+
+    T* allocate(std::size_t count) {
+        if (count > SIZE_MAX / sizeof(T)) {
+            throw std::bad_alloc();
+        }
+        void* memory = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (memory == nullptr) {
+            throw std::bad_alloc();
+        }
+        return static_cast<T*>(memory);
+    }
+
+    void deallocate(T* pointer, std::size_t) noexcept {
+        heap_caps_free(pointer);
+    }
+};
+
+template <typename T, typename U>
+bool operator==(const PsramAllocator<T>&, const PsramAllocator<U>&) noexcept { return true; }
+
+template <typename T, typename U>
+bool operator!=(const PsramAllocator<T>&, const PsramAllocator<U>&) noexcept { return false; }
 
 class Camera;
 class LvglDisplay;
@@ -130,7 +166,10 @@ private:
 
     // Preview 线程与 Detection 线程之间的共享帧缓冲
     std::mutex frame_mutex_;            // 保护 shared_frame_ / shared_frame_* / shared_frame_version_
-    std::vector<uint8_t> shared_frame_;
+    using PsramByteVector = std::vector<uint8_t, PsramAllocator<uint8_t>>;
+    PsramByteVector shared_frame_;
+    PsramByteVector display_frame_;  // PreviewLoop-owned, reused for LCD composition
+    PsramByteVector detect_frame_;   // DetectionLoop-owned, stable during HTTP upload
     uint32_t shared_frame_w_ = 0;
     uint32_t shared_frame_h_ = 0;
     int shared_frame_pixfmt_ = PIXFORMAT_RGB565;  // 记录共享帧格式（OV2640 直出 JPEG 时上传零编码）
