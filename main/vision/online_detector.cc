@@ -12,20 +12,24 @@
 #include "settings.h"
 #include "image_to_jpeg.h"
 
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
-
 #define TAG "OnlineDetector"
 
 // 发送前降采样宽度上限（原始帧先缩小再编码上传，大幅降低带宽占用）
 // 检测在服务器端进行，小图足够：320x240 约 15~30KB，640x480 约 60~120KB
 #define SEND_MAX_WIDTH 320
 
-// JpegChunk for streaming JPEG encode -> PSRAM buffer
-struct JpegChunk {
-    uint8_t* data;
-    size_t len;
+namespace {
+
+struct JpegOutputContext {
+    OnlineDetector* detector;
+    size_t size;
+    bool failed;
 };
+
+constexpr size_t kInitialJpegBufferCapacity = 32 * 1024;
+constexpr size_t kMaxJpegBufferCapacity = 256 * 1024;
+
+}  // namespace
 
 // 最近邻降采样 RGB565（发送前缩小，减少上传体积；内部分配 PSRAM，需调用方释放）
 // 返回新 buffer（heap_caps_malloc MALLOC_CAP_SPIRAM），失败返回 nullptr
@@ -64,6 +68,65 @@ OnlineDetector::OnlineDetector()
 
 OnlineDetector::~OnlineDetector() {
     Deinitialize();
+}
+
+size_t OnlineDetector::JpegOutputCallback(void* arg, size_t index,
+                                           const void* data, size_t len) {
+    auto* context = static_cast<JpegOutputContext*>(arg);
+    if (context == nullptr) return 0;
+    if (context->failed) return 0;
+    if (context->detector == nullptr || data == nullptr) {
+        context->failed = true;
+        return 0;
+    }
+
+    const size_t written = context->detector->AppendJpegData(index, data, len);
+    if (written != len) {
+        context->failed = true;
+        return 0;
+    }
+    context->size = index + written;
+    return written;
+}
+
+bool OnlineDetector::EnsureJpegBuffer(size_t required) {
+    if (required <= jpeg_buffer_cap_) return true;
+    if (required > kMaxJpegBufferCapacity) {
+        ESP_LOGE(TAG, "JPEG output exceeds reusable buffer limit: %u B", (unsigned)required);
+        return false;
+    }
+
+    size_t new_capacity = jpeg_buffer_cap_ == 0
+        ? kInitialJpegBufferCapacity : jpeg_buffer_cap_;
+    while (new_capacity < required) {
+        if (new_capacity > kMaxJpegBufferCapacity / 2) {
+            new_capacity = kMaxJpegBufferCapacity;
+            break;
+        }
+        new_capacity *= 2;
+    }
+
+    uint8_t* new_buffer = (uint8_t*)heap_caps_aligned_alloc(
+        16, new_capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (new_buffer == nullptr) {
+        ESP_LOGE(TAG, "PSRAM alloc failed for reusable JPEG buffer (%u B)",
+                 (unsigned)new_capacity);
+        return false;
+    }
+    if (jpeg_buffer_ != nullptr && jpeg_buffer_cap_ != 0) {
+        memcpy(new_buffer, jpeg_buffer_, jpeg_buffer_cap_);
+        heap_caps_free(jpeg_buffer_);
+    }
+    jpeg_buffer_ = new_buffer;
+    jpeg_buffer_cap_ = new_capacity;
+    return true;
+}
+
+size_t OnlineDetector::AppendJpegData(size_t index, const void* data, size_t len) {
+    if (data == nullptr || len == 0) return len;
+    if (index > SIZE_MAX - len || !EnsureJpegBuffer(index + len)) return 0;
+    memcpy(jpeg_buffer_ + index, data, len);
+    return len;
 }
 
 const char* OnlineDetector::GetName() const {
@@ -107,15 +170,32 @@ bool OnlineDetector::Initialize() {
 void OnlineDetector::Deinitialize() {
     if (!initialized_) return;
     initialized_ = false;
+    if (jpeg_buffer_ != nullptr) {
+        heap_caps_free(jpeg_buffer_);
+        jpeg_buffer_ = nullptr;
+        jpeg_buffer_cap_ = 0;
+    }
     ESP_LOGI(TAG, "Online detector deinitialized");
 }
 
 DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
+    return Detect(frame, std::vector<std::string>{task_});
+}
+
+DetectionResult OnlineDetector::Detect(const ImageFrame& frame,
+                                       const std::vector<std::string>& tasks) {
     DetectionResult result;
     result.source_width = frame.width;
     result.source_height = frame.height;
     result.timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000LL);
-    result.task = task_;
+    const std::vector<std::string> selected_tasks = tasks.empty()
+        ? std::vector<std::string>{task_} : tasks;
+    std::string task_list;
+    for (size_t i = 0; i < selected_tasks.size(); ++i) {
+        if (i != 0) task_list += ',';
+        task_list += selected_tasks[i];
+    }
+    result.task = task_list;
     if (auto_frame_id_) {
         frame_id_++;
     }
@@ -151,7 +231,6 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
     int enc_h = frame.height;
     uint8_t* jpeg_buffer = nullptr;
     size_t jpeg_size = 0;
-    bool own_jpeg_buffer = true;  // JPEG 直出时指向帧缓冲（共享帧/摄像头 fb），不释放
 
     if (frame.pixel_format == PIXFORMAT_JPEG) {
         // OV2640 硬件 JPEG 直出：跳过降采样与软编码，直接上传
@@ -160,7 +239,6 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
         enc_h = frame.height;
         jpeg_buffer = (uint8_t*)frame.data;
         jpeg_size = frame.len;
-        own_jpeg_buffer = false;
     } else {
         // Step 1: 发送前降采样（仅 RGB565 且超宽时执行），减少上传体积
         if (frame.width > SEND_MAX_WIDTH) {
@@ -177,67 +255,25 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
             }
         }
 
-        // Step 2: JPEG encode the (possibly downscaled) RGB565 frame
-        QueueHandle_t jpeg_queue = xQueueCreate(40, sizeof(JpegChunk));
-        if (jpeg_queue == nullptr) {
-            if (scaled_buf) heap_caps_free(scaled_buf);
-            ESP_LOGE(TAG, "Failed to create JPEG queue");
+        // Step 2: 在当前检测线程内同步编码。编码器本身只需短暂工作空间，
+        // 输出直接写入可复用的 PSRAM 缓冲，避免每帧创建线程、队列和 chunk。
+        JpegOutputContext output = { .detector = this, .size = 0, .failed = false };
+        const bool encoded = image_to_jpeg_cb(
+            (uint8_t*)enc_data, (size_t)enc_w * enc_h * 2, enc_w, enc_h,
+            (pixformat_t)frame.pixel_format, jpeg_quality_,
+            &OnlineDetector::JpegOutputCallback, &output);
+        if (scaled_buf) heap_caps_free(scaled_buf);
+        if (!encoded || output.failed || output.size == 0) {
+            ESP_LOGE(TAG, "JPEG encode failed (callback=%s, size=%u)",
+                     encoded ? "ok" : "error", (unsigned)output.size);
             return result;
         }
-
-        std::thread encoder_thread([enc_data, frame, enc_w, enc_h, jpeg_queue, this]() {
-            image_to_jpeg_cb((uint8_t*)enc_data, (size_t)enc_w * enc_h * 2, enc_w, enc_h,
-                             (pixformat_t)frame.pixel_format, jpeg_quality_,
-                [](void* arg, size_t /*index*/, const void* data, size_t len) -> size_t {
-                    auto queue = (QueueHandle_t)arg;
-                    JpegChunk chunk = {
-                        .data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM),
-                        .len = len
-                    };
-                    if (chunk.data != nullptr) {
-                        memcpy(chunk.data, data, len);
-                        xQueueSend(queue, &chunk, portMAX_DELAY);
-                    }
-                    return len;
-                }, jpeg_queue);
-            JpegChunk sentinel = { .data = nullptr, .len = 0 };
-            xQueueSend(jpeg_queue, &sentinel, portMAX_DELAY);
-        });
-
-        // Collect all JPEG chunks into one buffer
-        size_t jpeg_total = 0;
-
-        while (true) {
-            JpegChunk chunk;
-            if (xQueueReceive(jpeg_queue, &chunk, pdMS_TO_TICKS(5000)) != pdPASS) {
-                ESP_LOGE(TAG, "Timeout receiving JPEG chunk");
-                break;
-            }
-            if (chunk.data == nullptr) break;  // sentinel
-
-            uint8_t* new_buf = (uint8_t*)heap_caps_realloc(jpeg_buffer, jpeg_total + chunk.len,
-                                                            MALLOC_CAP_SPIRAM);
-            if (new_buf == nullptr) {
-                heap_caps_free(chunk.data);
-                ESP_LOGE(TAG, "Failed to grow JPEG buffer");
-                if (jpeg_buffer) heap_caps_free(jpeg_buffer);
-                jpeg_buffer = nullptr;
-                break;
-            }
-            jpeg_buffer = new_buf;
-            memcpy(jpeg_buffer + jpeg_total, chunk.data, chunk.len);
-            jpeg_total += chunk.len;
-            heap_caps_free(chunk.data);
-        }
-        encoder_thread.join();
-        vQueueDelete(jpeg_queue);
-        if (scaled_buf) heap_caps_free(scaled_buf);   // 释放降采样临时缓冲
-        jpeg_size = jpeg_total;
+        jpeg_buffer = jpeg_buffer_;
+        jpeg_size = output.size;
     }
 
     if (jpeg_buffer == nullptr || jpeg_size == 0) {
         ESP_LOGE(TAG, "JPEG encode failed");
-        if (own_jpeg_buffer && jpeg_buffer) heap_caps_free(jpeg_buffer);
         return result;
     }
 
@@ -249,35 +285,24 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
     // Step 3: multipart/form-data 二进制上传（免 base64）
     std::string boundary = "----VISION_ONLINE_DETECT_BOUNDARY";
 
-    auto network = Board::GetInstance().GetNetwork();
-    auto http = network->CreateHttp(0);
-    http->SetTimeout(timeout_sec_ * 1000);
-
-    http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-    http->SetHeader("Transfer-Encoding", "chunked");
-    http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
-
-    if (!http->Open("POST", endpoint_url_)) {
-        ESP_LOGE(TAG, "Failed to open HTTP connection to %s", endpoint_url_.c_str());
-        result.connection_ok = false;
-        result.error_message = "cannot connect to detection server";
-        http->Close();
-        if (own_jpeg_buffer) heap_caps_free(jpeg_buffer);
-        return result;
-    }
-
-    // 表单字段：frame_id / task / capture_timestamp_ms / calibrate / width / height
+    // 表单字段：frame_id / task(s) / capture_timestamp_ms / calibrate / width / height
     std::string meta_header;
     meta_header += "--" + boundary + "\r\n";
     meta_header += "Content-Disposition: form-data; name=\"frame_id\"\r\n\r\n";
     meta_header += std::to_string(frame_id_) + "\r\n";
     meta_header += "--" + boundary + "\r\n";
     meta_header += "Content-Disposition: form-data; name=\"task\"\r\n\r\n";
-    meta_header += task_ + "\r\n";
+    meta_header += selected_tasks.front() + "\r\n";
+    if (selected_tasks.size() > 1) {
+        meta_header += "--" + boundary + "\r\n";
+        meta_header += "Content-Disposition: form-data; name=\"tasks\"\r\n\r\n";
+        meta_header += task_list + "\r\n";
+    }
     meta_header += "--" + boundary + "\r\n";
     meta_header += "Content-Disposition: form-data; name=\"capture_timestamp_ms\"\r\n\r\n";
     meta_header += std::to_string((uint64_t)(total_start / 1000LL)) + "\r\n";
-    if (calibrate_once_ && task_ == kTaskPosture) {
+    if (calibrate_once_ && std::find(selected_tasks.begin(), selected_tasks.end(),
+                                     kTaskPosture) != selected_tasks.end()) {
         meta_header += "--" + boundary + "\r\n";
         meta_header += "Content-Disposition: form-data; name=\"calibrate\"\r\n\r\n";
         meta_header += "true\r\n";
@@ -292,20 +317,49 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
     meta_header += "--" + boundary + "\r\n";
     meta_header += "Content-Disposition: form-data; name=\"image\"; filename=\"frame.jpg\"\r\n";
     meta_header += "Content-Type: image/jpeg\r\n\r\n";
-    http->Write(meta_header.c_str(), meta_header.size());
-
-    // JPEG 二进制
-    http->Write((const char*)jpeg_buffer, jpeg_size);
-    if (own_jpeg_buffer) heap_caps_free(jpeg_buffer);
-
     std::string footer = "\r\n--" + boundary + "--\r\n";
-    http->Write(footer.c_str(), footer.size());
-    http->Write("", 0);
 
-    if (http->GetStatusCode() != 200) {
-        ESP_LOGE(TAG, "HTTP status=%d", http->GetStatusCode());
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    if (http == nullptr) {
+        ESP_LOGE(TAG, "Failed to create HTTP client");
         result.connection_ok = false;
-        result.error_message = "detection server returned error " + std::to_string(http->GetStatusCode());
+        result.error_message = "cannot create HTTP client";
+        return result;
+    }
+    http->SetTimeout(timeout_sec_ * 1000);
+    http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+    http->SetHeader("Content-Length", std::to_string(meta_header.size() + jpeg_size + footer.size()));
+    http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+
+    if (!http->Open("POST", endpoint_url_)) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection to %s", endpoint_url_.c_str());
+        result.connection_ok = false;
+        result.error_message = "cannot connect to detection server";
+        http->Close();
+        return result;
+    }
+
+    auto write_part = [&http](const char* data, size_t size) {
+        return http->Write(data, size) == static_cast<int>(size);
+    };
+    if (!write_part(meta_header.c_str(), meta_header.size()) ||
+        !write_part((const char*)jpeg_buffer, jpeg_size) ||
+        !write_part(footer.c_str(), footer.size())) {
+        ESP_LOGE(TAG, "Failed to send detection request body");
+        result.connection_ok = false;
+        result.error_message = "failed to send detection request";
+        http->Close();
+        return result;
+    }
+
+    const int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        const std::string error_response = status_code > 0 ? http->ReadAll() : std::string();
+        ESP_LOGE(TAG, "HTTP status=%d, response=%s", status_code,
+                 error_response.empty() ? "(empty)" : error_response.c_str());
+        result.connection_ok = false;
+        result.error_message = "detection server returned error " + std::to_string(status_code);
         http->Close();
         return result;
     }
@@ -319,8 +373,8 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame) {
     ParseResponse(response, result);
 
     auto total_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "Detect: task=%s frame=%d jpeg=%d B, detections=%d, total=%dms (encode=%dms, http=%dms) server(dec=%.1fms,inf=%.1fms,total=%.1fms)",
-             task_.c_str(),
+    ESP_LOGI(TAG, "Detect: tasks=%s frame=%d jpeg=%d B, detections=%d, total=%dms (encode=%dms, http=%dms) server(dec=%.1fms,inf=%.1fms,total=%.1fms)",
+             task_list.c_str(),
              (int)frame_id_,
              (int)jpeg_size,
              (int)result.detections.size(),
@@ -415,9 +469,13 @@ bool OnlineDetector::ParseResponse(const std::string& json_str, DetectionResult&
             if (reason && cJSON_IsString(reason)) result.posture.reason = reason->valuestring;
         }
 
+        const bool includes_heart_rate = result.task.find(kTaskHeartRate) != std::string::npos;
+        const bool includes_blood_pressure =
+            result.task.find(kTaskBloodPressure) != std::string::npos;
+
         // heart_rate: {bpm, confidence, fs, frames_used} 或 {error}
         cJSON* bpm = cJSON_GetObjectItem(result_obj, "bpm");
-        if (result.task == kTaskHeartRate && bpm != nullptr && cJSON_IsNumber(bpm)) {
+        if (bpm != nullptr && cJSON_IsNumber(bpm)) {
             result.heart_rate.available = true;
             result.heart_rate.bpm = (float)bpm->valuedouble;
             cJSON* hconf = cJSON_GetObjectItem(result_obj, "confidence");
@@ -426,12 +484,12 @@ bool OnlineDetector::ParseResponse(const std::string& json_str, DetectionResult&
             if (fs) result.heart_rate.fs = (float)fs->valuedouble;
             cJSON* fu = cJSON_GetObjectItem(result_obj, "frames_used");
             if (fu) result.heart_rate.frames_used = fu->valueint;
-        } else if (result.task == kTaskHeartRate) {
+        } else if (includes_heart_rate) {
             cJSON* herr = cJSON_GetObjectItem(result_obj, "error");
             if (herr && cJSON_IsString(herr)) result.heart_rate.error_message = herr->valuestring;
         }
 
-        if (result.task == kTaskBloodPressure) {
+        if (includes_blood_pressure) {
             result.blood_pressure.available = true;
             cJSON* status = cJSON_GetObjectItem(result_obj, "status");
             if (status && cJSON_IsString(status)) result.blood_pressure.status = status->valuestring;

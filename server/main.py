@@ -55,8 +55,8 @@ MODEL_FACE_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_dete
 MODEL_POSE_URL = "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx"
 MODEL_EMOTION_URL = "https://github.com/sb-ai-lab/EmotiEffLib/raw/main/models/affectnet_emotions/onnx/enet_b0_8_best_afew.onnx"
 
-# 帧缓存大小（30 帧 ≈ 2s@15fps）
-BUFFER_MAXLEN = 30
+# 帧缓存大小（60 帧 ≈ 4s@15fps）：心率窗口在原基础上扩大一倍。
+BUFFER_MAXLEN = 60
 # 长时 rPPG 仅缓存前额 RGB 均值，不缓存完整视频帧。
 RPPG_MAXLEN = 1800  # 60s @ 30fps
 # 缓存帧降采样宽度，节省内存
@@ -118,26 +118,41 @@ def _capture_timestamp_seconds(value) -> float:
     return timestamp_ms / 1000.0
 
 
-def _cache_and_sample(rgb: np.ndarray, timestamp: float) -> int:
+def _cache_and_sample(rgb: np.ndarray, timestamp: float, face=None,
+                      face_ready: bool = False) -> int:
     """Update the short frame cache and the compact long-window rPPG sample buffer."""
-    sample_rgb, face_confidence = blood_pressure_detector.sample_frame(rgb)
+    sample_rgb, face_confidence = blood_pressure_detector.sample_frame(
+        rgb, face=face, face_ready=face_ready)
     # A desktop/ESP32 scheduler can issue multiple task requests for one captured
     # frame. Keep each capture only once so heart-rate timing stays well-defined.
     if not state.push_rppg_sample(timestamp, sample_rgb, face_confidence):
         return -1
     cached = cache_resized(rgb)
-    return state.push_frame(cached, cached.shape[1], cached.shape[0], timestamp)
+    cached_face = face
+    if face is not None and cached.shape[:2] != rgb.shape[:2]:
+        scale_x = cached.shape[1] / float(max(1, rgb.shape[1]))
+        scale_y = cached.shape[0] / float(max(1, rgb.shape[0]))
+        cached_face = dict(face)
+        cached_face["bbox"] = dict(face["bbox"])
+        cached_face["bbox"]["x"] = int(cached_face["bbox"]["x"] * scale_x)
+        cached_face["bbox"]["y"] = int(cached_face["bbox"]["y"] * scale_y)
+        cached_face["bbox"]["width"] = int(cached_face["bbox"]["width"] * scale_x)
+        cached_face["bbox"]["height"] = int(cached_face["bbox"]["height"] * scale_y)
+    return state.push_frame(cached, cached.shape[1], cached.shape[0], timestamp,
+                            face=cached_face)
 
 
 # ============================================================
 # 任务分发
 # ============================================================
 
-def _detect_face_emotion(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
+def _detect_face_emotion(rgb: np.ndarray, src_w: int, src_h: int,
+                         face=None, face_ready: bool = False) -> dict:
     """人脸 + 情绪"""
     result = {"face": None, "emotion": None}
 
-    face = face_detector.detect_primary_face(rgb, src_w, src_h)
+    if not face_ready:
+        face = face_detector.detect_primary_face(rgb, src_w, src_h)
     if face is None:
         return result
     result["face"] = face
@@ -156,9 +171,11 @@ def _detect_face_emotion(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
     return result
 
 
-def _detect_posture(rgb: np.ndarray, src_w: int, src_h: int) -> dict:
+def _detect_posture(rgb: np.ndarray, src_w: int, src_h: int,
+                    face=None, face_ready: bool = False) -> dict:
     """基于当前帧人脸位置和面积的简化坐姿检测。"""
-    face = face_detector.detect_primary_face(rgb, src_w, src_h)
+    if not face_ready:
+        face = face_detector.detect_primary_face(rgb, src_w, src_h)
     if face is None:
         return {"state": "unknown", "reason": "no_face", "metrics": {}}
 
@@ -206,26 +223,50 @@ def _detect_blood_pressure() -> dict:
     return blood_pressure_detector.detect(samples)
 
 
+def _dispatch_tasks(tasks, rgb: np.ndarray, src_w: int, src_h: int,
+                    calibrate: bool = False, shared_face=None,
+                    face_ready: bool = False) -> dict:
+    """顺序执行同一帧上的多个任务，并复用人脸检测结果。"""
+    result = {}
+    needs_face = (protocol.TASK_FACE_EMOTION in tasks or
+                  protocol.TASK_POSTURE in tasks)
+    if needs_face and not face_ready:
+        shared_face = face_detector.detect_primary_face(rgb, src_w, src_h)
+
+    for task in tasks:
+        if task == protocol.TASK_FACE_EMOTION:
+            task_result = _detect_face_emotion(
+                rgb, src_w, src_h, shared_face, face_ready=True)
+            state.set_face(task_result["face"])
+            state.set_emotion(task_result["emotion"])
+        elif task == protocol.TASK_POSTURE:
+            # calibrate 参数保留兼容性；简化规则不需要校准。
+            task_result = _detect_posture(
+                rgb, src_w, src_h, shared_face, face_ready=True)
+            state.set_posture(task_result)
+        elif task == protocol.TASK_HEART_RATE:
+            task_result = _detect_heart_rate()
+            state.set_heart_rate(task_result)
+        elif task == protocol.TASK_BLOOD_PRESSURE:
+            task_result = _detect_blood_pressure()
+            state.set_blood_pressure(task_result)
+        else:
+            task_result = {"error": f"unsupported task: {task}"}
+        result.update(task_result)
+    return result
+
+
 def _dispatch_task(task: str, rgb: np.ndarray, src_w: int, src_h: int,
                    calibrate: bool = False) -> dict:
-    """按 task 分发推理（JSON 与 multipart 协议共用）"""
-    if task == protocol.TASK_FACE_EMOTION:
-        result = _detect_face_emotion(rgb, src_w, src_h)
-        state.set_face(result["face"])
-        state.set_emotion(result["emotion"])
-    elif task == protocol.TASK_POSTURE:
-        # calibrate 参数保留兼容性；简化规则不需要校准。
-        result = _detect_posture(rgb, src_w, src_h)
-        state.set_posture(result)
-    elif task == protocol.TASK_HEART_RATE:
-        result = _detect_heart_rate()
-        state.set_heart_rate(result)
-    elif task == protocol.TASK_BLOOD_PRESSURE:
-        result = _detect_blood_pressure()
-        state.set_blood_pressure(result)
-    else:
-        result = {"error": f"unsupported task: {task}"}
-    return result
+    """单任务兼容入口。"""
+    return _dispatch_tasks([task], rgb, src_w, src_h, calibrate)
+
+
+def _shared_face_for_tasks(tasks, rgb: np.ndarray, src_w: int, src_h: int):
+    if (protocol.TASK_FACE_EMOTION in tasks or
+            protocol.TASK_POSTURE in tasks):
+        return face_detector.detect_primary_face(rgb, src_w, src_h)
+    return None
 
 
 # ============================================================
@@ -236,7 +277,8 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
     """multipart/form-data 协议：二进制 JPEG 上传（免 base64）。
 
     请求字段:
-      frame_id / task / calibrate(可选 "true") / capture_timestamp_ms(可选) 为 form 字段
+      frame_id / task / tasks(可选，逗号分隔) / calibrate(可选 "true") /
+      capture_timestamp_ms(可选) 为 form 字段
       image 为文件字段（JPEG 二进制）
     响应: 与 JSON 协议相同的统一格式 {frame_id, task, result, performance}
     """
@@ -249,8 +291,17 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
         return jsonify({"error": "`frame_id` must be an integer"}), 400
 
     task = request.form.get("task", "")
-    if task not in protocol.VALID_TASKS:
-        return jsonify({"error": f"`task` must be one of {sorted(protocol.VALID_TASKS)}"}), 400
+    tasks_raw = request.form.get("tasks", "")
+    tasks = []
+    for item in (item.strip() for item in tasks_raw.split(",")):
+        if item and item not in tasks:
+            tasks.append(item)
+    if not tasks:
+        tasks = [task]
+    if not tasks or not all(tasks):
+        return jsonify({"error": "`task` or `tasks` must not be empty"}), 400
+    if any(item not in protocol.VALID_TASKS for item in tasks):
+        return jsonify({"error": f"`tasks` must contain only {sorted(protocol.VALID_TASKS)}"}), 400
 
     calibrate = request.form.get("calibrate", "false") in ("true", "1", "True")
     try:
@@ -281,11 +332,17 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
     except (TypeError, ValueError):
         src_w, src_h = rgb.shape[1], rgb.shape[0]
 
+    shared_face = _shared_face_for_tasks(tasks, rgb, src_w, src_h)
+    face_was_checked = (protocol.TASK_FACE_EMOTION in tasks or
+                        protocol.TASK_POSTURE in tasks)
+
     # 保存当前帧，并提取一个紧凑的前额 RGB 采样供长期 rPPG 使用。
-    cache_id = _cache_and_sample(rgb, capture_timestamp)
+    cache_id = _cache_and_sample(rgb, capture_timestamp, face=shared_face,
+                                 face_ready=face_was_checked)
 
     t1 = time.time()
-    result = _dispatch_task(task, rgb, src_w, src_h, calibrate=calibrate)
+    result = _dispatch_tasks(tasks, rgb, src_w, src_h, calibrate=calibrate,
+                             shared_face=shared_face, face_ready=face_was_checked)
     t_infer_ms = (time.time() - t1) * 1000
 
     # FPS 统计
@@ -299,7 +356,8 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
     _last_response_time = now
 
     t_elapsed = (time.time() - t_start) * 1000
-    print(f"[{time.strftime('%H:%M:%S')}] [mp] frame={cache_id} task={task} "
+    task_list = ",".join(tasks)
+    print(f"[{time.strftime('%H:%M:%S')}] [mp] frame={cache_id} tasks={task_list} "
           f"interval={interval_ms:.0f}ms FPS={fps:.1f} | client+net={client_net_ms:.0f}ms "
           f"server={t_elapsed:.0f}ms (decode={t_decode_ms:.0f}ms infer={t_infer_ms:.0f}ms) "
           f"jpeg={len(jpeg_bytes)}B")
@@ -309,7 +367,7 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
         "infer_ms": round(t_infer_ms, 2),
         "total_ms": round(t_elapsed, 2),
     }
-    return jsonify(protocol.build_response(frame_id, task, result, perf))
+    return jsonify(protocol.build_response(frame_id, task_list, result, perf))
 
 
 @app.route("/detect", methods=["POST"])
@@ -391,12 +449,20 @@ def detect():
     src_h = req.image.height or rgb.shape[0]
 
     capture_timestamp = _capture_timestamp_seconds(req.capture_timestamp_ms)
+    shared_face = _shared_face_for_tasks([req.task], rgb, src_w, src_h)
     # 保存当前帧，并提取一个紧凑的前额 RGB 采样供长期 rPPG 使用。
-    frame_id = _cache_and_sample(rgb, capture_timestamp)
+    frame_id = _cache_and_sample(rgb, capture_timestamp, face=shared_face,
+                                 face_ready=(shared_face is not None or
+                                             req.task in (protocol.TASK_FACE_EMOTION,
+                                                          protocol.TASK_POSTURE)))
 
     t1 = time.time()
     # 按 task 分发（JSON 与 multipart 共用）
-    result = _dispatch_task(req.task, rgb, src_w, src_h, calibrate=req.calibrate)
+    result = _dispatch_tasks([req.task], rgb, src_w, src_h,
+                             calibrate=req.calibrate, shared_face=shared_face,
+                             face_ready=(shared_face is not None or
+                                         req.task in (protocol.TASK_FACE_EMOTION,
+                                                      protocol.TASK_POSTURE)))
     t_infer_ms = (time.time() - t1) * 1000
 
     # FPS 统计（新协议响应频率）
@@ -526,13 +592,16 @@ def lamp():
     _lamp_future = _lamp_executor.submit(_run_lamp_action, action, value)
     try:
         result = _lamp_future.result(timeout=LAMP_REQUEST_TIMEOUT_SEC)
+        print(f"[lamp] action={action} value={value!r} ok=true result={result}")
         return jsonify({"ok": True, **result})
     except concurrent.futures.TimeoutError:
+        print(f"[lamp] action={action} value={value!r} ok=false timeout")
         return jsonify({
             "ok": False,
             "error": f"lamp request timed out after {LAMP_REQUEST_TIMEOUT_SEC} seconds",
         })
     except Exception as e:
+        print(f"[lamp] action={action} value={value!r} ok=false error={e}")
         return jsonify({"ok": False, "error": str(e)})
 
 

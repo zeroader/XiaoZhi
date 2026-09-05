@@ -14,6 +14,9 @@ Request (POST /detect):
     }
   }
 
+multipart/form-data 请求可额外携带 `tasks` 字段（逗号分隔）。服务器只解码
+一次 JPEG，然后按顺序处理这些任务，并在一次响应中返回合并结果。
+
 兼容旧协议（人脸检测专用，ESP32 online_detector 仍在用）:
   {
     "type": "face",
@@ -43,7 +46,7 @@ from typing import Any, Dict, List, Optional
 # ============================================================
 
 TASK_FACE_EMOTION = "face_emotion"   # 人脸 + 情绪（每帧）
-TASK_POSTURE = "posture"             # 坐姿（5s 一次）
+TASK_POSTURE = "posture"             # 坐姿（与预览帧同步更新）
 TASK_HEART_RATE = "heart_rate"       # 心率（10s 一次）
 TASK_BLOOD_PRESSURE = "blood_pressure"  # 血压（完成 rPPG 窗口后触发）
 

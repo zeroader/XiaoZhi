@@ -215,6 +215,21 @@ static bool ApplyTaskToOnlineDetector(Detector* detector, const std::string& tas
     return true;
 }
 
+static bool ResultIncludesTask(const std::string& task_list, const char* task) {
+    if (task == nullptr || *task == '\0') return false;
+    size_t start = 0;
+    while (start < task_list.size()) {
+        const size_t end = task_list.find(',', start);
+        const size_t length = (end == std::string::npos ? task_list.size() : end) - start;
+        if (length == strlen(task) && task_list.compare(start, length, task) == 0) {
+            return true;
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return false;
+}
+
 bool VisionPipeline::SetActiveDetector(DetectorType type) {
     if (type == DetectorType::kRemote) {
         ESP_LOGW(TAG, "Legacy remote detector is disabled; use online detector");
@@ -560,9 +575,9 @@ void VisionPipeline::DetectionLoop() {
 
     int consecutive_errors = 0;
     uint32_t last_version = 0;  // avoid re-processing same frame
-    uint64_t last_posture_ms = 0;  // 距上次 posture 任务的毫秒数
     uint64_t last_heart_ms = 0;    // 距上次 heart_rate 任务的毫秒数
     uint64_t last_blood_pressure_ms = 0;  // auto 模式下每约 2s 查询一次 BP 状态
+    uint64_t retry_after_ms = 0;
 
     while (continuous_running_.load()) {
         // Wait for a NEW shared frame (skip if same as last processed)
@@ -597,28 +612,38 @@ void VisionPipeline::DetectionLoop() {
             continue;
         }
 
-        // auto 模式下持续上传高频 face 帧供 rPPG，并每约 2s 请求一次 BP，
-        // 同时保留 posture/heart_rate 的低频任务。
-        std::string task = continuous_task_;
+        const uint64_t now_ms = esp_timer_get_time() / 1000LL;
+        if (now_ms < retry_after_ms) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // 自动模式每帧只上传一次 JPEG：服务器顺序执行情绪和坐姿，并复用
+        // 人脸检测结果；心率/血压到期时加入同一请求，避免额外 HTTP 连接。
+        std::vector<std::string> tasks;
         if (continuous_task_ == kTaskAutoSchedule) {
-            uint64_t now_ms = esp_timer_get_time() / 1000LL;
-            task = kTaskFaceEmotion;
+            tasks = {kTaskFaceEmotion, kTaskPosture};
             if (now_ms - last_blood_pressure_ms >= 2000) {
-                task = kTaskBloodPressure;
+                tasks.push_back(kTaskBloodPressure);
                 last_blood_pressure_ms = now_ms;
-            } else if (now_ms - last_posture_ms >= 5000) {
-                task = kTaskPosture;
-                last_posture_ms = now_ms;
-            } else if (now_ms - last_heart_ms >= 10000) {
-                task = kTaskHeartRate;
+            }
+            if (now_ms - last_heart_ms >= 10000) {
+                tasks.push_back(kTaskHeartRate);
                 last_heart_ms = now_ms;
             }
-            ApplyTaskToOnlineDetector(active_detector_, task);
+        } else {
+            tasks.push_back(continuous_task_);
         }
 
         // Run detection (JPEG encode + HTTP POST + parse response)
         auto t_detect0 = esp_timer_get_time();
-        DetectionResult result = active_detector_->Detect(detect_frame);
+        DetectionResult result;
+        if (auto* online = dynamic_cast<OnlineDetector*>(active_detector_)) {
+            result = online->Detect(detect_frame, tasks);
+        } else {
+            // 本地检测器没有批量网络协议，保持其单任务行为。
+            result = active_detector_->Detect(detect_frame);
+        }
         auto t_detect1 = esp_timer_get_time();
         stats_.total_detect_ms += (uint64_t)((t_detect1 - t_detect0) / 1000LL);
         stats_.detect_count++;
@@ -641,12 +666,16 @@ void VisionPipeline::DetectionLoop() {
             ESP_LOGW(TAG, "Detection error (%d/3): %s", consecutive_errors,
                      result.error_message.c_str());
             if (consecutive_errors >= 3) {
-                ESP_LOGE(TAG, "Stopping after %d consecutive detection errors", consecutive_errors);
-                continuous_running_.store(false);
-                break;
+                ESP_LOGW(TAG, "Detection temporarily backing off after %d consecutive errors",
+                         consecutive_errors);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                consecutive_errors = 0;
             }
+            retry_after_ms = (esp_timer_get_time() / 1000LL) +
+                             (consecutive_errors == 0 ? 1500 : 500);
         } else {
             consecutive_errors = 0;
+            retry_after_ms = 0;
         }
 
         std::string detail;
@@ -873,7 +902,7 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
     std::lock_guard<std::mutex> lock(sensing_mutex_);
     if (result.emotion.available && !result.emotion.label.empty()) {
         latest_emotion_ = result.emotion;
-    } else if (result.task == kTaskFaceEmotion) {
+    } else if (ResultIncludesTask(result.task, kTaskFaceEmotion)) {
         latest_emotion_ = EmotionResult();
     }
     if (result.heart_rate.available) {
@@ -891,7 +920,8 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
             posture_timestamp_ms_ = result.timestamp_ms;
         }
     }
-    if (result.task == kTaskFaceEmotion && result.emotion.available && !result.emotion.label.empty()) {
+    if (ResultIncludesTask(result.task, kTaskFaceEmotion) &&
+        result.emotion.available && !result.emotion.label.empty()) {
         // 10 帧平滑窗口：同一情绪 >=7 次判为特殊情绪，否则 neutral
         emotion_window_.push_back(result.emotion.label);
         if (emotion_window_.size() > 10) {
@@ -917,7 +947,7 @@ void VisionPipeline::CacheSensingResult(const DetectionResult& result) {
             user_emotion_hits_ = 0;
         }
         user_emotion_timestamp_ms_ = result.timestamp_ms;
-    } else if (result.task == kTaskFaceEmotion) {
+    } else if (ResultIncludesTask(result.task, kTaskFaceEmotion)) {
         // 服务器未检测到人脸时，立即使上一帧情绪失效，不能继续沿用旧结果。
         emotion_window_.clear();
         user_emotion_ = "neutral";
@@ -1078,7 +1108,7 @@ void VisionPipeline::MaybePlayVoiceAlerts(const DetectionResult& result) {
     }
 
     const std::string stable_emotion = GetUserEmotion();
-    if (result.task == kTaskFaceEmotion && stable_emotion != "" &&
+    if (ResultIncludesTask(result.task, kTaskFaceEmotion) && stable_emotion != "" &&
         stable_emotion != "neutral" && stable_emotion != "contempt" &&
         (last_emotion_alert_ms_ == 0 || now_ms - last_emotion_alert_ms_ >= kAlertCooldownMs)) {
         const std::string filename = stable_emotion + ".ogg";

@@ -23,6 +23,7 @@ class FrameRecord:
     image: Any                # RGB numpy 数组（已降采样，节省内存）
     width: int = 0            # 原始宽度
     height: int = 0           # 原始高度
+    face: Optional[dict] = None  # 与该帧对应的人脸结果，避免 rPPG 重复推理
 
 
 @dataclass
@@ -63,7 +64,7 @@ class ServerState:
     # ---------- 帧缓存 ----------
 
     def push_frame(self, image, width: int = 0, height: int = 0,
-                   timestamp: Optional[float] = None) -> int:
+                   timestamp: Optional[float] = None, face: Optional[dict] = None) -> int:
         """保存当前帧到缓存，返回自增 frame_id。"""
         with self._lock:
             self._frame_seq += 1
@@ -73,6 +74,7 @@ class ServerState:
                 image=image,
                 width=width,
                 height=height,
+                face=face,
             )
             self.frame_buffer.append(rec)
             return rec.frame_id

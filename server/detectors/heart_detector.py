@@ -13,6 +13,7 @@ rPPG 不做定时采集：由 ESP32 每 10s 触发一次 heart_rate 任务，
 """
 
 import math
+import threading
 
 import numpy as np
 from scipy import signal as sp_signal
@@ -22,7 +23,13 @@ from scipy import sparse
 BANDPASS_LOW = 0.7    # Hz (42 BPM)
 BANDPASS_HIGH = 4.0   # Hz (240 BPM)
 FFT_PADDING = 4       # 频域插值倍数，提升频率分辨率
-MIN_FRAMES = 8        # 最少需要的有效帧数
+MIN_FRAMES = 8        # 通用 rPPG 波形的最低样本数（血压路径保持原行为）
+HEART_MIN_FRAMES = 16 # 心率窗口扩大到 60 帧后使用更高的最低有效帧数
+
+# 心率结果稳定化参数。突变值需要连续两次落在同一新范围才接受。
+BPM_SMOOTH_ALPHA = 0.25
+BPM_MAX_JUMP = 30.0
+BPM_PENDING_TOLERANCE = 15.0
 
 # 支持的方法
 METHODS = ("green", "pos", "chrom")
@@ -59,7 +66,7 @@ class HeartRateDetector:
     def __init__(self, face_detector, method: str = "pos",
                  band_low: float = BANDPASS_LOW,
                  band_high: float = BANDPASS_HIGH,
-                 min_frames: int = MIN_FRAMES):
+                 min_frames: int = HEART_MIN_FRAMES):
         if method not in METHODS:
             raise ValueError(f"method must be one of {METHODS}, got {method!r}")
         self.face_detector = face_detector
@@ -67,6 +74,10 @@ class HeartRateDetector:
         self.band_low = band_low
         self.band_high = band_high
         self.min_frames = min_frames
+        self._smooth_lock = threading.Lock()
+        self._smoothed_bpm = None
+        self._pending_bpm = None
+        self._pending_count = 0
 
     # ---------- 信号提取 ----------
 
@@ -93,7 +104,10 @@ class HeartRateDetector:
         times = []
         for rec in frames:
             bbox = None
-            if self.face_detector is not None:
+            face = getattr(rec, "face", None)
+            if face is not None:
+                bbox = face.get("bbox")
+            elif self.face_detector is not None:
                 face = self.face_detector.detect_primary_face(
                     rec.image, rec.width, rec.height)
                 bbox = face["bbox"] if face else None
@@ -262,6 +276,37 @@ class HeartRateDetector:
         conf = max(0.0, min(1.0, conf))
         return round(float(bpm), 1), round(float(conf), 4)
 
+    def _smooth_bpm(self, bpm: float) -> tuple:
+        """Reject isolated jumps and smoothly follow a confirmed new rate."""
+        with self._smooth_lock:
+            if self._smoothed_bpm is None:
+                self._smoothed_bpm = float(bpm)
+                return round(self._smoothed_bpm, 1), True
+
+            delta = abs(float(bpm) - self._smoothed_bpm)
+            if delta > BPM_MAX_JUMP:
+                if (self._pending_bpm is None or
+                        abs(float(bpm) - self._pending_bpm) > BPM_PENDING_TOLERANCE):
+                    self._pending_bpm = float(bpm)
+                    self._pending_count = 1
+                    return round(self._smoothed_bpm, 1), False
+
+                self._pending_bpm = (self._pending_bpm + float(bpm)) / 2.0
+                self._pending_count += 1
+                if self._pending_count < 2:
+                    return round(self._smoothed_bpm, 1), False
+
+                # The new rate is confirmed; move halfway first, then use EMA.
+                self._smoothed_bpm += 0.5 * (self._pending_bpm - self._smoothed_bpm)
+                self._pending_bpm = None
+                self._pending_count = 0
+                return round(self._smoothed_bpm, 1), True
+
+            self._pending_bpm = None
+            self._pending_count = 0
+            self._smoothed_bpm += BPM_SMOOTH_ALPHA * (float(bpm) - self._smoothed_bpm)
+            return round(self._smoothed_bpm, 1), True
+
     # ---------- 对外接口 ----------
 
     def detect(self, frames) -> dict:
@@ -283,13 +328,16 @@ class HeartRateDetector:
 
         rgb = self._resample_uniform(rgb, times)
         bvp = self._generate_bvp(rgb, fs)
-        bpm, conf = self._estimate_bpm(bvp, fs)
-        if bpm is None:
+        raw_bpm, conf = self._estimate_bpm(bvp, fs)
+        if raw_bpm is None:
             return {"error": "no_peak_in_band"}
+
+        bpm, stable = self._smooth_bpm(raw_bpm)
 
         return {"bpm": round(float(bpm), 1), "confidence": round(float(conf), 4),
                 "method": self.method,
-                "fs": round(float(fs), 2), "frames_used": int(n_used)}
+                "fs": round(float(fs), 2), "frames_used": int(n_used),
+                "raw_bpm": round(float(raw_bpm), 1), "stable": stable}
 
 
 def extract_rppg_waveform(rgb: np.ndarray, times: np.ndarray, method: str = "pos",

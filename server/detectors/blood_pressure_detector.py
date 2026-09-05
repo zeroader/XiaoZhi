@@ -146,12 +146,14 @@ class BloodPressureDetector:
         self._roi = HeartRateDetector(None, method=method)
         self.model = OnnxBloodPressureModel(model_path, config_path)
 
-    def sample_frame(self, image_rgb: np.ndarray) -> tuple:
+    def sample_frame(self, image_rgb: np.ndarray, face=None,
+                     face_ready: bool = False) -> tuple:
         """Return (forehead_rgb, confidence); rgb is None when no usable face exists."""
         if self.face_detector is None:
             return None, 0.0
         h, w = image_rgb.shape[:2]
-        face = self.face_detector.detect_primary_face(image_rgb, w, h)
+        if not face_ready:
+            face = self.face_detector.detect_primary_face(image_rgb, w, h)
         if face is None:
             return None, 0.0
         rgb = self._roi._forehead_mean_rgb(image_rgb, face["bbox"])

@@ -1358,11 +1358,13 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         // The common label setup above aligns labels to the bottom. Restore
         // the intended fixed positions for the two numeric cards afterwards.
         lv_obj_set_align(vision_heart_label_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_heart_label_, 14, 47);
-        lv_obj_set_width(vision_heart_label_, 44);
+        lv_obj_set_pos(vision_heart_label_, 2, 42);
+        lv_obj_set_width(vision_heart_label_, side_w - 4);
+        lv_obj_set_style_transform_zoom(vision_heart_label_, 300, 0);
         lv_obj_set_align(vision_pressure_label_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_pressure_label_, 2, 31);
-        lv_obj_set_width(vision_pressure_label_, 64);
+        lv_obj_set_pos(vision_pressure_label_, 2, 28);
+        lv_obj_set_width(vision_pressure_label_, side_w - 4);
+        lv_obj_set_style_transform_zoom(vision_pressure_label_, 280, 0);
         lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
         auto setup_icon = [&](lv_obj_t* icon, const char* glyph, lv_color_t color) {
             lv_obj_set_width(icon, side_w);
@@ -1379,7 +1381,10 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_align(vision_posture_icon_, LV_ALIGN_TOP_MID, 0, 5);
         SetVisionPostureGraphic(vision_posture_icon_, false);
         lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_size(vision_emotion_image_, 52, 52);
+        lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_transform_zoom(vision_posture_label_, 280, 0);
+        lv_obj_set_style_transform_zoom(vision_emotion_label_, 280, 0);
+        lv_obj_set_size(vision_emotion_image_, side_w - 2, 68);
         lv_obj_align(vision_emotion_image_, LV_ALIGN_TOP_MID, 0, 5);
         lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_t* title = l(p(lw, 0, cw, th));
@@ -1431,6 +1436,9 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     }
     if (result.posture.available) {
         bool posture_bad = result.posture.state == "bad_posture";
+        lv_obj_remove_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_align(vision_posture_label_, LV_ALIGN_BOTTOM_MID, 0, -4);
+        SetLabelTextIfChanged(vision_posture_label_, posture_bad ? "坐姿\n不正" : "坐姿\n端正");
         const char* posture_asset = posture_bad ? "vision_posture_incorrect.png" : "vision_posture_correct.png";
         if (vision_posture_asset_name_ != posture_asset) {
             auto posture_image = LoadVisionAsset(posture_asset);
@@ -1441,9 +1449,9 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                 }
                 vision_posture_asset_image_ = std::move(posture_image);
                 vision_posture_asset_name_ = posture_asset;
-                lv_obj_set_size(vision_posture_image_, card_icon_w, 60);
+                lv_obj_set_size(vision_posture_image_, side_w - 2, 68);
                 lv_obj_set_align(vision_posture_image_, LV_ALIGN_TOP_MID);
-                lv_obj_set_pos(vision_posture_image_, 0, 25);
+                lv_obj_set_pos(vision_posture_image_, 0, 4);
                 lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
                 lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
             }
@@ -1457,6 +1465,10 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
     }
     if (result.emotion.available) {
+        lv_obj_remove_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_align(vision_emotion_label_, LV_ALIGN_BOTTOM_MID, 0, -4);
+        snprintf(buf, sizeof(buf), "情绪\n%s", EmotionLabelZh(result.emotion.label));
+        SetLabelTextIfChanged(vision_emotion_label_, buf);
         std::string emotion_asset_name = "vision_emotion_";
         emotion_asset_name += EmotionAssetKey(result.emotion.label);
         emotion_asset_name += ".png";
@@ -1469,17 +1481,17 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                 }
                 vision_emotion_asset_image_ = std::move(emotion_image);
                 vision_emotion_asset_name_ = emotion_asset_name;
-                lv_obj_set_size(vision_emotion_image_, card_icon_w, 60);
-                lv_obj_set_align(vision_emotion_image_, LV_ALIGN_DEFAULT);
-                lv_obj_set_pos(vision_emotion_image_, 0, 25);
+                lv_obj_set_size(vision_emotion_image_, side_w - 2, 68);
+                lv_obj_set_align(vision_emotion_image_, LV_ALIGN_TOP_MID);
+                lv_obj_set_pos(vision_emotion_image_, 0, 4);
                 lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
                 lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
             }
         }
         lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(vision_emotion_label_, "");
     }
     // Keep visual cards stable. Health warnings are spoken by main's fixed

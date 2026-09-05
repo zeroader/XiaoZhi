@@ -10,6 +10,7 @@
 #include <string>
 #include <stdexcept>
 
+#include <cJSON.h>
 #include <esp_log.h>
 
 #include "board.h"
@@ -81,6 +82,22 @@ std::string LampHttpPost(const std::string& base_url, const std::string& json_bo
 
     if (status != 200) {
         throw std::runtime_error("lamp server HTTP " + std::to_string(status) + ": " + response);
+    }
+
+    // Flask intentionally uses HTTP 200 for both transport success and lamp
+    // operation failure.  Propagate the application-level error instead of
+    // presenting it to the LLM as a successful tool result.
+    cJSON* json = cJSON_Parse(response.c_str());
+    if (json != nullptr) {
+        const cJSON* ok = cJSON_GetObjectItem(json, "ok");
+        if (cJSON_IsFalse(ok)) {
+            const cJSON* error = cJSON_GetObjectItem(json, "error");
+            std::string message = cJSON_IsString(error) ? error->valuestring
+                                                         : "lamp operation failed";
+            cJSON_Delete(json);
+            throw std::runtime_error(message);
+        }
+        cJSON_Delete(json);
     }
     return response;
 }
