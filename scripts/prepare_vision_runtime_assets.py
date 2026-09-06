@@ -9,10 +9,10 @@ source = root / "main" / "assets" / "vision"
 target = source / "runtime"
 target.mkdir(parents=True, exist_ok=True)
 
-# The supplied background already contains the final layout and printed units.
-Image.open(source / "vision_dashboard.png").convert("RGB").resize(
+# The final background includes enlarged status cards and a speech-text channel.
+Image.open(source / "vision_dashboard_5.png").convert("RGB").resize(
     (320, 240), Image.Resampling.LANCZOS
-).save(target / "vision_dashboard.png", optimize=True)
+).save(target / "vision_dashboard_5.png", optimize=True)
 
 
 def fit_transparent(input_path: Path, output_path: Path, size: tuple[int, int]):
@@ -26,17 +26,23 @@ def fit_transparent(input_path: Path, output_path: Path, size: tuple[int, int]):
 fit_transparent(source / "correct_posture.png", target / "vision_posture_correct.png", (76, 70))
 fit_transparent(source / "incorrect_posture.png", target / "vision_posture_incorrect.png", (76, 70))
 
-# emotion.png is a 4-column x 2-row sprite sheet:
+# emotion_emoji.png is a color-coded 4-column x 2-row sprite sheet:
 # angry, contempt, disgust, fear / happy, neutral, sad, surprise.
 labels = ["angry", "contempt", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
-sheet = Image.open(source / "emotion.png").convert("RGBA")
+sheet = Image.open(source / "emotion_emoji.png").convert("RGBA")
 cell_w, cell_h = sheet.width // 4, sheet.height // 2
 for index, label in enumerate(labels):
     cell = sheet.crop(((index % 4) * cell_w, (index // 4) * cell_h,
                        (index % 4 + 1) * cell_w, (index // 4 + 1) * cell_h))
-    cell.thumbnail((76, 80), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGBA", (76, 80), (0, 0, 0, 0))
-    canvas.alpha_composite(cell, ((76 - cell.width) // 2, (80 - cell.height) // 2))
+    # Ignore the faint outer glow when fitting, while preserving the generated
+    # alpha at the face edge. This gives all eight icons the same visual size.
+    bounds = cell.getchannel("A").point(lambda value: 255 if value >= 240 else 0).getbbox()
+    if bounds is None:
+        raise ValueError(f"Missing emoji in sprite cell: {label}")
+    cell = cell.crop(bounds)
+    cell.thumbnail((56, 56), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (58, 58), (0, 0, 0, 0))
+    canvas.alpha_composite(cell, ((58 - cell.width) // 2, (58 - cell.height) // 2))
     canvas.save(target / f"vision_emotion_{label}.png", optimize=True)
 
 print(f"Generated runtime assets in {target}")

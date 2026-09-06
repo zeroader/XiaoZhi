@@ -2,11 +2,89 @@
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <new>
 
 #define TAG "VisionDisplay"
+
+struct VisionFrameBufferPool {
+    struct Buffer {
+        uint8_t* data;
+        size_t size;
+    };
+
+    ~VisionFrameBufferPool() {
+        for (size_t i = 0; i < free_count; ++i) {
+            heap_caps_free(free_buffers[i].data);
+        }
+    }
+
+    uint8_t* Acquire(size_t size) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < free_count; ++i) {
+            if (free_buffers[i].size == size) {
+                uint8_t* data = free_buffers[i].data;
+                free_buffers[i] = free_buffers[--free_count];
+                return data;
+            }
+        }
+        return static_cast<uint8_t*>(
+            heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
+
+    void Release(uint8_t* data, size_t size) {
+        if (data == nullptr) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        // In steady state one spare buffer is sufficient (composition happens
+        // just before the LCD releases its oldest retained frame). Keep a
+        // second slot for a temporary resolution transition.
+        if (free_count < 2) {
+            free_buffers[free_count++] = {data, size};
+        } else {
+            heap_caps_free(data);
+        }
+    }
+
+    std::mutex mutex;
+    Buffer free_buffers[2]{};
+    size_t free_count = 0;
+};
+
+namespace {
+
+class PooledVisionImage final : public LvglImage {
+public:
+    PooledVisionImage(std::shared_ptr<VisionFrameBufferPool> pool, uint8_t* data,
+                      size_t size, int width, int height, int stride)
+        : pool_(std::move(pool)), data_(data), size_(size) {
+        image_dsc_.data_size = size;
+        image_dsc_.data = data;
+        image_dsc_.header.magic = LV_IMAGE_HEADER_MAGIC;
+        image_dsc_.header.cf = LV_COLOR_FORMAT_RGB565;
+        image_dsc_.header.w = width;
+        image_dsc_.header.h = height;
+        image_dsc_.header.stride = stride;
+    }
+
+    ~PooledVisionImage() override {
+        pool_->Release(data_, size_);
+        image_dsc_.data = nullptr;
+    }
+
+    const lv_img_dsc_t* image_dsc() const override { return &image_dsc_; }
+
+private:
+    std::shared_ptr<VisionFrameBufferPool> pool_;
+    uint8_t* data_;
+    size_t size_;
+    lv_img_dsc_t image_dsc_{};
+};
+
+}  // namespace
 
 static const uint8_t kFont5x7[][5] = {
     {0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x5F,0x00,0x00}, {0x00,0x07,0x00,0x07,0x00},
@@ -53,7 +131,8 @@ BoxStyle::BoxStyle()
     , draw_label(true) {
 }
 
-VisionDisplay::VisionDisplay() {
+VisionDisplay::VisionDisplay()
+    : frame_buffer_pool_(std::make_shared<VisionFrameBufferPool>()) {
 }
 
 VisionDisplay::~VisionDisplay() {
@@ -190,40 +269,88 @@ void VisionDisplay::DrawDetections(uint8_t* buf, int w, int h, size_t stride,
 std::unique_ptr<LvglImage> VisionDisplay::ComposePreview(const uint8_t* frame_rgb565,
                                                           int width, int height,
                                                           size_t stride_bytes,
-                                                          const DetectionResult& detections) {
-    if (frame_rgb565 == nullptr || width <= 0 || height <= 0) {
+                                                          const DetectionResult& detections,
+                                                          int target_width,
+                                                          int target_height) {
+    if (frame_rgb565 == nullptr || width <= 0 || height <= 0 || stride_bytes < size_t(width) * 2) {
         ESP_LOGE(TAG, "Invalid frame for preview composition");
         return nullptr;
     }
 
-    size_t dst_stride = (size_t)width * 2;
-    size_t total = dst_stride * (size_t)height;
-    uint8_t* dst = (uint8_t*)heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
+    if (target_width <= 0) target_width = width;
+    if (target_height <= 0) target_height = height;
+
+    // Crop to exactly the on-screen video's aspect ratio and downscale before
+    // handing the frame to LVGL. Previously LVGL repeatedly scaled the full
+    // 320x240 image during every partial flush, limiting the live view to only
+    // a few FPS. Nearest-neighbour sampling is intentional here: it is fast,
+    // deterministic, and the small LCD preview does not benefit from a costly
+    // filtered resize.
+    int crop_width = width;
+    int crop_height = height;
+    if (int64_t(width) * target_height > int64_t(height) * target_width) {
+        crop_width = std::max(1, int(int64_t(height) * target_width / target_height));
+    } else {
+        crop_height = std::max(1, int(int64_t(width) * target_height / target_width));
+    }
+    const int crop_x = (width - crop_width) / 2;
+    const int crop_y = (height - crop_height) / 2;
+
+    const size_t dst_stride = size_t(target_width) * 2;
+    const size_t total = dst_stride * size_t(target_height);
+    uint8_t* dst = frame_buffer_pool_->Acquire(total);
     if (dst == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate %d bytes for preview", (int)total);
         return nullptr;
     }
 
-    if (stride_bytes == dst_stride) {
-        memcpy(dst, frame_rgb565, total);
-    } else {
-        for (int y = 0; y < height; y++) {
-            memcpy(dst + (size_t)y * dst_stride,
-                   frame_rgb565 + (size_t)y * stride_bytes,
-                   dst_stride);
+    const uint32_t x_step = uint32_t((uint64_t(crop_width) << 16) / target_width);
+    const uint32_t y_step = uint32_t((uint64_t(crop_height) << 16) / target_height);
+    uint32_t y_acc = y_step / 2;
+    for (int y = 0; y < target_height; ++y, y_acc += y_step) {
+        const int source_y = crop_y + std::min(crop_height - 1, int(y_acc >> 16));
+        const uint8_t* source_row = frame_rgb565 + size_t(source_y) * stride_bytes;
+        uint8_t* target_row = dst + size_t(y) * dst_stride;
+        uint32_t x_acc = x_step / 2;
+        for (int x = 0; x < target_width; ++x, x_acc += x_step) {
+            const int source_x = crop_x + std::min(crop_width - 1, int(x_acc >> 16));
+            const uint8_t* source = source_row + size_t(source_x) * 2;
+            // Preserve the byte order expected by the existing LVGL/SPI path.
+            target_row[size_t(x) * 2] = source[1];
+            target_row[size_t(x) * 2 + 1] = source[0];
         }
     }
 
-    // Swap RGB565 byte pairs for LVGL compatibility (LVGL expects BGR565 byte order on ESP32-S3)
-    {
-        uint16_t* pixels = (uint16_t*)dst;
-        size_t pixel_count = total / 2;
-        for (size_t i = 0; i < pixel_count; i++) {
-            pixels[i] = __builtin_bswap16(pixels[i]);
-        }
+    const int source_width = detections.source_width > 0 ? detections.source_width : width;
+    const int source_height = detections.source_height > 0 ? detections.source_height : height;
+    for (const auto& detection : detections.detections) {
+        const auto& box = detection.box;
+        // Server responses are already mapped back to full-camera coordinates.
+        const int source_x1 = box.x * width / source_width;
+        const int source_y1 = box.y * height / source_height;
+        const int source_x2 = (box.x + box.width) * width / source_width;
+        const int source_y2 = (box.y + box.height) * height / source_height;
+        const int clipped_x1 = std::max(crop_x, source_x1);
+        const int clipped_y1 = std::max(crop_y, source_y1);
+        const int clipped_x2 = std::min(crop_x + crop_width, source_x2);
+        const int clipped_y2 = std::min(crop_y + crop_height, source_y2);
+        if (clipped_x2 <= clipped_x1 || clipped_y2 <= clipped_y1) continue;
+        const int box_x = (clipped_x1 - crop_x) * target_width / crop_width;
+        const int box_y = (clipped_y1 - crop_y) * target_height / crop_height;
+        const int box_x2 = (clipped_x2 - crop_x) * target_width / crop_width;
+        const int box_y2 = (clipped_y2 - crop_y) * target_height / crop_height;
+        DrawRect(dst, target_width, target_height, dst_stride,
+                 box_x, box_y, std::max(1, box_x2 - box_x), std::max(1, box_y2 - box_y),
+                 default_style_.border_color_rgb565, default_style_.border_thickness);
     }
 
-    DrawDetections(dst, width, height, dst_stride, detections);
-
-    return std::make_unique<LvglAllocatedImage>(dst, total, width, height, (int)dst_stride, LV_COLOR_FORMAT_RGB565);
+    auto* pooled_image = new (std::nothrow) PooledVisionImage(
+        frame_buffer_pool_, dst, total, target_width, target_height,
+        static_cast<int>(dst_stride));
+    if (pooled_image == nullptr) {
+        frame_buffer_pool_->Release(dst, total);
+        ESP_LOGE(TAG, "Failed to allocate preview image descriptor");
+        return nullptr;
+    }
+    return std::unique_ptr<LvglImage>(pooled_image);
 }

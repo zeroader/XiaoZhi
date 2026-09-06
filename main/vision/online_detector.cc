@@ -11,6 +11,8 @@
 #include "system_info.h"
 #include "settings.h"
 #include "image_to_jpeg.h"
+#include "vision_viewport.h"
+#include <lvgl.h>
 
 #define TAG "OnlineDetector"
 
@@ -314,6 +316,17 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame,
     meta_header += "--" + boundary + "\r\n";
     meta_header += "Content-Disposition: form-data; name=\"height\"\r\n\r\n";
     meta_header += std::to_string(enc_h) + "\r\n";
+#if CONFIG_BOARD_TYPE_ATK_DNESP32S3 && !CONFIG_USE_WECHAT_MESSAGE_STYLE
+    // The server crops BEFORE face detection, emotion and rPPG sampling.
+    // Retain hardware JPEG upload; no extra decode/encode on the ESP32.
+    const auto roi = VisionCenterCrop(enc_w, enc_h, VisionVideoViewport(LV_HOR_RES, LV_VER_RES));
+    meta_header += "--" + boundary + "\r\n";
+    meta_header += "Content-Disposition: form-data; name=\"vision_roi\"\r\n\r\n";
+    meta_header += std::to_string(roi.x) + "," + std::to_string(roi.y) + "," +
+                   std::to_string(roi.width) + "," + std::to_string(roi.height) + "\r\n";
+#endif
+    result.source_width = enc_w;
+    result.source_height = enc_h;
     meta_header += "--" + boundary + "\r\n";
     meta_header += "Content-Disposition: form-data; name=\"image\"; filename=\"frame.jpg\"\r\n";
     meta_header += "Content-Type: image/jpeg\r\n\r\n";
@@ -331,6 +344,12 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame,
     http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
     http->SetHeader("Content-Length", std::to_string(meta_header.size() + jpeg_size + footer.size()));
     http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+    // HttpClient::Open selects chunked writes when content_ is unset, even
+    // with a caller-supplied Content-Length. An explicit empty content selects
+    // raw streaming; the multipart body below supplies exactly Content-Length
+    // bytes. Otherwise Write includes chunk markers in its return count and
+    // the server receives a truncated/malformed multipart request (HTTP 400).
+    http->SetContent(std::string());
 
     if (!http->Open("POST", endpoint_url_)) {
         ESP_LOGE(TAG, "Failed to open HTTP connection to %s", endpoint_url_.c_str());
@@ -341,7 +360,18 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame,
     }
 
     auto write_part = [&http](const char* data, size_t size) {
-        return http->Write(data, size) == static_cast<int>(size);
+        size_t sent = 0;
+        while (sent < size) {
+            const size_t count = std::min<size_t>(4096, size - sent);
+            const int written = http->Write(data + sent, count);
+            if (written <= 0 || static_cast<size_t>(written) > count) {
+                ESP_LOGE(TAG, "Request write failed: sent=%u/%u requested=%u returned=%d",
+                         (unsigned)sent, (unsigned)size, (unsigned)count, written);
+                return false;
+            }
+            sent += static_cast<size_t>(written);
+        }
+        return true;
     };
     if (!write_part(meta_header.c_str(), meta_header.size()) ||
         !write_part((const char*)jpeg_buffer, jpeg_size) ||
@@ -370,6 +400,24 @@ DetectionResult OnlineDetector::Detect(const ImageFrame& frame,
     auto t_http = esp_timer_get_time();
 
     // Step 4: Parse response
+#if CONFIG_BOARD_TYPE_ATK_DNESP32S3 && !CONFIG_USE_WECHAT_MESSAGE_STYLE
+    // Do not silently display full-frame results from an outdated server.
+    cJSON* reply = cJSON_Parse(response.c_str());
+    cJSON* applied_roi = reply ? cJSON_GetObjectItem(reply, "vision_roi") : nullptr;
+    const int expected_roi[] = {roi.x, roi.y, roi.width, roi.height};
+    bool roi_matches = cJSON_IsArray(applied_roi) && cJSON_GetArraySize(applied_roi) == 4;
+    for (int i = 0; roi_matches && i < 4; ++i) {
+        const auto* value = cJSON_GetArrayItem(applied_roi, i);
+        roi_matches = cJSON_IsNumber(value) && value->valuedouble == expected_roi[i];
+    }
+    cJSON_Delete(reply);
+    if (!roi_matches) {
+        result.connection_ok = false;
+        result.error_message = "server did not apply vision ROI; update and restart detection server";
+        ESP_LOGE(TAG, "%s", result.error_message.c_str());
+        return result;
+    }
+#endif
     ParseResponse(response, result);
 
     auto total_end = esp_timer_get_time();

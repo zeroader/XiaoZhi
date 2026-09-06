@@ -191,7 +191,7 @@ private:
     int user_emotion_hits_;             // 该情绪的命中次数
     uint64_t user_emotion_timestamp_ms_;
 
-    // 本地语音提醒状态（各类事件独立 60 秒冷却）
+    // 本地语音提醒状态（坐姿 3 秒，其他事件 60 秒，各自独立冷却）
     uint64_t last_heart_alert_ms_ = 0;
     uint64_t last_blood_alert_ms_ = 0;
     uint64_t last_posture_alert_ms_ = 0;

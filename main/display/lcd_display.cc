@@ -11,11 +11,13 @@
 #include <esp_err.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
+#include <esp_heap_caps.h>
 #include <cstring>
 
 #include "board.h"
 #include "assets.h"
 #include "vision/detector.h"
+#include "vision/vision_viewport.h"
 
 #define TAG "LcdDisplay"
 
@@ -116,11 +118,85 @@ static void SetVisionEmojiImage(lv_obj_t* object, const LvglImage* image) {
     lv_obj_remove_flag(object, LV_OBJ_FLAG_HIDDEN);
 }
 
-static std::unique_ptr<LvglImage> LoadVisionAsset(const char* name) {
+std::shared_ptr<LvglImage> LcdDisplay::LoadVisionAsset(const char* name) {
+    const auto found = vision_asset_cache_.find(name);
+    if (found != vision_asset_cache_.end()) return found->second;
     void* data = nullptr;
     size_t size = 0;
     if (!Assets::GetInstance().GetAssetData(name, data, size)) return nullptr;
-    return std::make_unique<LvglRawImage>(data, size);
+    auto image = std::make_shared<LvglRawImage>(data, size);
+    vision_asset_cache_.emplace(name, image);
+    return image;
+}
+
+// Both layout implementations call these helpers while holding the LVGL lock.
+void LcdDisplay::PrepareVisionFrame(int bottom_y, bool show_bottom_mask) {
+    // Result handling below hides unavailable cards. Do not hide/show valid
+    // cards every frame: that invalidates their entire area on every refresh.
+    if (vision_bottom_mask_ == nullptr) {
+        vision_bottom_mask_ = lv_obj_create(vision_dashboard_);
+        lv_obj_remove_style_all(vision_bottom_mask_);
+        lv_obj_clear_flag(vision_bottom_mask_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_color(vision_bottom_mask_, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(vision_bottom_mask_, LV_OPA_COVER, 0);
+    }
+    lv_obj_set_pos(vision_bottom_mask_, 0, bottom_y);
+    lv_obj_set_size(vision_bottom_mask_, LV_HOR_RES, LV_VER_RES - bottom_y);
+    if (show_bottom_mask) {
+        lv_obj_remove_flag(vision_bottom_mask_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        // dashboard_5 already contains a fitted light-blue transcript channel
+        // and the decorative grass strip. An opaque mask here erased both.
+        lv_obj_add_flag(vision_bottom_mask_, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void LcdDisplay::PublishVisionFrame(std::unique_ptr<LvglImage> image) {
+    // Own the new descriptor before publishing it, and retain the previous
+    // eight complete frames across updates and ordinary-preview transitions.
+    if (preview_image_cached_) {
+        vision_frame_history_.push_back(std::move(preview_image_cached_));
+    }
+    preview_image_cached_ = std::move(image);
+    lv_image_set_src(preview_image_, preview_image_cached_->image_dsc());
+    while (vision_frame_history_.size() > 8) vision_frame_history_.pop_front();
+
+    // Report frames that actually reached this publishing path. Update the
+    // label once per second so the counter itself does not add per-frame UI
+    // invalidation or SPI traffic.
+    if (vision_fps_label_ != nullptr) {
+        const uint64_t now_ms = esp_timer_get_time() / 1000ULL;
+        if (vision_fps_window_start_ms_ == 0 ||
+            now_ms - vision_fps_window_start_ms_ > 3000) {
+            vision_fps_window_start_ms_ = now_ms;
+            vision_fps_frame_count_ = 0;
+        }
+        ++vision_fps_frame_count_;
+        const uint64_t elapsed_ms = now_ms - vision_fps_window_start_ms_;
+        if (elapsed_ms >= 1000) {
+            char fps_text[20];
+            const float fps = vision_fps_frame_count_ * 1000.0f / elapsed_ms;
+            snprintf(fps_text, sizeof(fps_text), "FPS %.1f", fps);
+            if (std::strcmp(lv_label_get_text(vision_fps_label_), fps_text) != 0) {
+                lv_label_set_text(vision_fps_label_, fps_text);
+            }
+            vision_fps_window_start_ms_ = now_ms;
+            vision_fps_frame_count_ = 0;
+        }
+    }
+
+    auto ensure_index = [](lv_obj_t* object, int32_t index) {
+        if (object && lv_obj_get_index(object) != index) lv_obj_move_to_index(object, index);
+    };
+    ensure_index(vision_background_view_, 0);
+    ensure_index(preview_image_, vision_background_view_ ? 1 : 0);
+    ensure_index(vision_fps_label_, vision_background_view_ ? 2 : 1);
+    const bool direct_caption = chat_message_label_ &&
+                                lv_obj_get_parent(chat_message_label_) == vision_dashboard_;
+    const int32_t last = lv_obj_get_child_count(vision_dashboard_) - 1;
+    ensure_index(vision_bottom_mask_, last - (vision_caption_ ? 1 : 0) - (direct_caption ? 1 : 0));
+    ensure_index(vision_caption_, last - (direct_caption ? 1 : 0));
+    if (direct_caption) ensure_index(chat_message_label_, last);
 }
 
 static void SetLabelTextIfChanged(lv_obj_t* label, const char* text) {
@@ -129,8 +205,70 @@ static void SetLabelTextIfChanged(lv_obj_t* label, const char* text) {
     }
 }
 
+static void SetVisionTranscriptX(void* object, int32_t x) {
+    lv_obj_set_x(static_cast<lv_obj_t*>(object), static_cast<lv_coord_t>(x));
+}
+
+static std::string VisionTranscriptSingleLine(const char* text) {
+    std::string line = text != nullptr ? text : "";
+    for (char& ch : line) {
+        if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+    }
+    return line;
+}
+
+static void StartVisionTranscriptScroll(lv_obj_t* label, lv_coord_t screen_width,
+                                        lv_coord_t caption_y, lv_coord_t caption_height) {
+    if (label == nullptr) return;
+
+    lv_anim_delete(label, SetVisionTranscriptX);
+    const auto line = VisionTranscriptSingleLine(lv_label_get_text(label));
+    SetLabelTextIfChanged(label, line.c_str());
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(label, LV_SIZE_CONTENT);
+    lv_obj_set_align(label, LV_ALIGN_DEFAULT);
+    lv_obj_set_style_base_dir(label, LV_BASE_DIR_LTR, 0);
+
+    const lv_font_t* font = lv_obj_get_style_text_font(label, 0);
+    const lv_coord_t line_height = font != nullptr ? font->line_height : caption_height;
+    const int32_t zoom = std::min<int32_t>(256, (caption_height - 2) * 256 / line_height);
+    lv_obj_set_height(label, line_height);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
+    // The 20 px Puhui font has a 25 px line box. Keep that box intact and
+    // scale around its top-left corner, independent of the sentence width.
+    lv_obj_set_style_transform_pivot_x(label, 0, 0);
+    lv_obj_set_style_transform_pivot_y(label, 0, 0);
+    lv_obj_set_style_transform_zoom(label, zoom, 0);
+    lv_obj_update_layout(label);
+
+    const lv_coord_t text_width = std::max<lv_coord_t>(1, (lv_obj_get_width(label) * zoom + 255) / 256);
+    const lv_coord_t text_y = caption_y + (caption_height - (line_height * zoom + 255) / 256) / 2;
+    lv_obj_set_pos(label, screen_width, text_y);
+    if (line.empty()) return;
+
+    // Constant-speed marquee: every utterance enters from the right and leaves
+    // at the left, including short one-line messages.
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, label);
+    lv_anim_set_values(&animation, screen_width, -text_width);
+    lv_anim_set_duration(&animation,
+                         std::max<uint32_t>(4200, (screen_width + text_width) * 20));
+    lv_anim_set_path_cb(&animation, lv_anim_path_linear);
+    lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_exec_cb(&animation, SetVisionTranscriptX);
+    lv_anim_start(&animation);
+}
+
 static bool LoadVisionDashboard(void*& data, size_t& size) {
-    const char* names[] = {"vision_dashboard_2.png", "vision_dashboard_1.png", "vision_dashboard.png"};
+    const char* names[] = {
+        "vision_dashboard_5.png",
+        "vision_dashboard_4.png",
+        "vision_dashboard_3.png",
+        "vision_dashboard_2.png",
+        "vision_dashboard_1.png",
+        "vision_dashboard.png",
+    };
     for (const char* name : names) {
         if (Assets::GetInstance().GetAssetData(name, data, size)) {
             ESP_LOGI(TAG, "Loaded vision dashboard asset: %s (%u bytes)", name, (unsigned)size);
@@ -265,6 +403,17 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     esp_timer_create_args_t preview_timer_args = {
         .callback = [](void* arg) {
             LcdDisplay* display = static_cast<LcdDisplay*>(arg);
+            // The LVGL mutex is recursive. Check mode and hide atomically so
+            // an already-dispatched photo timeout cannot hide live monitoring.
+            DisplayLockGuard lock(display, 1);
+            if (!lock) {
+                esp_timer_start_once(display->preview_timer_, 100000);
+                return;
+            }
+            if (display->vision_dashboard_ != nullptr && display->preview_image_ != nullptr &&
+                lv_obj_get_parent(display->preview_image_) == display->vision_dashboard_) {
+                return;
+            }
             display->SetPreviewImage(nullptr);
         },
         .arg = this,
@@ -313,14 +462,38 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     lvgl_port_init(&port_cfg);
 
     ESP_LOGI(TAG, "Adding LCD display");
-    const lvgl_port_display_cfg_t display_cfg = {
+#if CONFIG_BOARD_TYPE_ATK_DNESP32S3
+    // LCD initializes before camera/audio/vision threads. Prefer one wider DMA
+    // band over two narrow bands: both use at most 12.8 KB, but the wider band
+    // halves the number of visibly progressive partial-refresh boundaries.
+    // Larger/double buffers previously starved the detection thread's stack.
+    constexpr size_t kInternalReserve = 48 * 1024;
+    const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint32_t dma_lines = 8;
+    for (const uint32_t lines : {20U, 16U, 12U, 10U, 8U}) {
+        const size_t buffer_bytes = size_t(width_) * lines * sizeof(uint16_t);
+        if (largest_dma >= buffer_bytes &&
+            internal_free >= buffer_bytes + kInternalReserve) {
+            dma_lines = lines;
+            break;
+        }
+    }
+    ESP_LOGI(TAG, "LCD DMA budget: internal_free=%u largest_dma=%u reserve=%u lines=%u single",
+             (unsigned)internal_free, (unsigned)largest_dma, (unsigned)kInternalReserve,
+             (unsigned)dma_lines);
+#endif
+    lvgl_port_display_cfg_t display_cfg = {
         .io_handle = panel_io_,
         .panel_handle = panel_,
         .control_handle = nullptr,
-        // A 40-line DMA block halves the number of visible SPI refresh bands
-        // without consuming the internal RAM required by a full double buffer.
+#if CONFIG_BOARD_TYPE_ATK_DNESP32S3
+        .buffer_size = static_cast<uint32_t>(width_ * dma_lines),
+        .double_buffer = false,
+#else
         .buffer_size = static_cast<uint32_t>(width_ * 40),
         .double_buffer = false,
+#endif
         .trans_size = 0,
         .hres = static_cast<uint32_t>(width_),
         .vres = static_cast<uint32_t>(height_),
@@ -341,7 +514,15 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
         },
     };
 
+    DisplayLockGuard display_setup_lock(this);
+    if (!display_setup_lock) return;
     display_ = lvgl_port_add_disp(&display_cfg);
+#if CONFIG_BOARD_TYPE_ATK_DNESP32S3
+    if (display_) {
+        ESP_LOGI(TAG, "LCD DMA: single buffer, %u bytes, SPI clock unchanged",
+                 (unsigned)(display_cfg.buffer_size * sizeof(uint16_t)));
+    }
+#endif
     if (display_ == nullptr) {
         ESP_LOGE(TAG, "Failed to add display");
         return;
@@ -474,6 +655,7 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
 }
 
 LcdDisplay::~LcdDisplay() {
+    DisplayLockGuard display_lock(this);
     SetPreviewImage(nullptr);
     
     // Clean up GIF controller
@@ -954,11 +1136,13 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 
 void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                                        const DetectionResult& result) {
-    // Conversation updates share this lock. Never let a busy UI stall camera
-    // capture: dropping one LCD frame is preferable to blocking the pipeline.
-    DisplayLockGuard lock(this, 1);
+    // Wait for the preceding LVGL flush instead of repeatedly dropping frames
+    // after a 5 ms try-lock. The short timeout caused most preview submissions
+    // to be discarded (and logged), reducing the visible rate to 3-5 FPS.
+    DisplayLockGuard lock(this, 30);
     if (!lock) return;
     if (content_ == nullptr || preview_image_ == nullptr || image == nullptr) return;
+    esp_timer_stop(preview_timer_);
 
     // Reset transient artwork before applying this frame.  The image objects
     // are reused, so leaving one visible causes stale cards to flash over the
@@ -1116,7 +1300,6 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_set_style_border_width(video_area, 0, 0);
         lv_obj_set_parent(preview_image_, vision_dashboard_);
         // Exact inner video window of the 320x240 artwork.
-        const lv_coord_t video_w = (center_w - 8) * 9 / 10;
         const lv_coord_t video_h = std::min<lv_coord_t>(h - title_h - bottom_h - 8, video_w * 3 / 4);
         lv_obj_set_size(preview_image_, video_w, video_h);
         lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
@@ -1138,6 +1321,7 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         }
     }
 
+    PrepareVisionFrame(h - bottom_h);
     char text[128];
     // This label is refreshed on every preview frame; only the heart glyph
     // is static.  Keep the live value inside the red heart as in the mockup.
@@ -1158,15 +1342,12 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         bool posture_bad = result.posture.state == "bad_posture";
         lv_obj_remove_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_align(vision_posture_label_, LV_ALIGN_TOP_MID, 0, 101);
-        lv_label_set_text(vision_posture_label_, posture_bad ? "\xE5\x9D\x90\xE5\xA7\xbf\xE4\xB8\x8D\xE6\xAD\xA3" : "\xE5\x9D\x90\xE5\xA7\xbf\xE7\AB\AF\xE6\xAD\xA3");
+        lv_label_set_text(vision_posture_label_, posture_bad ? "坐姿不正" : "坐姿端正");
         const char* posture_asset = posture_bad ? "vision_posture_incorrect.png" : "vision_posture_correct.png";
         if (vision_posture_asset_name_ != posture_asset) {
             auto posture_image = LoadVisionAsset(posture_asset);
             if (posture_image != nullptr) {
                 lv_image_set_src(vision_posture_image_, posture_image->image_dsc());
-                if (vision_posture_asset_image_) {
-                    vision_asset_history_.push_back(std::move(vision_posture_asset_image_));
-                }
                 vision_posture_asset_image_ = std::move(posture_image);
                 vision_posture_asset_name_ = posture_asset;
         lv_obj_set_size(vision_posture_image_, card_icon_w, 60);
@@ -1177,6 +1358,9 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
             }
         }
         lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
     }
     if (result.emotion.available) {
         std::string emotion_asset_name = "vision_emotion_";
@@ -1186,9 +1370,6 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
             auto emotion_image = LoadVisionAsset(emotion_asset_name.c_str());
             if (emotion_image != nullptr) {
                 lv_image_set_src(vision_emotion_image_, emotion_image->image_dsc());
-                if (vision_emotion_asset_image_) {
-                    vision_asset_history_.push_back(std::move(vision_emotion_asset_image_));
-                }
                 vision_emotion_asset_image_ = std::move(emotion_image);
                 vision_emotion_asset_name_ = emotion_asset_name;
         lv_obj_set_size(vision_emotion_image_, card_icon_w, 60);
@@ -1243,12 +1424,7 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     lv_obj_set_pos(preview_image_, side_w,
                    title_h + (h - title_h - bottom_h - video_h) / 2);
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
-    lv_image_set_src(preview_image_, image->image_dsc());
-    if (preview_image_cached_) {
-        vision_frame_history_.push_back(std::move(preview_image_cached_));
-        while (vision_frame_history_.size() > 8) vision_frame_history_.pop_front();
-    }
-    preview_image_cached_ = std::move(image);
+    PublishVisionFrame(std::move(image));
     // Keep the preview below the four information cards, but above the
     // dashboard background image.
     lv_obj_move_to_index(preview_image_, 1);
@@ -1260,30 +1436,41 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
 #else
 void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
                                        const DetectionResult& result) {
-    // Conversation updates share this lock. Never let a busy UI stall camera
-    // capture: dropping one LCD frame is preferable to blocking the pipeline.
-    DisplayLockGuard lock(this, 1);
+    // Wait for the preceding LVGL flush instead of repeatedly dropping frames
+    // after a 5 ms try-lock. This remains bounded below the 50 ms frame period.
+    DisplayLockGuard lock(this, 30);
     if (!lock) return;
     if (!image || !content_ || !preview_image_) return;
+    esp_timer_stop(preview_timer_);
     if (status_bar_ != nullptr) {
         lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
     }
     const lv_coord_t w = LV_HOR_RES, h = LV_VER_RES;
-    const lv_coord_t th = 20;
-    const lv_coord_t bottom_h = 30;
-    const lv_coord_t lw = std::max<lv_coord_t>(52, w / 6);
-    const lv_coord_t cw = w - lw * 2;
-    const lv_coord_t preview_w = (cw - 8) * 9 / 10;
-    const lv_coord_t side_w = lw + (cw - preview_w) / 2;
-    const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
+    // Coordinates mirror the 320x240 dashboard_5 artwork. The lower strip is
+    // a dedicated speech-text channel and must never be covered by cards.
+    const lv_coord_t th = std::max<lv_coord_t>(20, h * 28 / 240);
+    const lv_coord_t caption_y = h * 199 / 240;
+    const lv_coord_t caption_h = std::max<lv_coord_t>(18, h * 21 / 240);
+    const lv_coord_t split_y = h * 107 / 240;
+    const lv_coord_t side_w = std::max<lv_coord_t>(64, w * 70 / 320);
+    const lv_coord_t cw = w - side_w * 2;
+    const auto viewport = VisionVideoViewport(w, h);
+    const lv_coord_t preview_x = viewport.x;
+    const lv_coord_t preview_y = viewport.y;
+    const lv_coord_t preview_w = viewport.width;
+    const lv_coord_t preview_h = viewport.height;
     const bool entering_vision = vision_dashboard_ == nullptr ||
                                  lv_obj_get_parent(preview_image_) != vision_dashboard_;
     if (entering_vision) {
         lv_obj_set_layout(content_, LV_LAYOUT_NONE);
         lv_obj_set_size(content_, w, h);
+        lv_obj_scroll_to(content_, 0, 0, LV_ANIM_OFF);
     }
     if (!vision_dashboard_) {
         vision_dashboard_ = lv_obj_create(content_);
+        lv_obj_set_style_border_width(vision_dashboard_, 0, 0);
+        lv_obj_set_style_radius(vision_dashboard_, 0, 0);
+        lv_obj_set_pos(vision_dashboard_, 0, 0);
         lv_obj_set_scrollbar_mode(vision_dashboard_, LV_SCROLLBAR_MODE_OFF);
         lv_obj_clear_flag(vision_dashboard_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_size(vision_dashboard_, w, h); lv_obj_set_style_pad_all(vision_dashboard_, 0, 0);
@@ -1298,30 +1485,15 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
             lv_obj_set_size(vision_background_view_, w, h);
             lv_obj_set_pos(vision_background_view_, 0, 0);
         }
-        lv_obj_t* bottom_mask = lv_obj_create(vision_dashboard_);
-        lv_obj_set_size(bottom_mask, w, bottom_h);
-        lv_obj_set_pos(bottom_mask, 0, h - bottom_h);
-        lv_obj_set_style_bg_color(bottom_mask, lv_color_white(), 0);
-        lv_obj_set_style_bg_opa(bottom_mask, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(bottom_mask, 0, 0);
-        lv_obj_set_style_pad_all(bottom_mask, 0, 0);
         auto p = [&](lv_coord_t x, lv_coord_t y, lv_coord_t pw, lv_coord_t ph) { lv_obj_t* o = lv_obj_create(vision_dashboard_); lv_obj_set_size(o, pw, ph); lv_obj_set_pos(o, x, y); lv_obj_set_scrollbar_mode(o, LV_SCROLLBAR_MODE_OFF); lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_style_pad_all(o, 0, 0); lv_obj_set_style_bg_color(o, lv_color_hex(0xFFFFFF), 0); lv_obj_set_style_border_width(o, 0, 0); return o; };
         auto l = [&](lv_obj_t* o) { lv_obj_t* x = lv_label_create(o); lv_obj_center(x); lv_obj_set_style_text_align(x, LV_TEXT_ALIGN_CENTER, 0); return x; };
-        const lv_coord_t video_w = cw - 8;
-        const lv_coord_t side_w = lw + (cw - video_w) / 2;
-        const lv_coord_t card_icon_w = std::max<lv_coord_t>(48, side_w - 6);
-        vision_heart_panel_ = p(0, 0, side_w, h / 2); vision_pressure_panel_ = p(0, h / 2, side_w, h - h / 2);
+        vision_heart_panel_ = p(0, 0, side_w, split_y);
+        vision_pressure_panel_ = p(0, split_y, side_w, caption_y - split_y);
         vision_heart_label_ = l(vision_heart_panel_); vision_pressure_label_ = l(vision_pressure_panel_);
-        vision_posture_panel_ = p(w - side_w, 0, side_w, h / 2); vision_posture_label_ = l(vision_posture_panel_);
-        vision_emotion_panel_ = p(w - side_w, h / 2, side_w, h - h / 2); vision_emotion_label_ = l(vision_emotion_panel_);
-        lv_obj_set_align(vision_heart_label_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_heart_label_, 14, 47);
-        lv_obj_set_width(vision_heart_label_, 44);
-        lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
-        lv_obj_set_align(vision_pressure_label_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_pressure_label_, 2, 31);
-        lv_obj_set_width(vision_pressure_label_, 64);
-        lv_obj_set_style_text_color(vision_pressure_label_, lv_color_hex(0x1267D6), 0);
+        vision_posture_panel_ = p(w - side_w, 0, side_w, split_y);
+        vision_posture_label_ = l(vision_posture_panel_);
+        vision_emotion_panel_ = p(w - side_w, split_y, side_w, caption_y - split_y);
+        vision_emotion_label_ = l(vision_emotion_panel_);
         vision_heart_icon_ = lv_label_create(vision_heart_panel_);
         vision_pressure_icon_ = lv_label_create(vision_pressure_panel_);
         vision_posture_cartoon_ = CreateVisionPostureCartoon(vision_posture_panel_);
@@ -1344,28 +1516,20 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
         for (auto* label : {vision_heart_label_, vision_pressure_label_, vision_posture_label_, vision_emotion_label_}) {
-            lv_obj_set_width(label, side_w - 4);
+            lv_obj_set_width(label, side_w - 8);
             lv_obj_set_height(label, LV_SIZE_CONTENT);
-            lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -5);
+            lv_obj_align(label, LV_ALIGN_CENTER, 0, 13);
             lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
             lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
             lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_set_style_text_font(label, static_cast<LvglTheme*>(current_theme_)->text_font()->font(), 0);
             lv_obj_set_style_text_color(label, lv_color_hex(0x243447), 0);
-            lv_obj_set_style_transform_zoom(label, 220, 0);
-            lv_obj_set_style_text_line_space(label, 2, 0);
+            lv_obj_set_style_transform_zoom(label, 280, 0);
+            lv_obj_set_style_text_line_space(label, 0, 0);
         }
-        // The common label setup above aligns labels to the bottom. Restore
-        // the intended fixed positions for the two numeric cards afterwards.
-        lv_obj_set_align(vision_heart_label_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_heart_label_, 2, 42);
-        lv_obj_set_width(vision_heart_label_, side_w - 4);
-        lv_obj_set_style_transform_zoom(vision_heart_label_, 300, 0);
-        lv_obj_set_align(vision_pressure_label_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(vision_pressure_label_, 2, 28);
-        lv_obj_set_width(vision_pressure_label_, side_w - 4);
-        lv_obj_set_style_transform_zoom(vision_pressure_label_, 280, 0);
         lv_obj_set_style_text_color(vision_heart_label_, lv_color_hex(0xE53935), 0);
+        lv_obj_set_style_text_color(vision_pressure_label_, lv_color_hex(0x1267D6), 0);
+        lv_obj_set_style_text_color(vision_posture_label_, lv_color_hex(0x1E9E49), 0);
         auto setup_icon = [&](lv_obj_t* icon, const char* glyph, lv_color_t color) {
             lv_obj_set_width(icon, side_w);
             lv_obj_set_height(icon, LV_SIZE_CONTENT);
@@ -1380,14 +1544,11 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_set_size(vision_posture_icon_, 52, 56);
         lv_obj_align(vision_posture_icon_, LV_ALIGN_TOP_MID, 0, 5);
         SetVisionPostureGraphic(vision_posture_icon_, false);
-        lv_obj_add_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_transform_zoom(vision_posture_label_, 280, 0);
-        lv_obj_set_style_transform_zoom(vision_emotion_label_, 280, 0);
-        lv_obj_set_size(vision_emotion_image_, side_w - 2, 68);
-        lv_obj_align(vision_emotion_image_, LV_ALIGN_TOP_MID, 0, 5);
+        lv_obj_set_size(vision_emotion_image_, 58, 58);
+        lv_obj_align(vision_emotion_image_, LV_ALIGN_CENTER, 0, 13);
+        lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
         lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_t* title = l(p(lw, 0, cw, th));
+        lv_obj_t* title = l(p(side_w, 0, cw, th));
         StyleVisionCard(lv_obj_get_parent(title), lv_color_hex(0xEAF4FF), lv_color_hex(0x3F8FE8), 7);
         CreateVisionBear(lv_obj_get_parent(title));
         // Leave a clear gap after the bear so the title never overlaps it.
@@ -1398,28 +1559,61 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_label_set_text(title, "坐姿健康检测系统");
         lv_obj_align(title, LV_ALIGN_RIGHT_MID, -3, 0);
         lv_obj_add_flag(lv_obj_get_parent(title), LV_OBJ_FLAG_HIDDEN);
-        lv_obj_t* video = p(lw, th, cw, h - th - bottom_h);
+        lv_obj_t* video = p(side_w, th, cw, caption_y - th);
         lv_obj_set_style_bg_opa(video, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(video, 0, 0);
         lv_obj_set_parent(preview_image_, vision_dashboard_);
-        const lv_coord_t video_h = std::min<lv_coord_t>(h - th - bottom_h - 8, video_w * 3 / 4);
-        lv_obj_set_size(preview_image_, video_w, video_h);
+        lv_obj_set_size(preview_image_, preview_w, preview_h);
         lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
-        lv_obj_set_pos(preview_image_, side_w, th + (h - th - bottom_h - video_h) / 2);
+        lv_obj_set_pos(preview_image_, preview_x, preview_y);
         lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_COVER);
-        if (chat_message_label_ != nullptr) {
-            lv_obj_set_parent(chat_message_label_, vision_dashboard_);
-            lv_obj_set_size(chat_message_label_, w - 8, bottom_h - 4);
-            lv_obj_set_pos(chat_message_label_, 4, h - bottom_h + 2);
-            lv_obj_set_style_bg_color(chat_message_label_, lv_color_white(), 0);
-            lv_obj_set_style_bg_opa(chat_message_label_, LV_OPA_COVER, 0);
-            lv_obj_set_style_pad_all(chat_message_label_, 2, 0);
-            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_set_style_text_color(chat_message_label_, lv_color_hex(0x24507A), 0);
-            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-            lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
-        }
+        lv_obj_set_style_radius(preview_image_, 7, 0);
     }
+    if (vision_fps_label_ == nullptr) {
+        vision_fps_label_ = lv_label_create(vision_dashboard_);
+        lv_obj_set_size(vision_fps_label_, 66, 18);
+        lv_obj_set_pos(vision_fps_label_, preview_x + 3, preview_y + 3);
+        lv_label_set_long_mode(vision_fps_label_, LV_LABEL_LONG_CLIP);
+        lv_label_set_text(vision_fps_label_, "FPS --");
+        lv_obj_set_style_text_font(vision_fps_label_, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_align(vision_fps_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(vision_fps_label_, lv_color_white(), 0);
+        lv_obj_set_style_bg_color(vision_fps_label_, lv_color_hex(0x17324D), 0);
+        lv_obj_set_style_bg_opa(vision_fps_label_, LV_OPA_70, 0);
+        lv_obj_set_style_border_width(vision_fps_label_, 0, 0);
+        lv_obj_set_style_radius(vision_fps_label_, 3, 0);
+        lv_obj_set_style_pad_hor(vision_fps_label_, 2, 0);
+        lv_obj_set_style_pad_ver(vision_fps_label_, 1, 0);
+        vision_fps_window_start_ms_ = 0;
+        vision_fps_frame_count_ = 0;
+    }
+    if (vision_caption_ == nullptr) {
+        vision_caption_ = lv_obj_create(vision_dashboard_);
+        lv_obj_remove_style_all(vision_caption_);
+        lv_obj_set_size(vision_caption_, w - 12, caption_h);
+        lv_obj_set_pos(vision_caption_, 6, caption_y);
+        lv_obj_clear_flag(vision_caption_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(vision_caption_, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    }
+    lv_obj_remove_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
+    // Re-apply the transcript-channel layout on every entry. The label is
+    // reparented to content_ when leaving vision mode, while the dashboard
+    // object itself is intentionally retained for reuse.
+    if (chat_message_label_ != nullptr) {
+        if (lv_obj_get_parent(chat_message_label_) != vision_caption_) {
+            lv_obj_set_parent(chat_message_label_, vision_caption_);
+        }
+        if (entering_vision) {
+            lv_obj_set_style_bg_opa(chat_message_label_, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_all(chat_message_label_, 0, 0);
+            lv_obj_set_style_text_color(chat_message_label_, lv_color_hex(0x24507A), 0);
+            StartVisionTranscriptScroll(chat_message_label_, w - 12, 0, caption_h);
+        }
+        lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+    // Keep the artwork's own transcript slot visible; it is already sized and
+    // colored for this dashboard.
+    PrepareVisionFrame(caption_y, false);
     char buf[96];
     if (result.heart_rate.available) {
         snprintf(buf, sizeof(buf), "%.0f", result.heart_rate.bpm);
@@ -1427,7 +1621,7 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     } else {
         SetLabelTextIfChanged(vision_heart_label_, "");
     }
-    if (result.blood_pressure.available) {
+    if (result.blood_pressure.ready) {
         snprintf(buf, sizeof(buf), "%.0f\n%.0f",
                  result.blood_pressure.sbp_mmHg, result.blood_pressure.dbp_mmHg);
         SetLabelTextIfChanged(vision_pressure_label_, buf);
@@ -1437,26 +1631,14 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
     if (result.posture.available) {
         bool posture_bad = result.posture.state == "bad_posture";
         lv_obj_remove_flag(vision_posture_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_align(vision_posture_label_, LV_ALIGN_BOTTOM_MID, 0, -4);
-        SetLabelTextIfChanged(vision_posture_label_, posture_bad ? "坐姿\n不正" : "坐姿\n端正");
-        const char* posture_asset = posture_bad ? "vision_posture_incorrect.png" : "vision_posture_correct.png";
-        if (vision_posture_asset_name_ != posture_asset) {
-            auto posture_image = LoadVisionAsset(posture_asset);
-            if (posture_image != nullptr) {
-                lv_image_set_src(vision_posture_image_, posture_image->image_dsc());
-                if (vision_posture_asset_image_) {
-                    vision_asset_history_.push_back(std::move(vision_posture_asset_image_));
-                }
-                vision_posture_asset_image_ = std::move(posture_image);
-                vision_posture_asset_name_ = posture_asset;
-                lv_obj_set_size(vision_posture_image_, side_w - 2, 68);
-                lv_obj_set_align(vision_posture_image_, LV_ALIGN_TOP_MID);
-                lv_obj_set_pos(vision_posture_image_, 0, 4);
-                lv_image_set_inner_align(vision_posture_image_, LV_IMAGE_ALIGN_CONTAIN);
-                lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
-            }
+        const char* posture_text = posture_bad ? "不端正" : "端正";
+        if (std::strcmp(lv_label_get_text(vision_posture_label_), posture_text) != 0) {
+            lv_label_set_text(vision_posture_label_, posture_text);
+            lv_obj_set_style_text_color(vision_posture_label_,
+                                       posture_bad ? lv_color_hex(0xD93025)
+                                                   : lv_color_hex(0x1E9E49), 0);
         }
-        lv_obj_remove_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(vision_posture_icon_, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(vision_posture_image_, LV_OBJ_FLAG_HIDDEN);
@@ -1465,10 +1647,6 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
         lv_obj_add_flag(vision_posture_cartoon_, LV_OBJ_FLAG_HIDDEN);
     }
     if (result.emotion.available) {
-        lv_obj_remove_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_align(vision_emotion_label_, LV_ALIGN_BOTTOM_MID, 0, -4);
-        snprintf(buf, sizeof(buf), "情绪\n%s", EmotionLabelZh(result.emotion.label));
-        SetLabelTextIfChanged(vision_emotion_label_, buf);
         std::string emotion_asset_name = "vision_emotion_";
         emotion_asset_name += EmotionAssetKey(result.emotion.label);
         emotion_asset_name += ".png";
@@ -1476,49 +1654,32 @@ void LcdDisplay::SetVisionPreviewImage(std::unique_ptr<LvglImage> image,
             auto emotion_image = LoadVisionAsset(emotion_asset_name.c_str());
             if (emotion_image != nullptr) {
                 lv_image_set_src(vision_emotion_image_, emotion_image->image_dsc());
-                if (vision_emotion_asset_image_) {
-                    vision_asset_history_.push_back(std::move(vision_emotion_asset_image_));
-                }
                 vision_emotion_asset_image_ = std::move(emotion_image);
                 vision_emotion_asset_name_ = emotion_asset_name;
-                lv_obj_set_size(vision_emotion_image_, side_w - 2, 68);
-                lv_obj_set_align(vision_emotion_image_, LV_ALIGN_TOP_MID);
-                lv_obj_set_pos(vision_emotion_image_, 0, 4);
-                lv_image_set_inner_align(vision_emotion_image_, LV_IMAGE_ALIGN_CONTAIN);
-                lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
             }
         }
-        lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
+        if (vision_emotion_asset_image_ && vision_emotion_asset_name_ == emotion_asset_name) {
+            lv_obj_remove_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        }
     } else {
         lv_obj_add_flag(vision_emotion_image_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(vision_emotion_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(vision_emotion_label_, "");
     }
     // Keep visual cards stable. Health warnings are spoken by main's fixed
     // voice-alert path; the dashboard must not flash or change layers.
-    lv_color_t emotion_color = lv_color_hex(0x808080);
-    if (result.emotion.label == "happy") emotion_color = lv_color_hex(0x22AA55);
-    else if (result.emotion.label == "sad") emotion_color = lv_color_hex(0x3388CC);
-    else if (result.emotion.label == "angry") emotion_color = lv_color_hex(0xDD3333);
-    else if (result.emotion.label == "fear") emotion_color = lv_color_hex(0x9944CC);
-    else if (result.emotion.label == "surprise") emotion_color = lv_color_hex(0xEE9922);
-    lv_obj_set_style_text_color(vision_emotion_label_, emotion_color, 0);
-    const lv_coord_t video_w = preview_w;
-    const lv_coord_t video_h = std::min<lv_coord_t>(h - th - bottom_h - 8, video_w * 3 / 4);
     if (lv_obj_get_parent(preview_image_) != vision_dashboard_) {
         lv_obj_set_parent(preview_image_, vision_dashboard_);
         lv_obj_set_align(preview_image_, LV_ALIGN_DEFAULT);
-        lv_obj_set_size(preview_image_, video_w, video_h);
-        lv_obj_set_pos(preview_image_, side_w, th + (h - th - bottom_h - video_h) / 2);
+        lv_obj_set_size(preview_image_, preview_w, preview_h);
+        lv_obj_set_pos(preview_image_, preview_x, preview_y);
         lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_COVER);
+        lv_obj_set_style_radius(preview_image_, 7, 0);
         lv_obj_move_to_index(preview_image_, 1);
     }
-    lv_image_set_src(preview_image_, image->image_dsc());
-    if (preview_image_cached_) {
-        vision_frame_history_.push_back(std::move(preview_image_cached_));
-        while (vision_frame_history_.size() > 8) vision_frame_history_.pop_front();
-    }
-    preview_image_cached_ = std::move(image);
+    PublishVisionFrame(std::move(image));
     lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 }
@@ -1651,6 +1812,12 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
         return;
     }
 
+    if (image != nullptr && vision_dashboard_ != nullptr &&
+        !lv_obj_has_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN)) {
+        ESP_LOGW(TAG, "Ignoring ordinary image preview while vision dashboard is active");
+        return;
+    }
+
     if (image == nullptr) {
         esp_timer_stop(preview_timer_);
         if (status_bar_ != nullptr) {
@@ -1661,7 +1828,14 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
         }
         lv_obj_set_parent(preview_image_, content_);
         if (chat_message_label_ != nullptr) {
+            lv_anim_delete(chat_message_label_, SetVisionTranscriptX);
             lv_obj_set_parent(chat_message_label_, content_);
+            lv_obj_set_size(chat_message_label_, width_ * 9 / 10, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(chat_message_label_, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_all(chat_message_label_, 0, 0);
+            lv_obj_set_style_transform_zoom(chat_message_label_, 256, 0);
+            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
         }
         lv_obj_set_size(preview_image_, width_ / 2, height_ / 2);
@@ -1672,17 +1846,35 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
         lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
-        preview_image_cached_.reset();
+        lv_image_set_src(preview_image_, nullptr);
+        if (preview_image_cached_) {
+            vision_frame_history_.push_back(std::move(preview_image_cached_));
+            while (vision_frame_history_.size() > 8) vision_frame_history_.pop_front();
+        }
         if (gif_controller_) {
             gif_controller_->Start();
         }
         return;
     }
 
+    // Keep the old descriptor alive until lv_image_set_src has detached it.
+    if (preview_image_cached_) {
+        vision_frame_history_.push_back(std::move(preview_image_cached_));
+    }
     preview_image_cached_ = std::move(image);
     if (vision_dashboard_ != nullptr) {
         lv_obj_add_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_parent(preview_image_, content_);
+        if (chat_message_label_ != nullptr) {
+            lv_anim_delete(chat_message_label_, SetVisionTranscriptX);
+            lv_obj_set_parent(chat_message_label_, content_);
+            lv_obj_set_size(chat_message_label_, width_ * 9 / 10, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(chat_message_label_, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_all(chat_message_label_, 0, 0);
+            lv_obj_set_style_transform_zoom(chat_message_label_, 256, 0);
+            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+        }
         if (status_bar_ != nullptr) {
             lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
         }
@@ -1693,6 +1885,7 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     auto img_dsc = preview_image_cached_->image_dsc();
     // 设置图片源并显示预览图片
     lv_image_set_src(preview_image_, img_dsc);
+    while (vision_frame_history_.size() > 8) vision_frame_history_.pop_front();
     if (img_dsc->header.w > 0 && img_dsc->header.h > 0) {
         // zoom factor 0.5
         lv_image_set_scale(preview_image_, 128 * width_ / img_dsc->header.w);
@@ -1713,7 +1906,26 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (chat_message_label_ == nullptr) {
         return;
     }
-    lv_label_set_text(chat_message_label_, content);
+    if (vision_dashboard_ != nullptr &&
+        lv_obj_get_parent(chat_message_label_) == vision_caption_ &&
+        !lv_obj_has_flag(vision_dashboard_, LV_OBJ_FLAG_HIDDEN)) {
+        const auto line = VisionTranscriptSingleLine(content);
+        // Application state transitions frequently send an empty system
+        // message. In monitoring mode it must not erase the latest transcript.
+        if (line.empty()) return;
+        if (line == lv_label_get_text(chat_message_label_)) {
+            if (lv_anim_get(chat_message_label_, SetVisionTranscriptX) == nullptr) {
+                const lv_coord_t caption_h = std::max<lv_coord_t>(18, LV_VER_RES * 21 / 240);
+                StartVisionTranscriptScroll(chat_message_label_, LV_HOR_RES - 12, 0, caption_h);
+            }
+            return;
+        }
+        lv_label_set_text(chat_message_label_, line.c_str());
+        const lv_coord_t caption_h = std::max<lv_coord_t>(18, LV_VER_RES * 21 / 240);
+        StartVisionTranscriptScroll(chat_message_label_, LV_HOR_RES - 12, 0, caption_h);
+    } else {
+        lv_label_set_text(chat_message_label_, content != nullptr ? content : "");
+    }
 }
 #endif
 

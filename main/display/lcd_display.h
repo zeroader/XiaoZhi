@@ -12,6 +12,7 @@
 #include <memory>
 #include <deque>
 #include <string>
+#include <map>
 
 #define PREVIEW_IMAGE_DURATION_MS 30000
 
@@ -20,7 +21,6 @@ class LcdDisplay : public LvglDisplay {
 protected:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
-    
     lv_draw_buf_t draw_buf_;
     lv_obj_t* status_bar_ = nullptr;
     lv_obj_t* content_ = nullptr;
@@ -33,6 +33,9 @@ protected:
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
     lv_obj_t* vision_dashboard_ = nullptr;
+    lv_obj_t* vision_caption_ = nullptr;
+    lv_obj_t* vision_fps_label_ = nullptr;
+    lv_obj_t* vision_bottom_mask_ = nullptr;
     lv_obj_t* vision_background_view_ = nullptr;
     lv_obj_t* vision_heart_label_ = nullptr;
     lv_obj_t* vision_pressure_label_ = nullptr;
@@ -51,20 +54,27 @@ protected:
     bool vision_hr_alert_active_ = false;
     bool vision_bp_alert_active_ = false;
     bool vision_posture_alert_active_ = false;
+    uint64_t vision_fps_window_start_ms_ = 0;
+    uint32_t vision_fps_frame_count_ = 0;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     // LVGL/SPI may still reference a previous image after lv_image_set_src().
     // Retain a short history so its PSRAM buffer is not freed during DMA.
     std::deque<std::unique_ptr<LvglImage>> vision_frame_history_;
-    std::deque<std::unique_ptr<LvglImage>> vision_asset_history_;
+    // Cache every distinct card asset for the display lifetime. Switching
+    // emotions must not free/reuse descriptors still referenced by LVGL.
+    std::map<std::string, std::shared_ptr<LvglImage>> vision_asset_cache_;
     std::unique_ptr<LvglImage> vision_background_image_ = nullptr;
-    std::unique_ptr<LvglImage> vision_posture_asset_image_ = nullptr;
-    std::unique_ptr<LvglImage> vision_emotion_asset_image_ = nullptr;
+    std::shared_ptr<LvglImage> vision_posture_asset_image_ = nullptr;
+    std::shared_ptr<LvglImage> vision_emotion_asset_image_ = nullptr;
     std::string vision_posture_asset_name_;
     std::string vision_emotion_asset_name_;
 
     void InitializeLcdThemes();
     void SetupUI();
+    std::shared_ptr<LvglImage> LoadVisionAsset(const char* name);
+    void PrepareVisionFrame(int bottom_y, bool show_bottom_mask = true);
+    void PublishVisionFrame(std::unique_ptr<LvglImage> image);
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
 

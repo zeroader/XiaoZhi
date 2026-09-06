@@ -8,6 +8,8 @@
 #include <string>
 #include <cstdint>
 
+struct VisionFrameBufferPool;
+
 struct BoxStyle {
     uint16_t border_color_rgb565;
     uint16_t fill_color_rgb565;
@@ -27,9 +29,11 @@ public:
     void SetDefaultStyle(const BoxStyle& style);
 
     std::unique_ptr<LvglImage> ComposePreview(const uint8_t* frame_rgb565,
-                                                int width, int height,
-                                                size_t stride_bytes,
-                                                const DetectionResult& detections);
+                                               int width, int height,
+                                               size_t stride_bytes,
+                                               const DetectionResult& detections,
+                                               int target_width = 0,
+                                               int target_height = 0);
 
     void DrawDetections(uint8_t* buf_rgb565,
                         int width, int height, size_t stride_bytes,
@@ -40,6 +44,10 @@ public:
 
 private:
     BoxStyle default_style_;
+    // Display-sized RGB565 preview buffers are kept alive by the LCD for
+    // several frames. Recycle them once released instead of allocating from
+    // PSRAM on every frame, which fragments memory during long sessions.
+    std::shared_ptr<VisionFrameBufferPool> frame_buffer_pool_;
 
     void DrawRect(uint8_t* buf_rgb565, int w, int h, size_t stride,
                   int x, int y, int rw, int rh,

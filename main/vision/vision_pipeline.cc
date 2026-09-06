@@ -19,6 +19,7 @@
 #include "application.h"
 #include "assets.h"
 #include "settings.h"
+#include "vision_viewport.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -26,6 +27,23 @@
 #include "esp_jpeg_dec.h"
 
 #define TAG "VisionPipeline"
+
+static VisionViewport DisplayVisionViewport(const LvglDisplay* display) {
+    const int width = display->width();
+    const int height = display->height();
+#if CONFIG_USE_WECHAT_MESSAGE_STYLE
+    const int left_width = std::max(52, width / 6);
+    const int center_width = width - left_width * 2;
+    const int preview_width = (center_width - 8) * 9 / 10;
+    const int preview_height = std::min(height - 20 - 30 - 8,
+                                        preview_width * 3 / 4);
+    return {left_width + (center_width - preview_width) / 2,
+            20 + (height - 20 - 30 - preview_height) / 2,
+            preview_width, preview_height};
+#else
+    return VisionVideoViewport(width, height);
+#endif
+}
 
 static void StopQueuedVoiceAlert();
 
@@ -285,6 +303,15 @@ bool VisionPipeline::CaptureFrame(ImageFrame& out_frame) {
         return false;
     }
     out_frame.data = fb->buf;
+    if ((fb->format != PIXFORMAT_JPEG && fb->format != PIXFORMAT_RGB565) ||
+        (fb->format == PIXFORMAT_RGB565 && fb->len < size_t(fb->width) * fb->height * 2) ||
+        (fb->format == PIXFORMAT_JPEG &&
+         (fb->len < 4 || fb->buf[0] != 0xFF || fb->buf[1] != 0xD8))) {
+        ESP_LOGW(TAG, "Discarding invalid camera frame: format=%d size=%ux%u bytes=%u",
+                 int(fb->format), unsigned(fb->width), unsigned(fb->height), unsigned(fb->len));
+        cam->ReleaseLastCapturedFrame();
+        return false;
+    }
     out_frame.len = fb->len;
     out_frame.width = fb->width;
     out_frame.height = fb->height;
@@ -427,10 +454,15 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
                 uint8_t* dec = nullptr; size_t dec_len = 0; int dw = 0, dh = 0;
                 if (DecodeJpegFrame(frame, &dec, &dec_len, &dw, &dh)) {
                     disp_data = dec; disp_w = dw; disp_h = dh;
+                } else {
+                    // Compressed JPEG bytes must never be read as RGB565.
+                    disp_data = nullptr;
                 }
             }
-            auto image = display_composer_->ComposePreview(disp_data, disp_w, disp_h,
-                                                          (size_t)disp_w * 2, result);
+            const auto output_viewport = DisplayVisionViewport(lcd);
+            auto image = display_composer_->ComposePreview(
+                disp_data, disp_w, disp_h, size_t(disp_w) * 2, result,
+                output_viewport.width, output_viewport.height);
             auto t_comp1 = esp_timer_get_time();
             stats_.total_compose_ms += (uint64_t)((t_comp1 - t_comp0) / 1000LL);
 
@@ -466,15 +498,17 @@ bool VisionPipeline::OneShotDetect(bool show_on_lcd, std::string* out_debug_info
     return true;
 }
 
-// ---------- Two-thread architecture: Preview (15 FPS) + Detect (async) ----------
+// ---------- Two-thread architecture: Preview (20 FPS) + Detect (async) ----------
 
 void VisionPipeline::PreviewLoop() {
-    ESP_LOGI(TAG, "Preview loop started (15 FPS capture, 12 FPS LCD)");
+    ESP_LOGI(TAG, "Preview loop started (target 20 FPS, display each captured frame)");
 
-    constexpr uint32_t kPreviewPeriodMs = 67;  // ~15 FPS
-    constexpr uint32_t kDisplayPeriodMs = 83;  // 12 FPS target; audio remains higher priority.
+    constexpr uint32_t kPreviewPeriodMs = 50;  // ~20 FPS; slow frames self-throttle below.
     uint64_t last_iter = 0;
-    uint64_t last_display_ms = 0;
+    uint64_t last_health_ms = esp_timer_get_time() / 1000LL;
+    uint32_t captured = 0, submitted = 0, capture_errors = 0, decode_errors = 0;
+    uint32_t decoded = 0, composed = 0;
+    uint64_t decode_time_us = 0, compose_time_us = 0, submit_time_us = 0;
 
     while (continuous_running_.load()) {
         auto t0 = esp_timer_get_time();
@@ -484,6 +518,7 @@ void VisionPipeline::PreviewLoop() {
         // Step 1: Capture frame
         ImageFrame frame;
         if (CaptureFrame(frame)) {
+            ++captured;
             // Step 2: Copy to shared buffer for detection thread
             {
                 std::lock_guard<std::mutex> lock(frame_mutex_);
@@ -497,19 +532,13 @@ void VisionPipeline::PreviewLoop() {
             // Release the camera buffer before doing any JPEG/LVGL work.  The
             // camera often has only one framebuffer, so holding it during a
             // display refresh stalls the next capture.
-            const uint64_t now_ms = esp_timer_get_time() / 1000LL;
-            const bool should_display = last_display_ms == 0 ||
-                                        now_ms - last_display_ms >= kDisplayPeriodMs;
             ImageFrame display_frame = frame;
-            if (should_display) {
-                display_frame_.assign(frame.data, frame.data + frame.len);
-            }
+            display_frame_.assign(frame.data, frame.data + frame.len);
             ReleaseCurrentFrame();
 
             // Step 3: Compose preview with latest bbox (if any), at a bounded
             // LCD rate. Detection continues to receive every captured frame.
-            if (should_display && display_composer_) {
-                last_display_ms = now_ms;
+            if (display_composer_) {
                 auto* lcd = ResolveLvglDisplay();
                 if (lcd != nullptr) {
                     DetectionResult current_result;
@@ -532,24 +561,34 @@ void VisionPipeline::PreviewLoop() {
                     int disp_h = display_frame.height;
                     if (display_frame.pixel_format == PIXFORMAT_JPEG) {
                         uint8_t* dec = nullptr; size_t dec_len = 0; int dw = 0, dh = 0;
+                        const int64_t decode_start = esp_timer_get_time();
                         if (!DecodeJpegFrame(display_frame, &dec, &dec_len, &dw, &dh)) {
+                            ++decode_errors;
                             disp_data = nullptr;  // 解码失败则本次不显示
                         } else {
                             disp_data = dec; disp_w = dw; disp_h = dh;
+                            ++decoded;
                         }
+                        decode_time_us += uint64_t(esp_timer_get_time() - decode_start);
                     }
                     if (disp_data != nullptr) {
                         auto t_comp0 = esp_timer_get_time();
+                        const auto output_viewport = DisplayVisionViewport(lcd);
                         auto image = display_composer_->ComposePreview(
-                            disp_data, disp_w, disp_h,
-                            (size_t)disp_w * 2, current_result);
+                            disp_data, disp_w, disp_h, size_t(disp_w) * 2,
+                            current_result, output_viewport.width,
+                            output_viewport.height);
                         auto t_comp1 = esp_timer_get_time();
                         stats_.total_compose_ms += (uint64_t)((t_comp1 - t_comp0) / 1000LL);
+                        compose_time_us += uint64_t(t_comp1 - t_comp0);
+                        ++composed;
 
                         if (image) {
                             auto t_disp0 = esp_timer_get_time();
                             lcd->SetVisionPreviewImage(std::move(image), current_result);
+                            ++submitted;
                             auto t_disp1 = esp_timer_get_time();
+                            submit_time_us += uint64_t(t_disp1 - t_disp0);
                             stats_.total_display_ms += (uint64_t)((t_disp1 - t_disp0) / 1000LL);
                             stats_.display_count++;
                         }
@@ -557,6 +596,26 @@ void VisionPipeline::PreviewLoop() {
                 }
             }
 
+        } else {
+            ++capture_errors;
+        }
+
+        const uint64_t health_now_ms = esp_timer_get_time() / 1000LL;
+        if (health_now_ms - last_health_ms >= 5000) {
+            ESP_LOGI(TAG, "Preview health: interval=%ums captured=%u submitted=%u "
+                     "capture_errors=%u decode_errors=%u avg_decode=%ums "
+                     "avg_compose=%ums avg_submit=%ums psram_free=%u largest=%u",
+                     (unsigned)(health_now_ms - last_health_ms), (unsigned)captured,
+                     (unsigned)submitted, (unsigned)capture_errors, (unsigned)decode_errors,
+                     decoded ? (unsigned)(decode_time_us / decoded / 1000) : 0,
+                     composed ? (unsigned)(compose_time_us / composed / 1000) : 0,
+                     submitted ? (unsigned)(submit_time_us / submitted / 1000) : 0,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+            captured = submitted = capture_errors = decode_errors = 0;
+            decoded = composed = 0;
+            decode_time_us = compose_time_us = submit_time_us = 0;
+            last_health_ms = health_now_ms;
         }
 
         // Step 5: Sleep to maintain FPS
@@ -564,7 +623,10 @@ void VisionPipeline::PreviewLoop() {
         int64_t elapsed = (t1 - t0) / 1000LL;
         int64_t wait = (int64_t)kPreviewPeriodMs - elapsed;
         if (wait > 0 && continuous_running_.load()) {
-            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait));
+            vTaskDelay(std::max<TickType_t>(1, pdMS_TO_TICKS((uint32_t)wait)));
+        } else {
+            // Slow decode/render must still yield to LVGL and audio tasks.
+            vTaskDelay(1);
         }
     }
     ESP_LOGI(TAG, "Preview loop stopped");
@@ -585,26 +647,25 @@ void VisionPipeline::DetectionLoop() {
         // 检测（HTTP 上传）在线程锁外执行，因此必须拥有独立的帧副本。
         // 不能只保存 shared_frame_.data()：预览线程可能在上传期间用下一帧
         // 覆盖或重分配 shared_frame_，从而发送损坏的 JPEG 并触发服务器 400。
-        uint32_t current_version;
+        bool have_new_frame = false;
         {
             std::lock_guard<std::mutex> lock(frame_mutex_);
-            if (shared_frame_.empty()) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
+            if (!shared_frame_.empty() && shared_frame_version_ != last_version) {
+                last_version = shared_frame_version_;
+                detect_frame_ = shared_frame_;
+                detect_frame.data = detect_frame_.data();
+                detect_frame.len = detect_frame_.size();
+                detect_frame.width = shared_frame_w_;
+                detect_frame.height = shared_frame_h_;
+                detect_frame.pixel_format = shared_frame_pixfmt_;
+                have_new_frame = true;
             }
-            current_version = shared_frame_version_;
-            if (current_version == last_version) {
-                // Frame hasn't changed since last detection, wait
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            last_version = current_version;
-            detect_frame_ = shared_frame_;
-            detect_frame.data = detect_frame_.data();
-            detect_frame.len = detect_frame_.size();
-            detect_frame.width = shared_frame_w_;
-            detect_frame.height = shared_frame_h_;
-            detect_frame.pixel_format = shared_frame_pixfmt_;  // JPEG 直出时上传零编码
+        }
+        if (!have_new_frame) {
+            // Never sleep with frame_mutex_ held: the producer needs it to
+            // publish the very frame we are waiting for.
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
 
         if (active_detector_ == nullptr) {
@@ -826,11 +887,14 @@ void VisionPipeline::PreviewOnlyLoop() {
                 uint8_t* dec = nullptr; size_t dec_len = 0; int dw = 0, dh = 0;
                 if (DecodeJpegFrame(frame, &dec, &dec_len, &dw, &dh)) {
                     disp_data = dec; disp_w = dw; disp_h = dh;
+                } else {
+                    disp_data = nullptr;
                 }
             }
+            const auto output_viewport = DisplayVisionViewport(lcd);
             auto image = display_composer_->ComposePreview(
-                disp_data, disp_w, disp_h,
-                (size_t)disp_w * 2, empty_result);
+                disp_data, disp_w, disp_h, size_t(disp_w) * 2, empty_result,
+                output_viewport.width, output_viewport.height);
             if (image) {
                 lcd->SetVisionPreviewImage(std::move(image), empty_result);
             }
@@ -1077,9 +1141,10 @@ static void StopQueuedVoiceAlert() {
     }
 }
 
-// 四类本地语音提醒：心率/血压/坐姿/情绪各自独立冷却 60 秒。
+// 四类本地语音提醒独立冷却；坐姿需要及时纠正，使用更短的 3 秒间隔。
 void VisionPipeline::MaybePlayVoiceAlerts(const DetectionResult& result) {
     constexpr uint64_t kAlertCooldownMs = 60000;
+    constexpr uint64_t kPostureAlertCooldownMs = 3000;
     constexpr float kHighHeartRateBpm = 120.0f;
     constexpr float kHighSystolicMmHg = 140.0f;
     constexpr float kHighDiastolicMmHg = 90.0f;
@@ -1102,7 +1167,8 @@ void VisionPipeline::MaybePlayVoiceAlerts(const DetectionResult& result) {
     }
 
     if (result.posture.available && result.posture.state == "bad_posture" &&
-        (last_posture_alert_ms_ == 0 || now_ms - last_posture_alert_ms_ >= kAlertCooldownMs)) {
+        (last_posture_alert_ms_ == 0 ||
+         now_ms - last_posture_alert_ms_ >= kPostureAlertCooldownMs)) {
         if (QueueVoiceAsset("pose_alarm.ogg")) last_posture_alert_ms_ = now_ms;
         return;
     }

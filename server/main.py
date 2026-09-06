@@ -32,12 +32,24 @@ from PIL import Image
 
 import protocol
 import state as state_mod
+from vision_roi import crop_recognition_input, camera_coordinates
 from detectors.face_detector import FaceDetector
 from detectors.emotion_detector import EmotionDetector
 from detectors.heart_detector import HeartRateDetector, METHODS as HEART_METHODS
 from detectors.blood_pressure_detector import BloodPressureDetector
 
 app = Flask(__name__)
+
+
+@app.after_request
+def log_detection_request_error(response):
+    if request.path == "/detect" and response.status_code >= 400:
+        detail = response.get_json(silent=True) if response.is_json else None
+        reason = detail.get("error", "request rejected") if isinstance(detail, dict) else "malformed or incomplete HTTP request"
+        app.logger.warning("POST /detect rejected: status=%s length=%s transfer_encoding=%s reason=%s",
+                           response.status_code, request.content_length,
+                           request.headers.get("Transfer-Encoding", "none"), reason)
+    return response
 
 # ============================================================
 # 目录与模型配置
@@ -332,6 +344,13 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
     except (TypeError, ValueError):
         src_w, src_h = rgb.shape[1], rgb.shape[0]
 
+    try:
+        rgb, vision_roi = crop_recognition_input(rgb, request.form.get("vision_roi"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if vision_roi is not None:
+        src_h, src_w = rgb.shape[:2]
+
     shared_face = _shared_face_for_tasks(tasks, rgb, src_w, src_h)
     face_was_checked = (protocol.TASK_FACE_EMOTION in tasks or
                         protocol.TASK_POSTURE in tasks)
@@ -367,7 +386,11 @@ def _handle_multipart_detect(t_start: float, client_net_ms: float):
         "infer_ms": round(t_infer_ms, 2),
         "total_ms": round(t_elapsed, 2),
     }
-    return jsonify(protocol.build_response(frame_id, task_list, result, perf))
+    response = protocol.build_response(frame_id, task_list,
+                                       camera_coordinates(result, vision_roi), perf)
+    if vision_roi is not None:
+        response["vision_roi"] = list(vision_roi)
+    return jsonify(response)
 
 
 @app.route("/detect", methods=["POST"])
@@ -652,8 +675,8 @@ def main():
                         help=f"rPPG 心率信号提取方法 (default: pos, 可选: {', '.join(HEART_METHODS)})")
     parser.add_argument("--bp-method", default="pos", choices=list(HEART_METHODS),
                         help="血压 rPPG 波形提取方法 (default: pos)")
-    parser.add_argument("--bp-model", default="", help="rPPG-BP 导出的 ONNX 模型路径（可选）")
-    parser.add_argument("--bp-model-config", default="",
+    parser.add_argument("--bp-model", default="models/resnet_ppg_nonmixed.onnx", help="rPPG-BP 导出的 ONNX 模型路径（可选）")
+    parser.add_argument("--bp-model-config", default="models/resnet_ppg_nonmixed.json",
                         help="BP 模型 JSON 配置路径（input_length/normalization，可选）")
     parser.add_argument("--bp-window-seconds", type=float, default=7.0,
                         help="血压测量所需连续 rPPG 窗口秒数 (default: 7)")

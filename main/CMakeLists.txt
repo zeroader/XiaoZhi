@@ -697,8 +697,11 @@ function(build_default_assets_bin)
     endif()
     
     # Add default assets extra files if defined
+    set(DEFAULT_ASSETS_EXTRA_DEPENDS)
     foreach(EXTRA_FILES_DIR IN LISTS DEFAULT_ASSETS_EXTRA_FILES)
         list(APPEND BUILD_ARGS "--extra_files" "${EXTRA_FILES_DIR}")
+        file(GLOB_RECURSE EXTRA_ASSET_FILES CONFIGURE_DEPENDS "${EXTRA_FILES_DIR}/*")
+        list(APPEND DEFAULT_ASSETS_EXTRA_DEPENDS ${EXTRA_ASSET_FILES})
     endforeach()
     
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
@@ -711,6 +714,7 @@ function(build_default_assets_bin)
         DEPENDS
             ${SDKCONFIG}
             ${PROJECT_DIR}/scripts/build_default_assets.py
+            ${DEFAULT_ASSETS_EXTRA_DEPENDS}
         COMMENT "Building default assets.bin based on configuration"
         VERBATIM
     )
