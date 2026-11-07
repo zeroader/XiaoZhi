@@ -20,6 +20,8 @@ import logging
 import socket
 from pathlib import Path
 
+from runtime_config import APP_DIR
+
 # 屏蔽 python-miio 构造 MiotDevice 时的重复告警（扫描时会刷屏）
 logging.getLogger("miio").setLevel(logging.ERROR)
 
@@ -34,16 +36,17 @@ PIID_POWER = 1
 PIID_BRIGHTNESS = 2
 PIID_COLOR_TEMP = 3
 
-CONFIG_PATH = Path(__file__).resolve().parent / "lamp_config.json"
+CONFIG_PATH = APP_DIR / "lamp_config.json"
 
 
-def _load_config() -> dict:
-    if not CONFIG_PATH.exists():
+def _load_config(config_path=None) -> dict:
+    path = Path(config_path) if config_path else CONFIG_PATH
+    if not path.exists():
         raise RuntimeError(
             "lamp_config.json 不存在：请复制 lamp_config.example.json 为 "
             "lamp_config.json 并填入台灯的 token（ip 可选，留空会自动扫描）"
         )
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         cfg = json.load(f)
     if not cfg.get("token"):
         raise RuntimeError("lamp_config.json 缺少 token")
@@ -102,10 +105,10 @@ def discover_lamp_ip(token: str, max_workers: int = 64):
 class MijiaLampController:
     """封装 MiotDevice，只暴露台灯需要的少量操作。"""
 
-    def __init__(self, config: dict = None):
+    def __init__(self, config: dict = None, config_path=None):
         if MiotDevice is None:
             raise RuntimeError("python-miio 未安装：请执行 pip install python-miio")
-        self._cfg = config or _load_config()
+        self._cfg = config if config is not None else _load_config(config_path)
         self._token = self._cfg["token"]
         self._device = None
         self._ip = None

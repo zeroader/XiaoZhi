@@ -8,6 +8,7 @@
 import cv2
 import numpy as np
 import threading
+from pathlib import Path
 
 # 检测参数
 SCORE_THRESHOLD = 0.6
@@ -19,8 +20,12 @@ class FaceDetector:
     """人脸检测器，封装 cv2.FaceDetectorYN（YuNet）"""
 
     def __init__(self, model_path: str):
+        # OpenCV's filename loader cannot open some Windows Unicode paths.
+        # Read through Python and use the buffer overload so relocated EXEs work.
+        model_data = np.frombuffer(Path(model_path).read_bytes(), dtype=np.uint8)
         self.detector = cv2.FaceDetectorYN.create(
-            model_path, "", (320, 320), SCORE_THRESHOLD, NMS_THRESHOLD, TOP_K
+            "onnx", model_data, np.empty(0, dtype=np.uint8),
+            (320, 320), SCORE_THRESHOLD, NMS_THRESHOLD, TOP_K
         )
         self._lock = threading.RLock()
         print(f"[Model] YuNet loaded: {model_path}")

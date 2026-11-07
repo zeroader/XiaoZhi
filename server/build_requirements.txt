@@ -1,0 +1,2 @@
+-r server_requirements.txt
+pyinstaller>=6.16,<7

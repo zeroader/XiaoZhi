@@ -22,3 +22,8 @@ _vision_modifications_backup/
 
 # Mijia lamp server config (contains the device token — never commit)
 server/lamp_config.json
+server/server_config.json
+server/.packaging-venv/
+server/.packaging-tmp/
+server/.packaging-work/
+server/dist/

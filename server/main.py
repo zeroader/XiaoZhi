@@ -26,6 +26,9 @@ import sys
 import time
 from pathlib import Path
 
+from runtime_config import (APP_DIR, DEFAULT_MODELS_DIR, DEFAULTS,
+                            load_settings, resolve_settings_paths, validate_settings)
+
 import numpy as np
 from flask import Flask, request, jsonify
 from PIL import Image
@@ -55,8 +58,8 @@ def log_detection_request_error(response):
 # 目录与模型配置
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-MODELS_DIR = BASE_DIR / "models"
+MODELS_DIR = DEFAULT_MODELS_DIR
+LAMP_CONFIG_PATH = APP_DIR / "lamp_config.json"
 
 MODEL_FACE = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
 MODEL_EMOTION = MODELS_DIR / "enet_b0_8_best_afew.onnx"
@@ -556,7 +559,7 @@ def _get_lamp_controller():
         raise _lamp_error
     try:
         from lamp_controller import MijiaLampController
-        _lamp_controller = MijiaLampController()
+        _lamp_controller = MijiaLampController(config_path=LAMP_CONFIG_PATH)
     except Exception as e:  # 记录错误，避免每次请求都重试
         _lamp_error = e
         raise
@@ -660,37 +663,60 @@ def download_models():
 # 启动入口
 # ============================================================
 
+def parse_args(argv=None):
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=str(APP_DIR / "server_config.json"))
+    config_args, _ = config_parser.parse_known_args(argv)
+    parser = argparse.ArgumentParser(description="ESP32 Bio-Perception Server",
+                                     parents=[config_parser])
+    parser.add_argument("--host", help="Listen host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, help="Listen port (default: 8291)")
+    parser.add_argument("--face-model", help="YuNet face model path")
+    parser.add_argument("--emotion-model", help="Emotion ONNX model path")
+    parser.add_argument("--pose-model", help="YOLOv8-pose model path")
+    parser.add_argument("--buffer-size", type=int, help="frame_buffer maxlen (default: 60)")
+    parser.add_argument("--heart-method", choices=list(HEART_METHODS))
+    parser.add_argument("--bp-method", choices=list(HEART_METHODS))
+    parser.add_argument("--bp-model", help="Optional BP ONNX model path")
+    parser.add_argument("--bp-model-config", help="Optional BP model JSON config path")
+    parser.add_argument("--bp-window-seconds", type=float)
+    parser.add_argument("--bp-strict-quality", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--rppg-max-samples", type=int)
+    parser.add_argument("--lamp-config", help="Lamp JSON config path")
+    parser.add_argument("--download-model", action="store_true", help="Download ONNX models and exit")
+    try:
+        # --help remains available even if an existing config is malformed.
+        if "--help" in (sys.argv[1:] if argv is None else argv) or "-h" in (sys.argv[1:] if argv is None else argv):
+            return parser.parse_args(argv)
+        explicit_config = any(arg == "--config" or arg.startswith("--config=")
+                              for arg in (sys.argv[1:] if argv is None else argv))
+        settings = {**DEFAULTS, **load_settings(config_args.config, required=explicit_config)}
+        parser.set_defaults(**settings)
+        args = parser.parse_args(argv)
+        settings = {key: getattr(args, key) for key in DEFAULTS}
+        validate_settings(settings)
+        resolve_settings_paths(settings, args.config)
+        for key, value in settings.items():
+            setattr(args, key, value)
+        return args
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
 def main():
     global face_detector, emotion_detector, heart_detector, blood_pressure_detector, state
-
-    parser = argparse.ArgumentParser(description="ESP32 Bio-Perception Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8291, help="Listen port (default: 8291)")
-    parser.add_argument("--face-model", default=str(MODEL_FACE), help="YuNet face model path")
-    parser.add_argument("--emotion-model", default=str(MODEL_EMOTION), help="Emotion ONNX model path")
-    parser.add_argument("--pose-model", default=str(MODEL_POSE), help="YOLOv8-pose model path")
-    parser.add_argument("--buffer-size", type=int, default=BUFFER_MAXLEN,
-                        help=f"frame_buffer maxlen (default: {BUFFER_MAXLEN})")
-    parser.add_argument("--heart-method", default="pos", choices=list(HEART_METHODS),
-                        help=f"rPPG 心率信号提取方法 (default: pos, 可选: {', '.join(HEART_METHODS)})")
-    parser.add_argument("--bp-method", default="pos", choices=list(HEART_METHODS),
-                        help="血压 rPPG 波形提取方法 (default: pos)")
-    parser.add_argument("--bp-model", default="models/resnet_ppg_nonmixed.onnx", help="rPPG-BP 导出的 ONNX 模型路径（可选）")
-    parser.add_argument("--bp-model-config", default="models/resnet_ppg_nonmixed.json",
-                        help="BP 模型 JSON 配置路径（input_length/normalization，可选）")
-    parser.add_argument("--bp-window-seconds", type=float, default=7.0,
-                        help="血压测量所需连续 rPPG 窗口秒数 (default: 7)")
-    parser.add_argument("--bp-strict-quality", action="store_true",
-                        help="启用人脸可见率、采样率和 SNR 的严格血压质量门控")
-    parser.add_argument("--rppg-max-samples", type=int, default=RPPG_MAXLEN,
-                        help=f"紧凑 rPPG 缓冲样本数 (default: {RPPG_MAXLEN})")
-    parser.add_argument("--download-model", action="store_true",
-                        help="Download ONNX models and exit")
-    args = parser.parse_args()
+    global LAMP_CONFIG_PATH, BUFFER_MAXLEN
+    args = parse_args()
+    LAMP_CONFIG_PATH = Path(args.lamp_config)
+    BUFFER_MAXLEN = args.buffer_size
 
     if args.download_model:
         download_models()
         return
+
+    if not Path(args.face_model).is_file():
+        raise RuntimeError(f"Face model not found: {args.face_model}. Place models next to the EXE or update server_config.json.")
+    print(f"[Config] {Path(args.config).resolve()}")
 
     state = state_mod.ServerState(buffer_maxlen=args.buffer_size,
                                   rppg_maxlen=args.rppg_max_samples)
